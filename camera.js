@@ -8,7 +8,7 @@
   const status = document.getElementById('status');
 
   let stream = null;
-  let facingMode = 'user'; // 'user' = インカメラ, 'environment' = アウトカメラ
+  let facingMode = 'environment'; // 既定はリアカメラ ('user' = フロント)
 
   function setStatus(message) {
     status.textContent = message;
@@ -26,15 +26,15 @@
       return;
     }
 
-    stopCamera();
+    stopCamera({ silent: true });
     setStatus('カメラを起動中...');
 
     try {
       stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          facingMode: facingMode,
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
+          facingMode: { ideal: facingMode },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
         },
         audio: false
       });
@@ -42,20 +42,21 @@
       video.srcObject = stream;
       await video.play();
 
-      // インカメラのときだけ鏡像表示にする
-      video.style.transform = facingMode === 'user' ? 'scaleX(-1)' : 'none';
+      // フロントカメラのときだけ鏡像表示にする
+      video.classList.toggle('mirrored', facingMode === 'user');
 
       setRunning(true);
 
       const track = stream.getVideoTracks()[0];
       const settings = track.getSettings();
-      setStatus(`起動中: ${track.label || 'カメラ'} (${settings.width}x${settings.height})`);
+      const label = facingMode === 'environment' ? 'リアカメラ' : 'フロントカメラ';
+      setStatus(`${label} ${settings.width}x${settings.height}`);
     } catch (err) {
       handleError(err);
     }
   }
 
-  function stopCamera() {
+  function stopCamera(options = {}) {
     if (!stream) return;
 
     stream.getTracks().forEach((track) => track.stop());
@@ -63,12 +64,18 @@
     video.srcObject = null;
 
     setRunning(false);
-    setStatus('カメラを停止しました。');
+    if (!options.silent) setStatus('カメラを停止しました。');
   }
 
   async function switchCamera() {
-    facingMode = facingMode === 'user' ? 'environment' : 'user';
+    const previous = facingMode;
+    facingMode = facingMode === 'environment' ? 'user' : 'environment';
+
+    switchBtn.disabled = true;
     await startCamera();
+
+    // 切替に失敗した場合は元の向きに戻す
+    if (!stream) facingMode = previous;
   }
 
   function handleError(err) {
@@ -80,7 +87,7 @@
         break;
       case 'NotFoundError':
       case 'OverconstrainedError':
-        setStatus('利用できるカメラが見つかりませんでした。');
+        setStatus('指定した向きのカメラが見つかりませんでした。');
         break;
       case 'NotReadableError':
         setStatus('カメラが他のアプリで使用中の可能性があります。');
@@ -93,9 +100,9 @@
   }
 
   startBtn.addEventListener('click', startCamera);
-  stopBtn.addEventListener('click', stopCamera);
+  stopBtn.addEventListener('click', () => stopCamera());
   switchBtn.addEventListener('click', switchCamera);
 
   // ページを離れるときにカメラを確実に解放する
-  window.addEventListener('pagehide', stopCamera);
+  window.addEventListener('pagehide', () => stopCamera({ silent: true }));
 })();

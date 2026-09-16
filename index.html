@@ -2,68 +2,137 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>カメラテスト</title>
   <style>
-    body {
-      margin: 0;
-      padding: 16px;
-      font-family: system-ui, sans-serif;
-      background: #111;
-      color: #eee;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 12px;
+    * {
+      box-sizing: border-box;
     }
 
+    html,
+    body {
+      height: 100%;
+    }
+
+    body {
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      color: #fff;
+      font-family: system-ui, sans-serif;
+      overscroll-behavior: none;
+    }
+
+    /* 画面全体をカメラプレビュー領域にする */
+    #stage {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+      background: #000;
+    }
+
+    /* object-fit: contain で画面いっぱい・アスペクト比は維持（切り取りなし） */
     #video {
       width: 100%;
-      max-width: 640px;
-      background: #000;
-      border-radius: 8px;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    #video.mirrored {
       transform: scaleX(-1);
     }
 
-    .controls {
+    /* --- プレビューに重ねるUI --- */
+    .overlay {
+      position: absolute;
+      left: 0;
+      right: 0;
       display: flex;
-      gap: 8px;
+      justify-content: center;
+      pointer-events: none;
     }
 
-    button {
-      padding: 10px 20px;
-      font-size: 16px;
-      border: none;
-      border-radius: 6px;
-      background: #2d7ff9;
-      color: #fff;
-      cursor: pointer;
+    .overlay > * {
+      pointer-events: auto;
     }
 
-    button:disabled {
-      background: #555;
-      cursor: not-allowed;
+    #statusBar {
+      top: 0;
+      padding: calc(env(safe-area-inset-top) + 12px) 16px 12px;
     }
 
     #status {
-      min-height: 1.4em;
-      font-size: 14px;
-      color: #9aa;
+      margin: 0;
+      max-width: 90vw;
+      padding: 6px 14px;
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(6px);
+      font-size: 13px;
+      line-height: 1.4;
+      text-align: center;
+      transition: opacity 0.2s;
+    }
+
+    #status:empty {
+      opacity: 0;
+    }
+
+    #controls {
+      bottom: 0;
+      gap: 12px;
+      padding: 16px 16px calc(env(safe-area-inset-bottom) + 24px);
+      flex-wrap: wrap;
+    }
+
+    button {
+      padding: 12px 22px;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 999px;
+      background: rgba(20, 20, 20, 0.55);
+      backdrop-filter: blur(8px);
+      color: #fff;
+      font-size: 15px;
+      cursor: pointer;
+      transition: background 0.15s, opacity 0.15s;
+    }
+
+    button:hover:not(:disabled) {
+      background: rgba(60, 60, 60, 0.7);
+    }
+
+    button:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+
+    #startBtn {
+      background: rgba(45, 127, 249, 0.85);
+      border-color: transparent;
+    }
+
+    #startBtn:hover:not(:disabled) {
+      background: rgba(45, 127, 249, 1);
     }
   </style>
 </head>
 <body>
-  <h1>カメラテスト</h1>
+  <div id="stage">
+    <video id="video" playsinline autoplay muted></video>
 
-  <video id="video" playsinline autoplay muted></video>
+    <div id="statusBar" class="overlay">
+      <p id="status"></p>
+    </div>
 
-  <div class="controls">
-    <button id="startBtn">カメラを起動</button>
-    <button id="stopBtn" disabled>停止</button>
-    <button id="switchBtn" disabled>前後切替</button>
+    <div id="controls" class="overlay">
+      <button id="startBtn">カメラを起動</button>
+      <button id="switchBtn" disabled>前後切替</button>
+      <button id="stopBtn" disabled>停止</button>
+    </div>
   </div>
-
-  <p id="status"></p>
 
   <script src="camera.js"></script>
 </body>
