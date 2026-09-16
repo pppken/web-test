@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>カメラテスト</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 16px;
+      font-family: system-ui, sans-serif;
+      background: #111;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+
+    #video {
+      width: 100%;
+      max-width: 640px;
+      background: #000;
+      border-radius: 8px;
+      transform: scaleX(-1);
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+    }
+
+    button {
+      padding: 10px 20px;
+      font-size: 16px;
+      border: none;
+      border-radius: 6px;
+      background: #2d7ff9;
+      color: #fff;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      background: #555;
+      cursor: not-allowed;
+    }
+
+    #status {
+      min-height: 1.4em;
+      font-size: 14px;
+      color: #9aa;
+    }
+  </style>
+</head>
+<body>
+  <h1>カメラテスト</h1>
+
+  <video id="video" playsinline autoplay muted></video>
+
+  <div class="controls">
+    <button id="startBtn">カメラを起動</button>
+    <button id="stopBtn" disabled>停止</button>
+    <button id="switchBtn" disabled>前後切替</button>
+  </div>
+
+  <p id="status"></p>
+
+  <script src="camera.js"></script>
+</body>
+</html>
