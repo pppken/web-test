@@ -8,8 +8,31 @@
   const switchBtn = document.getElementById('switchBtn');
   const status = document.getElementById('status');
 
+  const STORAGE_KEY = 'cameraFacingMode';
+  const DEFAULT_FACING_MODE = 'environment'; // 既定はリアカメラ ('user' = フロント)
+
+  // 前回選択したカメラの向きを復元する。
+  // プライベートモードや file:// では localStorage が使えないことがあるので握りつぶす
+  function loadFacingMode() {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved === 'user' || saved === 'environment') return saved;
+    } catch (err) {
+      console.warn('カメラ設定の読み込みに失敗しました', err);
+    }
+    return DEFAULT_FACING_MODE;
+  }
+
+  function saveFacingMode(mode) {
+    try {
+      localStorage.setItem(STORAGE_KEY, mode);
+    } catch (err) {
+      console.warn('カメラ設定の保存に失敗しました', err);
+    }
+  }
+
   let stream = null;
-  let facingMode = 'environment'; // 既定はリアカメラ ('user' = フロント)
+  let facingMode = loadFacingMode();
 
   function setStatus(message) {
     status.textContent = message;
@@ -58,6 +81,9 @@
 
       // フロントカメラのときだけ鏡像表示にする
       video.classList.toggle('mirrored', facingMode === 'user');
+
+      // 起動に成功した向きだけを次回用に保存する
+      saveFacingMode(facingMode);
 
       setRunning(true);
       updateStatus();
