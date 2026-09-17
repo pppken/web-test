@@ -42,6 +42,12 @@
     #frame {
       position: relative;
       display: flex;
+      /* 既定の stretch のままだと、枠を画面いっぱいに広げている停止中だけ
+         video が画面の高さまで引き伸ばされ、中で映像がレターボックスになる。
+         起動の瞬間に video の箱が「画面いっぱい」から「映像そのもの」へ縮むため、
+         映像が一瞬ずれて見える。中央寄せにして停止中も稼働中も同じ箱にする */
+      align-items: center;
+      justify-content: center;
       max-width: 100%;
       max-height: 100%;
       overflow: hidden;
@@ -54,13 +60,17 @@
     }
 
     /* 幅・高さを auto にすることで、画面に収まる最大サイズまで
-       アスペクト比を維持したまま拡大される */
+       アスペクト比を維持したまま拡大される。
+       上限は枠ではなく画面（#stage と同じ 100vw / 100dvh）に対して掛ける。
+       枠は映像の描画サイズに追従する＝高さが不定なので、% だと停止中
+       （枠 = 画面）と稼働中（枠 = 映像）で解決結果が変わってしまう */
     #video {
       display: block;
       width: auto;
       height: auto;
-      max-width: 100%;
-      max-height: 100%;
+      max-width: 100vw;
+      max-height: 100vh;
+      max-height: 100dvh;
       background: #000;
     }
 

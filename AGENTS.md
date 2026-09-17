@@ -217,6 +217,14 @@ Android 実機では `BarcodeDetector` が常に勝つため、自動のまま�
   UI は全部 `#frame` の中に重ねる。
 - **`#frame.idle`**（カメラ停止中）が状態のスイッチ。`idle` のとき枠を画面いっぱいに
   広げ、`#scanArea` / `#engine` / `#flash` を隠す。`camera.js` の `setRunning()` が付け外しする。
+- **`#video` の箱は常に映像そのものの大きさにする。** 枠の中で余白（レターボックス）を
+  作らせない。そのために `#frame` は `align-items` / `justify-content` を中央寄せにし
+  （既定の `stretch` だと `idle` のときだけ画面の高さまで引き伸ばされる）、`#video` の
+  上限は `%`（＝高さが不定な枠が基準）ではなく `100vw` / `100dvh` で掛けている。
+  - これを崩すと、`idle` を外した瞬間に video の箱の大きさが変わり、
+    映像が一瞬ずれて見える（枠と映像の差のぶんだけ動く）。
+  - `barcode.js` の `captureScanArea()` も **video 要素の矩形＝映像の表示矩形**を前提に
+    `videoWidth / rect.width` で倍率を出しているので、余白ができると切り出し位置がずれる。
 - ダイアログは `<dialog>` + `showModal()`。未対応ブラウザ向けに
   `setAttribute('open', '')` のフォールバックを両方のダイアログに入れてある。
 - ボタンの一時的なラベル変更（「コピーしました」「共有できません」など）は
