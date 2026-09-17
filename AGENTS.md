@@ -11,6 +11,8 @@
 index.html   画面（マークアップ + CSS 全部）と、js を動的に読み込むローダ
 camera.js    getUserMedia でのカメラ制御。barcode.js / photo.js のライフサイクル管理
 barcode.js   バーコード検出（BarcodeDetector → ZXing フォールバック）
+barcode-worker.js
+             ZXing の解析を回す Worker。barcode.js からのみ使う
 photo.js     静止画撮影（ImageCapture → video フレーム取得フォールバック）
 vendor/      第三者ライブラリ（無改変で同梱）
 ```
@@ -72,6 +74,9 @@ const scanner = window.BarcodeScanner || { start() {}, stop() {} };
 ### barcode.js
 
 検出エンジンは 2 系統。**まず `BarcodeDetector`、駄目なら同梱 ZXing** に落ちる。
+ZXing はさらに **Worker → メインスレッド** の 2 段になっていて、全体では
+`BarcodeDetector` → `ZXing (Worker)` → `ZXing` の順に落ちる。
+いま何で動いているかは `#engine` のバッジにそのまま出る。
 
 - **読み取る種類は `FORMATS` に集約してある。現状は CODE39 のみ。**
   `BarcodeDetector` には `code_39`、ZXing には `POSSIBLE_FORMATS` として渡す。
@@ -81,7 +86,21 @@ const scanner = window.BarcodeScanner || { start() {}, stop() {} };
   （`FORMATS` のどれも含まれない場合も同じ扱い。いずれも ZXing へ）。
   実行中に例外を投げた場合も `runDetect()` が捕まえて ZXing に切り替える。
 - ZXing (`vendor/zxing-0.21.3.min.js`, 約 330KB) は**必要になった時だけ**
-  `loadScript()` で遅延読み込みする。10 秒でタイムアウトさせる。
+  読み込む（Worker なら `importScripts`、メインスレッドなら `loadScript()`）。
+  どちらも `ZXING_TIMEOUT_MS` = 10 秒でタイムアウトさせる。
+- **ZXing の解析は既定で `barcode-worker.js` に投げる。** ZXing は同期処理なので、
+  メインスレッドで回すと解析のあいだ画面が固まる。Worker 側に移すと、メインスレッドに
+  残るのは `drawImage` と `getImageData` だけになる。
+  `ImageData` の `ArrayBuffer` は転送で渡す（コピーしない）ので、
+  送ったあと元の `ImageData` は使えなくなる（毎フレーム作り捨てにしている）。
+- Worker を作れない場合と、動き出した Worker が途中で落ちた場合は、
+  `useZXingMain()` でメインスレッド実行に落ちる（`runDetect()` が面倒を見る）。
+  遅くはなるが読み取り自体は続く。
+- Worker には canvas が無いので `HTMLCanvasElementLuminanceSource` は使えない。
+  代わりに同じ係数で自前に RGBA → 輝度へ変換し（メインスレッド経路と 1 バイトも
+  違わないことを確認済み）、`RGBLuminanceSource` に渡している。
+  こちらは `isRotateSupported()` が false だが、回転が要るのは `TRY_HARDER` を
+  付けたときだけなので今は影響しない。**`TRY_HARDER` を入れるならここも見直すこと。**
 
 性能に直結するので、次の 4 点は安易に変えないこと（いずれもコメントに理由あり）。
 

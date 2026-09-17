@@ -7,6 +7,10 @@
   const ZXING_SRC = 'vendor/zxing-0.21.3.min.js';
   const ZXING_TIMEOUT_MS = 10000;
 
+  // ZXing は同期処理なので、メインスレッドで回すと解析のあいだ画面が固まる。
+  // 既定では Worker に投げ、Worker を使えない環境だけメインスレッドで実行する
+  const ZXING_WORKER_SRC = 'barcode-worker.js';
+
   const SCAN_INTERVAL_MS = 120;      // 1 秒あたり約 8 回スキャンする
   const COPY_LABEL_RESET_MS = 1500;
 
@@ -55,6 +59,7 @@
   let detect = null;         // (canvas) => { text, format } | null （Promise でも可）
   let detectorPromise = null;
   let usingNative = false;   // BarcodeDetector で動いているか
+  let usingWorker = false;   // ZXing を Worker で動かしているか
   let active = false;        // カメラ稼働中か（camera.js が制御する）
   let paused = false;        // 撮影中など、一時的に解析を止めているか
   let timerId = null;
@@ -195,16 +200,108 @@
 
     const detector = new window.BarcodeDetector({ formats });
 
-    return async (source) => {
-      const results = await detector.detect(source);
-      if (!results.length) return null;
+    return {
+      name: 'BarcodeDetector',
+      detect: async (source) => {
+        const results = await detector.detect(source);
+        if (!results.length) return null;
 
-      // ZXing 側と表記を揃える（code_39 -> CODE_39）
-      return { text: results[0].rawValue, format: String(results[0].format).toUpperCase() };
+        // ZXing 側と表記を揃える（code_39 -> CODE_39）
+        return { text: results[0].rawValue, format: String(results[0].format).toUpperCase() };
+      }
     };
   }
 
-  async function createZXingDetector() {
+  // ZXing の解析を Worker に投げる経路。メインスレッドに残るのは drawImage と
+  // getImageData だけになるので、解析中もプレビューや UI が固まらない
+  function createZXingWorkerDetector() {
+    if (typeof Worker !== 'function') {
+      return Promise.reject(new Error('Worker に対応していません。'));
+    }
+
+    // 他の js と同じ理由でキャッシュ対策を付ける（AGENTS.md の読み込み順を参照）
+    const worker = new Worker(`${ZXING_WORKER_SRC}?v=${Date.now()}`);
+    let pending = null;
+    let nextId = 0;
+
+    function detect(source) {
+      // 既に 2d コンテキストがあるので、getContext は作成済みのものを返す
+      const image = source.getContext('2d').getImageData(0, 0, source.width, source.height);
+
+      return new Promise((resolve, reject) => {
+        // 前の解析が応答を返さないまま次が来た場合は捨てる。放置すると
+        // Promise が残り続けて、スキャンループが二度と進まなくなる
+        if (pending) pending.reject(new Error('前の解析が完了していません。'));
+
+        const id = (nextId += 1);
+        pending = { id, resolve, reject };
+
+        // ArrayBuffer は転送で渡す（サイズによらずコピーが起きない）
+        worker.postMessage(
+          { id, width: image.width, height: image.height, buffer: image.data.buffer },
+          [image.data.buffer]
+        );
+      });
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        worker.terminate();
+        reject(new Error(`Worker の初期化がタイムアウトしました: ${ZXING_WORKER_SRC}`));
+      }, ZXING_TIMEOUT_MS);
+
+      // 初期化前なら初期化の失敗として、初期化後なら解析中の失敗として伝える
+      // （解決済みの Promise への reject は無視される）
+      function fail(err) {
+        clearTimeout(timer);
+        reject(err);
+
+        if (pending) {
+          pending.reject(err);
+          pending = null;
+        }
+      }
+
+      worker.onerror = (event) => {
+        fail(new Error(event.message || `Worker を読み込めませんでした: ${ZXING_WORKER_SRC}`));
+      };
+
+      worker.onmessage = (event) => {
+        const message = event.data;
+
+        if (message.type === 'ready') {
+          clearTimeout(timer);
+          resolve({ name: 'ZXing (Worker)', detect });
+          return;
+        }
+
+        if (message.type === 'error') {
+          worker.terminate();
+          fail(new Error(message.message));
+          return;
+        }
+
+        // stop() などをまたいだ古い応答は捨てる
+        if (!pending || pending.id !== message.id) return;
+
+        const current = pending;
+        pending = null;
+
+        if (message.error) current.reject(new Error(message.error));
+        else current.resolve(message.result);
+      };
+
+      worker.postMessage({
+        type: 'init',
+        // Worker 内は相対パスの基準が変わるので、絶対 URL にしてから渡す
+        src: new URL(ZXING_SRC, location.href).href,
+        formats: FORMATS.map((format) => format.zxing)
+      });
+    });
+  }
+
+  // Worker を使えない環境向けの経路。解析のあいだメインスレッドが止まる
+  async function createZXingMainDetector() {
     await loadScript(ZXING_SRC);
 
     const ZXing = window.ZXing;
@@ -229,36 +326,59 @@
     const reader = new ZXing.MultiFormatReader();
     reader.setHints(hints);
 
-    return (source) => {
-      // 第 2 引数を true にすると 1 フレームおきに白黒反転した画像を試す挙動になり、
-      // 通常の（黒地に白でない）バーコードの実効スキャン回数が半減するので false
-      const luminance = new ZXing.HTMLCanvasElementLuminanceSource(source, false);
-      const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+    return {
+      name: 'ZXing',
+      detect: (source) => {
+        // 第 2 引数を true にすると 1 フレームおきに白黒反転した画像を試す挙動になり、
+        // 通常の（黒地に白でない）バーコードの実効スキャン回数が半減するので false
+        const luminance = new ZXing.HTMLCanvasElementLuminanceSource(source, false);
+        const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
 
-      try {
-        const result = reader.decodeWithState(bitmap);
-        return {
-          text: result.getText(),
-          format: ZXing.BarcodeFormat[result.getBarcodeFormat()]
-        };
-      } catch (err) {
-        // 未検出はフレームごとに例外で返ってくるので通常系として扱う
-        if (err instanceof ZXing.NotFoundException) return null;
-        throw err;
-      } finally {
-        reader.reset();
+        try {
+          const result = reader.decodeWithState(bitmap);
+          return {
+            text: result.getText(),
+            format: ZXing.BarcodeFormat[result.getBarcodeFormat()]
+          };
+        } catch (err) {
+          // 未検出はフレームごとに例外で返ってくるので通常系として扱う
+          if (err instanceof ZXing.NotFoundException) return null;
+          throw err;
+        } finally {
+          reader.reset();
+        }
       }
     };
+  }
+
+  // メインスレッドで ZXing を動かす経路。Worker を作れない環境と、
+  // 動き出した Worker が途中で落ちた場合の受け皿
+  function useZXingMain() {
+    usingNative = false;
+    usingWorker = false;
+
+    return createZXingMainDetector().then((engine) => {
+      setEngine(engine.name);
+      return engine.detect;
+    });
   }
 
   function useZXing() {
     setEngine('ZXing 読み込み中…');
     usingNative = false;
+    usingWorker = true;
 
-    detectorPromise = createZXingDetector().then((fn) => {
-      setEngine('ZXing');
-      return fn;
-    });
+    detectorPromise = createZXingWorkerDetector()
+      .then((engine) => {
+        setEngine(engine.name);
+        return engine.detect;
+      })
+      .catch((err) => {
+        // Worker が駄目でも読み取り自体は続けられるようにする。
+        // どちらで動いているかは #engine のバッジで分かる
+        console.warn('ZXing を Worker で動かせないため、メインスレッドで実行します', err);
+        return useZXingMain();
+      });
 
     return detectorPromise;
   }
@@ -275,8 +395,8 @@
         if (!native) return useZXing();
 
         usingNative = true;
-        setEngine('BarcodeDetector');
-        return native;
+        setEngine(native.name);
+        return native.detect;
       });
 
     return detectorPromise;
@@ -335,17 +455,27 @@
     showResult(result);
   }
 
-  // BarcodeDetector は端末側のモジュール未取得などで例外を返すことがある。
-  // その場合は黙って止まらず ZXing に切り替える
+  // BarcodeDetector は端末側のモジュール未取得などで例外を返すことがあり、
+  // Worker も動き出したあとで落ちることがある。どちらも黙って止まらず、
+  // ひとつ下の経路（ネイティブ -> ZXing、Worker -> メインスレッド）に切り替える
   async function runDetect(source) {
     try {
       return await detect(source);
     } catch (err) {
-      if (!usingNative) throw err;
+      if (usingNative) {
+        console.warn('BarcodeDetector が失敗したため ZXing に切り替えます', err);
+        detect = await useZXing();
+        return null;
+      }
 
-      console.warn('BarcodeDetector が失敗したため ZXing に切り替えます', err);
-      detect = await useZXing();
-      return null;
+      if (usingWorker) {
+        console.warn('Worker での解析が失敗したため、メインスレッドに切り替えます', err);
+        detectorPromise = useZXingMain();
+        detect = await detectorPromise;
+        return null;
+      }
+
+      throw err;
     }
   }
 
