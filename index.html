@@ -23,22 +23,42 @@
       overscroll-behavior: none;
     }
 
-    /* 画面全体をカメラプレビュー領域にする */
+    /* 画面全体をプレビュー領域にし、中央にカメラ映像を配置 */
     #stage {
       position: fixed;
       inset: 0;
       width: 100vw;
       height: 100vh;
       height: 100dvh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       background: #000;
     }
 
-    /* object-fit: contain で画面いっぱい・アスペクト比は維持（切り取りなし） */
-    #video {
+    /* 映像の描画サイズにぴったり追従する枠。UIはこの中に重ねる */
+    #frame {
+      position: relative;
+      display: flex;
+      max-width: 100%;
+      max-height: 100%;
+    }
+
+    /* 停止中は映像が無いので、枠を画面いっぱいに広げてUIを配置する */
+    #frame.idle {
       width: 100%;
       height: 100%;
-      object-fit: contain;
+    }
+
+    /* 幅・高さを auto にすることで、画面に収まる最大サイズまで
+       アスペクト比を維持したまま拡大される */
+    #video {
       display: block;
+      width: auto;
+      height: auto;
+      max-width: 100%;
+      max-height: 100%;
+      background: #000;
     }
 
     #video.mirrored {
@@ -46,34 +66,18 @@
     }
 
     /* --- プレビューに重ねるUI --- */
-    .overlay {
-      position: absolute;
-      left: 0;
-      right: 0;
-      display: flex;
-      justify-content: center;
-      pointer-events: none;
-    }
-
-    .overlay > * {
-      pointer-events: auto;
-    }
-
-    #statusBar {
-      top: 0;
-      padding: calc(env(safe-area-inset-top) + 12px) 16px 12px;
-    }
-
     #status {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      max-width: calc(100% - 24px);
       margin: 0;
-      max-width: 90vw;
-      padding: 6px 14px;
+      padding: 6px 12px;
       border-radius: 999px;
       background: rgba(0, 0, 0, 0.55);
       backdrop-filter: blur(6px);
       font-size: 13px;
       line-height: 1.4;
-      text-align: center;
       transition: opacity 0.2s;
     }
 
@@ -82,14 +86,24 @@
     }
 
     #controls {
+      position: absolute;
+      left: 0;
+      right: 0;
       bottom: 0;
-      gap: 12px;
-      padding: 16px 16px calc(env(safe-area-inset-bottom) + 24px);
+      display: flex;
+      justify-content: center;
       flex-wrap: wrap;
+      gap: 10px;
+      padding: 16px 12px;
+      pointer-events: none;
+    }
+
+    #controls > button {
+      pointer-events: auto;
     }
 
     button {
-      padding: 12px 22px;
+      padding: 11px 20px;
       border: 1px solid rgba(255, 255, 255, 0.25);
       border-radius: 999px;
       background: rgba(20, 20, 20, 0.55);
@@ -121,16 +135,16 @@
 </head>
 <body>
   <div id="stage">
-    <video id="video" playsinline autoplay muted></video>
+    <div id="frame">
+      <video id="video" playsinline autoplay muted></video>
 
-    <div id="statusBar" class="overlay">
       <p id="status"></p>
-    </div>
 
-    <div id="controls" class="overlay">
-      <button id="startBtn">カメラを起動</button>
-      <button id="switchBtn" disabled>前後切替</button>
-      <button id="stopBtn" disabled>停止</button>
+      <div id="controls">
+        <button id="startBtn">カメラを起動</button>
+        <button id="switchBtn" disabled>前後切替</button>
+        <button id="stopBtn" disabled>停止</button>
+      </div>
     </div>
   </div>
 

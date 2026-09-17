@@ -1,6 +1,7 @@
 (() => {
   'use strict';
 
+  const frame = document.getElementById('frame');
   const video = document.getElementById('video');
   const startBtn = document.getElementById('startBtn');
   const stopBtn = document.getElementById('stopBtn');
@@ -18,6 +19,19 @@
     startBtn.disabled = running;
     stopBtn.disabled = !running;
     switchBtn.disabled = !running;
+    // 停止中は枠を画面いっぱいに広げ、ボタンが潰れないようにする
+    frame.classList.toggle('idle', !running);
+  }
+
+  // 実際に再生中の解像度をプレビュー上に表示する
+  function updateStatus() {
+    if (!stream) return;
+
+    const label = facingMode === 'environment' ? 'リアカメラ' : 'フロントカメラ';
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+
+    setStatus(width ? `${label}  ${width} × ${height}` : label);
   }
 
   async function startCamera() {
@@ -46,11 +60,7 @@
       video.classList.toggle('mirrored', facingMode === 'user');
 
       setRunning(true);
-
-      const track = stream.getVideoTracks()[0];
-      const settings = track.getSettings();
-      const label = facingMode === 'environment' ? 'リアカメラ' : 'フロントカメラ';
-      setStatus(`${label} ${settings.width}x${settings.height}`);
+      updateStatus();
     } catch (err) {
       handleError(err);
     }
@@ -64,7 +74,7 @@
     video.srcObject = null;
 
     setRunning(false);
-    if (!options.silent) setStatus('カメラを停止しました。');
+    setStatus(options.silent ? '' : 'カメラを停止しました。');
   }
 
   async function switchCamera() {
@@ -103,6 +113,12 @@
   stopBtn.addEventListener('click', () => stopCamera());
   switchBtn.addEventListener('click', switchCamera);
 
+  // 解像度が確定／変化したタイミングで表示を更新する
+  video.addEventListener('loadedmetadata', updateStatus);
+  video.addEventListener('resize', updateStatus);
+
   // ページを離れるときにカメラを確実に解放する
   window.addEventListener('pagehide', () => stopCamera({ silent: true }));
+
+  setRunning(false);
 })();
