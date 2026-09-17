@@ -7,6 +7,10 @@
   const stopBtn = document.getElementById('stopBtn');
   const switchBtn = document.getElementById('switchBtn');
   const zoomBtn = document.getElementById('zoomBtn');
+  const brightnessBtn = document.getElementById('brightnessBtn');
+  const brightnessPanel = document.getElementById('brightnessPanel');
+  const brightnessRange = document.getElementById('brightnessRange');
+  const brightnessValueLabel = document.getElementById('brightnessValue');
   const status = document.getElementById('status');
 
   const STORAGE_KEY = 'cameraFacingMode';
@@ -17,6 +21,15 @@
   // zoom の値は端末によって尺度が違う（1〜8 で返すものもあれば 100〜400 で返すものもある）ので、
   // 絶対値ではなく min（＝等倍）の何倍かで持つ
   const ZOOM_FACTORS = [1, 2, 3, 5];
+
+  // 明るさとして使う capabilities のキー。先に見つかったほうを使う。
+  // Android Chrome は brightness を持たず exposureCompensation だけを返すことが多く、
+  // 逆に PC の UVC カメラは brightness を返す。どちらも尺度も意味も端末任せなので、
+  // 値はこちらで換算せず、端末が返した範囲をそのままスライダーに渡す
+  const BRIGHTNESS_KEYS = ['brightness', 'exposureCompensation'];
+
+  // step を返さない端末で、スライダーの刻みを作るための段数
+  const BRIGHTNESS_STEPS = 100;
 
   // 前回選択したカメラの向きを復元する。
   // プライベートモードや file:// では localStorage が使えないことがあるので握りつぶす
@@ -45,6 +58,12 @@
   let zoomLevels = [];   // 実際に設定できる zoom の値（昇順。先頭は min ＝ 等倍）
   let zoomIndex = 0;
 
+  let brightnessTrack = null;    // 明るさを適用する映像トラック（= 再生中のもの）
+  let brightnessCap = null;      // { key, min, max, step }。非対応なら null
+  let brightnessValue = 0;       // 最後に適用できた値
+  let brightnessPending = null;  // 適用中に動かされたぶん（最新の 1 つだけ持つ）
+  let brightnessApplying = false;
+
   // barcode.js / photo.js が読み込めなかった場合でもカメラ単体で動くようにしておく
   const scanner = window.BarcodeScanner || { start() {}, stop() {} };
   const photo = window.PhotoCapture || { start() {}, stop() {} };
@@ -57,8 +76,12 @@
     startBtn.disabled = running;
     stopBtn.disabled = !running;
     switchBtn.disabled = !running;
-    // ズームは端末が対応している場合だけ押せる。稼働中の有効・無効は setupZoom() が決める
-    if (!running) clearZoom();
+    // ズームと明るさは端末が対応している場合だけ押せる。
+    // 稼働中の有効・無効は setupZoom() / setupBrightness() が決める
+    if (!running) {
+      clearZoom();
+      clearBrightness();
+    }
     // 停止中は枠を画面いっぱいに広げ、ボタンが潰れないようにする
     frame.classList.toggle('idle', !running);
   }
@@ -74,23 +97,40 @@
     setStatus(width ? `${label}  ${width} × ${height}` : label);
   }
 
-  // --- ズーム -----------------------------------------------------------
+  // --- トラックの能力 ---------------------------------------------------
 
-  // 端末が対応しているズームの範囲を読む。
-  // ズームは端末差が大きく、iOS Safari や大半の PC では capabilities に zoom 自体が無い。
-  // getCapabilities() も未対応のブラウザ（Firefox）があるので、
-  // 取れなければ null を返してボタンを '非対応' にする
-  function readZoomCapability(track) {
+  // getCapabilities() は未対応のブラウザ（Firefox）があり、端末によっては例外も投げる。
+  // 取れなければ null を返し、呼び出し側はその機能を '非対応' として扱う
+  function readCapabilities(track) {
     if (!track || typeof track.getCapabilities !== 'function') return null;
 
-    let capabilities = null;
     try {
-      capabilities = track.getCapabilities();
+      return track.getCapabilities();
     } catch (err) {
       console.warn('カメラの capabilities を取得できませんでした', err);
       return null;
     }
+  }
 
+  // applyConstraints のあとに端末側が値を丸めることがあるので、
+  // 表示は要求値ではなくこちらの実値から出す
+  function readSettings(track) {
+    if (!track || typeof track.getSettings !== 'function') return null;
+
+    try {
+      return track.getSettings();
+    } catch (err) {
+      console.warn('カメラの settings を取得できませんでした', err);
+      return null;
+    }
+  }
+
+  // --- ズーム -----------------------------------------------------------
+
+  // 端末が対応しているズームの範囲を読む。
+  // ズームは端末差が大きく、iOS Safari や大半の PC では capabilities に zoom 自体が無い
+  function readZoomCapability(track) {
+    const capabilities = readCapabilities(track);
     const zoom = capabilities && capabilities.zoom;
     if (!zoom || typeof zoom.min !== 'number' || typeof zoom.max !== 'number') return null;
     // min と max が同じ（＝動かせない）端末は非対応と同じ扱いにする
@@ -121,17 +161,11 @@
     return levels;
   }
 
-  // いま実際に出ている倍率。applyConstraints のあとに端末側が丸めることがあるので、
+  // いま実際に出ている倍率。端末側で丸められることがあるので、
   // 要求値ではなく getSettings() の実値を優先する
   function currentZoom() {
-    if (zoomTrack && typeof zoomTrack.getSettings === 'function') {
-      try {
-        const settings = zoomTrack.getSettings();
-        if (typeof settings.zoom === 'number') return settings.zoom;
-      } catch (err) {
-        console.warn('カメラの settings を取得できませんでした', err);
-      }
-    }
+    const settings = readSettings(zoomTrack);
+    if (settings && typeof settings.zoom === 'number') return settings.zoom;
 
     return zoomLevels[zoomIndex];
   }
@@ -205,6 +239,148 @@
     }
   }
 
+  // --- 明るさ -----------------------------------------------------------
+
+  // 端末が調整できる明るさの範囲を読む。ズームと同じで、指定できる値はこちらで決めず、
+  // capabilities が返した { min, max, step } をそのままスライダーに渡す
+  function readBrightnessCapability(track) {
+    const capabilities = readCapabilities(track);
+    if (!capabilities) return null;
+
+    for (const key of BRIGHTNESS_KEYS) {
+      const range = capabilities[key];
+      if (!range || typeof range.min !== 'number' || typeof range.max !== 'number') continue;
+      // min と max が同じ（＝動かせない）端末は非対応と同じ扱いにする
+      if (!(range.max > range.min)) continue;
+
+      // step を返さない端末向けの保険。範囲が BRIGHTNESS_STEPS より広ければ 1 刻み
+      // （0〜255 のような整数の尺度で半端な値を送らないため）、狭ければ等分する
+      const span = range.max - range.min;
+      const step = typeof range.step === 'number' && range.step > 0
+        ? range.step
+        : (span >= BRIGHTNESS_STEPS ? 1 : span / BRIGHTNESS_STEPS);
+
+      return { key, min: range.min, max: range.max, step };
+    }
+
+    return null;
+  }
+
+  // いま実際に出ている値。ズームの currentZoom() と同じで実値を優先する。
+  // settings に出てこない端末（設定はできるが読めない）向けに既定値を渡せるようにしてある
+  function currentBrightness(fallback = brightnessValue) {
+    const settings = readSettings(brightnessTrack);
+    if (brightnessCap && settings && typeof settings[brightnessCap.key] === 'number') {
+      return settings[brightnessCap.key];
+    }
+
+    return fallback;
+  }
+
+  // 尺度が端末ごとに違う（0〜255 の brightness もあれば -3〜+3 の exposureCompensation もある）ので、
+  // 小数を出すかどうかは step から決める
+  function formatBrightness(value) {
+    return value.toFixed(brightnessCap && brightnessCap.step < 1 ? 2 : 0);
+  }
+
+  // ラベルは「ズーム」ボタンと同じく常にその時の状態を表す。
+  // 値そのものは端末ごとに意味が違うので、ボタンには範囲の何 % かを出す（実値はスライダー側）
+  function renderBrightnessButton() {
+    if (!brightnessCap) {
+      brightnessBtn.textContent = brightnessTrack ? '明るさ: 非対応' : '明るさ';
+      return;
+    }
+
+    const ratio = (currentBrightness() - brightnessCap.min) / (brightnessCap.max - brightnessCap.min);
+    brightnessBtn.textContent = `明るさ: ${Math.round(ratio * 100)}%`;
+  }
+
+  // スライダー脇の読み値。どのキーで調整しているかも出す（端末差の確認用）
+  function renderBrightnessValue(value = currentBrightness()) {
+    brightnessValueLabel.textContent = brightnessCap ? `${brightnessCap.key} ${formatBrightness(value)}` : '';
+  }
+
+  function showBrightnessPanel(open) {
+    brightnessPanel.hidden = !open;
+    brightnessBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+
+  function setupBrightness(track) {
+    brightnessTrack = track || null;
+    brightnessCap = readBrightnessCapability(brightnessTrack);
+    brightnessPending = null;
+
+    if (brightnessCap) {
+      brightnessRange.min = String(brightnessCap.min);
+      brightnessRange.max = String(brightnessCap.max);
+      brightnessRange.step = String(brightnessCap.step);
+      // 起動直後の値から始める（端末が前回の設定を覚えていることがあるので初期化はしない）。
+      // step に乗らない値は <input type="range"> 側が丸めるので、丸めた結果を控える
+      brightnessRange.value = String(currentBrightness(brightnessCap.min));
+      brightnessValue = Number(brightnessRange.value);
+    }
+
+    brightnessBtn.disabled = !brightnessCap;
+    // カメラを入れ替えると範囲も変わるので、開きっぱなしのスライダーは一度畳む
+    showBrightnessPanel(false);
+    renderBrightnessButton();
+    renderBrightnessValue();
+  }
+
+  function clearBrightness() {
+    brightnessTrack = null;
+    brightnessCap = null;
+    brightnessPending = null;
+    brightnessBtn.disabled = true;
+    showBrightnessPanel(false);
+    renderBrightnessButton();
+    renderBrightnessValue();
+  }
+
+  // スライダーは動かすたびに input が飛んでくるが、applyConstraints は 1 つずつしか待てない。
+  // 適用中に動かされたぶんは最新の 1 つだけ覚えておき、終わってから続けて出す
+  async function applyBrightness(value) {
+    if (!brightnessTrack || !brightnessCap) return;
+
+    if (brightnessApplying) {
+      brightnessPending = value;
+      return;
+    }
+
+    brightnessApplying = true;
+    let target = value;
+
+    try {
+      while (target !== null && brightnessCap) {
+        const previous = brightnessValue;
+
+        try {
+          await brightnessTrack.applyConstraints({ advanced: [{ [brightnessCap.key]: target }] });
+          brightnessValue = target;
+        } catch (err) {
+          brightnessPending = null;
+          // 待っている間にカメラが止まっていた場合は、停止のメッセージを消さない
+          if (!brightnessCap) break;
+          // 設定できなかった場合は直前の値に戻す
+          // （ズーム・前後切替・エンジン切替と同じ扱い）
+          brightnessValue = previous;
+          brightnessRange.value = String(previous);
+          console.warn('明るさを変更できませんでした', err);
+          setStatus('明るさを変更できませんでした。');
+          break;
+        }
+
+        target = brightnessPending;
+        brightnessPending = null;
+      }
+    } finally {
+      brightnessApplying = false;
+      // 待っている間にカメラが止まっていれば brightnessCap は null になっている
+      renderBrightnessButton();
+      renderBrightnessValue();
+    }
+  }
+
   async function startCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setStatus('このブラウザはカメラに対応していません。');
@@ -238,6 +414,7 @@
       setRunning(true);
       updateStatus();
       setupZoom(videoTrack);
+      setupBrightness(videoTrack);
       scanner.start();
       photo.start({ facingMode, track: videoTrack });
     } catch (err) {
@@ -307,6 +484,16 @@
   stopBtn.addEventListener('click', () => stopCamera());
   switchBtn.addEventListener('click', switchCamera);
   zoomBtn.addEventListener('click', zoomNext);
+
+  // 押すたびにスライダーを開閉する（非対応ならボタン自体が無効）
+  brightnessBtn.addEventListener('click', () => showBrightnessPanel(brightnessPanel.hidden));
+
+  brightnessRange.addEventListener('input', () => {
+    const value = Number(brightnessRange.value);
+    // 反映を待たずに読み値を出す（端末が丸めたぶんは適用後に実値で上書きされる）
+    renderBrightnessValue(value);
+    applyBrightness(value);
+  });
 
   // 解像度が確定／変化したタイミングで表示を更新する
   video.addEventListener('loadedmetadata', updateStatus);

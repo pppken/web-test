@@ -96,6 +96,38 @@ const scanner = window.BarcodeScanner || { start() {}, stop() {} };
 - ズームしても `videoWidth / videoHeight` は変わらないので、barcode.js の切り出し座標には
   影響しない。photo.js も同じトラックを使うため、撮影結果にもそのまま効く。
 
+#### 明るさ
+
+「明るさ」ボタン（`#brightnessBtn`）でスライダー（`#brightnessPanel`）を開閉して上げ下げする。
+ズームと同じく**指定できる値は端末が `getCapabilities()` で返したものだけ**で、
+こちらから範囲や刻みを決めることはしない。
+
+- 使うのは `BRIGHTNESS_KEYS`（`['brightness', 'exposureCompensation']`）を順に見て
+  **先に見つかったほう**。Android Chrome は `brightness` を返さず `exposureCompensation`
+  だけを持つことが多く、逆に PC の UVC カメラは `brightness` を返す。どちらで動いているかは
+  スライダー脇の読み値に出る（`exposureCompensation 2.00` など）。
+  尺度も意味も端末任せなので、値はこちらで換算しない。
+- `{ min, max, step }` はそのまま `<input type="range">` に入れる。`step` を返さない端末だけ
+  保険として、範囲が `BRIGHTNESS_STEPS`（100）より広ければ 1 刻み（0〜255 のような整数の
+  尺度に半端な値を送らないため）、狭ければ 100 等分にする。初期値は `getSettings()` の実値
+  （端末が前回の設定を覚えていることがあるので、こちらでは初期化しない）。
+- 次のいずれでもボタンは無効＋ラベル `明るさ: 非対応` になる。
+  `getCapabilities()` が無い（Firefox）／例外を投げる／どちらのキーも返さない
+  （iOS Safari など）／`min` と `max` が同じ。
+- 適用は `applyConstraints({ advanced: [{ [key]: value }] })`。失敗したらスライダーを直前の
+  値に戻し、その明るさのまま使い続ける（ズーム・前後切替・エンジン切替と同じ扱い）。
+- **`input` は動かすたびに飛んでくるが、`applyConstraints` は 1 つずつしか待てない。**
+  適用中に動かされたぶんは最新の 1 つだけ `brightnessPending` に控え、終わってから続けて出す
+  （間の値は捨てる）。溜めると指を離したあとも延々と追いかけることになる。
+- ボタンのラベルは実値ではなく**範囲の何 %**（`renderBrightnessButton()`）。
+  値の尺度が端末ごとに違って倍率のようには読めないため。実値はスライダー脇に出す。
+- 範囲はカメラごとに違うので、**起動のたびに `setupBrightness()` で作り直す**
+  （前後切替でも作り直し、開いていたスライダーは畳む）。停止時は `clearBrightness()`。
+- `getCapabilities()` / `getSettings()` の読み出し（未対応・例外の握りつぶし）は
+  ズームと共通の `readCapabilities()` / `readSettings()` にまとめてある。
+- 映像そのものには手を入れないので barcode.js の切り出しには影響しない。
+  photo.js も同じトラックを使うため、撮影結果にはそのまま効く。
+
 ### barcode.js
 
 検出エンジンは 4 系統。**まず `BarcodeDetector`、駄目なら同梱 ZXing** に落ちる。
@@ -331,6 +363,11 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
 - 「ズーム」ボタン（`#zoomBtn`）も同じ扱いで、`renderZoomButton()` が
   `ズーム: 2.0x` / `ズーム: 非対応` / 停止中の `ズーム` を書く。
   こちらは端末の能力に依るので、稼働中でも非対応なら無効のまま。
+- 「明るさ」ボタン（`#brightnessBtn`）も同じで、`renderBrightnessButton()` が
+  `明るさ: 60%` / `明るさ: 非対応` / 停止中の `明るさ` を書く。
+  スライダー（`#brightnessPanel`）は `#controls` の中に幅いっぱい（`flex: 0 0 100%`）で
+  置いてあり、ボタンが何行に折り返しても常にその上の行に出る。
+  `#controls` は `pointer-events: none` なので、触る箱（`#brightnessControl`）だけ戻している。
 
 ## vendor/
 
