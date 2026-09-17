@@ -74,16 +74,16 @@
       top: 50%;
       left: 50%;
       transform: translate(-50%, -50%);
+      /* 1D（横長）と 2D（正方形）のどちらも収まる比率にしている */
       width: 80%;
       max-width: 520px;
-      height: 24%;
-      min-height: 96px;
-      max-height: 180px;
+      height: 40%;
+      min-height: 150px;
+      max-height: 320px;
       border: 2px solid rgba(255, 255, 255, 0.9);
       border-radius: 12px;
       /* 枠の外側をまとめて暗くする */
       box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.35);
-      overflow: hidden;
       pointer-events: none;
     }
 
@@ -92,61 +92,80 @@
       display: none;
     }
 
-    #scanLine {
-      position: absolute;
-      left: 8px;
-      right: 8px;
-      height: 2px;
-      border-radius: 2px;
-      background: rgba(255, 64, 64, 0.9);
-      box-shadow: 0 0 8px rgba(255, 64, 64, 0.8);
-      animation: scanSweep 2s ease-in-out infinite;
+    /* 読み取り結果のダイアログ */
+    #result {
+      width: 100%;
+      max-width: min(420px, calc(100vw - 32px));
+      margin: auto;
+      padding: 0;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 16px;
+      background: rgba(28, 28, 30, 0.97);
+      color: #fff;
     }
 
-    @keyframes scanSweep {
-      0%, 100% {
-        top: 10%;
-      }
-
-      50% {
-        top: 90%;
-      }
+    #result::backdrop {
+      background: rgba(0, 0, 0, 0.6);
     }
 
-    @media (prefers-reduced-motion: reduce) {
-      #scanLine {
-        top: 50%;
-        animation: none;
-      }
+    #resultBody {
+      padding: 22px 22px 0;
     }
 
-    /* 読み取り結果のトースト */
-    #toast {
-      position: absolute;
-      left: 50%;
-      bottom: 80px;
-      max-width: calc(100% - 24px);
-      padding: 10px 18px;
-      border-radius: 12px;
-      background: rgba(22, 163, 74, 0.92);
-      font-size: 15px;
+    #resultTitle {
+      margin: 0 0 4px;
+      font-size: 17px;
       font-weight: 600;
-      letter-spacing: 0.02em;
-      text-align: center;
+    }
+
+    #result.error #resultTitle {
+      color: #fca5a5;
+    }
+
+    #resultFormat {
+      margin: 0 0 14px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      color: rgba(255, 255, 255, 0.55);
+    }
+
+    #resultFormat:empty {
+      display: none;
+    }
+
+    #resultValue {
+      margin: 0;
+      padding: 12px 14px;
+      max-height: 40vh;
+      overflow: auto;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.08);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 17px;
+      line-height: 1.5;
       word-break: break-all;
-      opacity: 0;
-      transform: translate(-50%, 8px);
-      transition: opacity 0.2s, transform 0.2s;
-      pointer-events: none;
+      user-select: text;
     }
 
-    #toast.error {
-      background: rgba(220, 38, 38, 0.92);
+    #resultActions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 18px 22px 22px;
     }
 
-    #toast.show {
-      opacity: 1;
-      transform: translate(-50%, 0);
+    #resultActions button {
+      padding: 9px 18px;
+      font-size: 14px;
+    }
+
+    #resultCloseBtn {
+      background: rgba(45, 127, 249, 0.85);
+      border-color: transparent;
+    }
+
+    #resultCloseBtn:hover:not(:disabled) {
+      background: rgba(45, 127, 249, 1);
     }
 
     #status {
@@ -221,13 +240,9 @@
     <div id="frame">
       <video id="video" playsinline autoplay muted></video>
 
-      <div id="scanArea" aria-hidden="true">
-        <div id="scanLine"></div>
-      </div>
+      <div id="scanArea" aria-hidden="true"></div>
 
       <p id="status"></p>
-
-      <div id="toast" role="status" aria-live="polite"></div>
 
       <div id="controls">
         <button id="startBtn">カメラを起動</button>
@@ -236,6 +251,19 @@
       </div>
     </div>
   </div>
+
+  <dialog id="result" aria-labelledby="resultTitle">
+    <div id="resultBody">
+      <h2 id="resultTitle">バーコードを検出しました</h2>
+      <p id="resultFormat"></p>
+      <p id="resultValue"></p>
+    </div>
+
+    <div id="resultActions">
+      <button id="resultCopyBtn" type="button">コピー</button>
+      <button id="resultCloseBtn" type="button" autofocus>閉じる</button>
+    </div>
+  </dialog>
 
   <script src="barcode.js"></script>
   <script src="camera.js"></script>
