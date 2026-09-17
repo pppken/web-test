@@ -3,12 +3,43 @@
 
   // 検出は BarcodeDetector（Chrome / Android 等）を優先し、
   // 非対応のブラウザ（iOS Safari / Firefox / デスクトップ Chrome）では同梱の ZXing を使う。
-  // Quagga2 は自動では選ばれず、「エンジン」ボタンで明示的に選んだときだけ使う。
-  // どちらのライブラリも、初回に必要になったときだけ読み込む
-  // （ZXing 約 330KB / Quagga2 約 150KB）
+  // ZXing-C++ と Quagga2 は自動では選ばれず、「エンジン」ボタンで明示的に選んだときだけ使う。
+  // どのライブラリも、初回に必要になったときだけ読み込む
+  // （ZXing 約 330KB / ZXing-C++ 約 36KB + wasm 約 930KB / Quagga2 約 150KB）
   const ZXING_SRC = 'vendor/zxing-0.21.3.min.js';
   const QUAGGA_SRC = 'vendor/quagga2-1.12.1.min.js';
   const LIB_TIMEOUT_MS = 10000;
+
+  // ZXing-C++（zxing-wasm の reader ビルド）。js と wasm の 2 つで 1 組なので、
+  // 版を上げるときは両方を差し替える。wasm の場所は locateFile で指定するため、
+  // ファイル名は vendor の流儀（バージョン入り）に揃えてある
+  const ZXING_CPP_SRC = 'vendor/zxing-wasm-reader-3.1.4.min.js';
+  const ZXING_CPP_WASM = 'vendor/zxing-wasm-reader-3.1.4.wasm';
+
+  // ZXing-C++ の初期化を打ち切るまでの時間。js（約 36KB）の読み込みだけでなく
+  // wasm（約 930KB）の取得とコンパイルまで待つので、他のライブラリ
+  // （LIB_TIMEOUT_MS = 10 秒）と同じ尺では回線の細い実機で足りない
+  const WASM_INIT_TIMEOUT_MS = 30000;
+
+  // ZXing-C++ の解析オプション。formats は FORMATS から入れるのでここには書かない。
+  //   maxNumberOfSymbols  1 件見つかった時点で打ち切る（枠内に複数は想定していない）
+  //   tryInvert           白黒反転した画像は試さない。ZXing 経路で
+  //                       HTMLCanvasElementLuminanceSource の第 2 引数を false に
+  //                       しているのと同じ理由で、通常のバーコードの実効回数が落ちる
+  // tryHarder / tryRotate / tryDownscale は既定（いずれも true）のまま。
+  // 特に tryRotate が効くので、この経路ではこちら側で 90 度回転させない
+  // （needsRotation() が false）。速度が足りないときは #engine の N/s を見ながら外す
+  const ZXING_CPP_OPTIONS = {
+    maxNumberOfSymbols: 1,
+    tryInvert: false
+  };
+
+  // 既定の locateFile は wasm を jsDelivr から取りに行くので、同梱したものを指すように
+  // 差し替える。prepareZXingModule は overrides の中身が前回と同じなら作った Module を
+  // 使い回すため、呼ぶたびに新しい関数を渡さないよう 1 つだけ持つ
+  const ZXING_CPP_OVERRIDES = {
+    locateFile: (path, prefix) => (path.endsWith('.wasm') ? ZXING_CPP_WASM : prefix + path)
+  };
 
   // Quagga2 の 1 フレームぶんの解析を打ち切るまでの時間。
   // decodeSingle は画像を <img> 経由でしか受け取れない作りで、読み込みが返らないと
@@ -40,12 +71,14 @@
   const SCAN_PAD_X = 50;
 
   // 読み取る対象のフォーマット。現状は CODE39 のみ。
-  // BarcodeDetector / ZXing / Quagga2 で表記が違うので 3 つとも持つ。大半は
-  // 大文字小文字の差でしかないが、PDF417 だけ 'pdf417' / 'PDF_417' と規則が
-  // 揃わないため機械的な変換はせず、増やすときは 3 つとも書くこと。
-  // Quagga2 はリーダー名で指定する（対応表は同梱ライブラリの Readers を参照）
+  // BarcodeDetector / ZXing / ZXing-C++ / Quagga2 で表記が違うので 4 つとも持つ。大半は
+  // 大文字小文字と区切りの差でしかないが、PDF417 だけ 'pdf417' / 'PDF_417' と規則が
+  // 揃わないため機械的な変換はせず、増やすときは 4 つとも書くこと。
+  // Quagga2 はリーダー名で指定する（対応表は同梱ライブラリの Readers を参照）。
+  // ZXing-C++ の表記は zxing-wasm の README にある一覧を参照。
+  // 結果の format は全経路で zxing の表記（CODE_39）に揃えてから返す
   const FORMATS = [
-    { native: 'code_39', zxing: 'CODE_39', quagga: 'code_39_reader' }
+    { native: 'code_39', zxing: 'CODE_39', zxingCpp: 'Code39', quagga: 'code_39_reader' }
   ];
 
   const video = document.getElementById('video');
@@ -103,10 +136,12 @@
   let detect = null;         // (canvas) => { text, format } | null （Promise でも可）
 
   // いま動いている経路。切り出し方（余白・回転）とフォールバック先をこれで決める。
-  //   'native'       BarcodeDetector
-  //   'zxing-worker' ZXing（Worker）
-  //   'zxing'        ZXing（メインスレッド）
-  //   'quagga'       Quagga2
+  //   'native'           BarcodeDetector
+  //   'zxing-worker'     ZXing（Worker）
+  //   'zxing'            ZXing（メインスレッド）
+  //   'zxing-cpp-worker' ZXing-C++ / wasm（Worker）
+  //   'zxing-cpp'        ZXing-C++ / wasm（メインスレッド）
+  //   'quagga'           Quagga2
   let engineKind = '';
 
   // 選択値 -> Promise<エンジン>。一度作ったものは取っておき、エンジンを
@@ -129,14 +164,14 @@
     return pendingDetects > 0;
   }
 
-  // 余白を足すのは ZXing / Quagga2 経路だけ。BarcodeDetector は向きも含めて
+  // 余白を足すのは同梱ライブラリの経路だけ。BarcodeDetector は向きも含めて
   // 端末側の実装に任せるので、余分な画素を渡して 1 回の検出を重くしない
   function needsQuietZone() {
     return engineKind !== 'native';
   }
 
-  // 1 フレームおきの 90 度回転が要るのは ZXing だけ。
-  // BarcodeDetector と Quagga2 はバーコードの向きを自前で処理する
+  // 1 フレームおきの 90 度回転が要るのは ZXing だけ。BarcodeDetector・
+  // ZXing-C++（tryRotate）・Quagga2（locator）はバーコードの向きを自前で処理する
   function needsRotation() {
     return engineKind === 'zxing' || engineKind === 'zxing-worker';
   }
@@ -182,11 +217,12 @@
 
   // 同じバーコードを同じ端末で読み比べられるように、使うエンジンを選べるようにしてある。
   // '自動' は従来どおり BarcodeDetector → ZXing。Android 実機では BarcodeDetector が
-  // 常に勝つので、'自動' のままだと ZXing / Quagga2 の実力を実機で見られない
+  // 常に勝つので、'自動' のままだと ZXing / ZXing-C++ / Quagga2 の実力を実機で見られない
   const ENGINE_KEY = 'barcodeEngine';
   const ENGINE_CHOICES = [
     { value: 'auto', label: '自動' },
     { value: 'zxing', label: 'ZXing' },
+    { value: 'zxing-cpp', label: 'ZXing-C++' },
     { value: 'quagga', label: 'Quagga2' }
   ];
 
@@ -216,7 +252,7 @@
     engineBtn.textContent = `エンジン: ${choice.label}`;
   }
 
-  // 押すたびに 自動 -> ZXing -> Quagga2 と巡回する。
+  // 押すたびに 自動 -> ZXing -> ZXing-C++ -> Quagga2 と巡回する。
   // 動作中ならカメラは止めずに、検出器だけその場で差し替える
   async function switchEngine() {
     const previous = engineChoice;
@@ -431,9 +467,10 @@
     };
   }
 
-  // ZXing の解析を Worker に投げる経路。メインスレッドに残るのは drawImage と
-  // getImageData だけになるので、解析中もプレビューや UI が固まらない
-  function createZXingWorkerDetector() {
+  // 解析を barcode-worker.js に投げる経路。メインスレッドに残るのは drawImage と
+  // getImageData だけになるので、解析中もプレビューや UI が固まらない。
+  // spec は { kind, name, timeout, init }。init はそのまま Worker の init メッセージになる
+  function createWorkerDetector(spec) {
     if (typeof Worker !== 'function') {
       return Promise.reject(new Error('Worker に対応していません。'));
     }
@@ -467,7 +504,7 @@
       const timer = setTimeout(() => {
         worker.terminate();
         reject(new Error(`Worker の初期化がタイムアウトしました: ${ZXING_WORKER_SRC}`));
-      }, LIB_TIMEOUT_MS);
+      }, spec.timeout);
 
       // 初期化前なら初期化の失敗として、初期化後なら解析中の失敗として伝える
       // （解決済みの Promise への reject は無視される）
@@ -490,7 +527,7 @@
 
         if (message.type === 'ready') {
           clearTimeout(timer);
-          resolve({ kind: 'zxing-worker', name: 'ZXing (Worker)', detect });
+          resolve({ kind: spec.kind, name: spec.name, detect });
           return;
         }
 
@@ -510,12 +547,38 @@
         else current.resolve(message.result);
       };
 
-      worker.postMessage({
-        type: 'init',
+      worker.postMessage({ type: 'init', formats: FORMATS, ...spec.init });
+    });
+  }
+
+  function createZXingWorkerDetector() {
+    return createWorkerDetector({
+      kind: 'zxing-worker',
+      name: 'ZXing (Worker)',
+      timeout: LIB_TIMEOUT_MS,
+      init: {
+        engine: 'zxing',
         // Worker 内は相対パスの基準が変わるので、絶対 URL にしてから渡す
-        src: new URL(ZXING_SRC, location.href).href,
-        formats: FORMATS.map((format) => format.zxing)
-      });
+        src: new URL(ZXING_SRC, location.href).href
+      }
+    });
+  }
+
+  // ZXing-C++ を Worker で動かす経路。wasm の解析も呼び出したスレッドを止めるので、
+  // ZXing と同じくメインスレッドからは追い出す
+  function createZXingCppWorkerDetector() {
+    return createWorkerDetector({
+      kind: 'zxing-cpp-worker',
+      name: 'ZXing-C++ (Worker)',
+      // wasm の取得とコンパイルまで ready を待つので、こちらは長めのタイムアウト
+      timeout: WASM_INIT_TIMEOUT_MS,
+      init: {
+        engine: 'zxing-cpp',
+        // js も wasm も Worker 内は相対パスの基準が変わるので絶対 URL で渡す
+        src: new URL(ZXING_CPP_SRC, location.href).href,
+        wasm: new URL(ZXING_CPP_WASM, location.href).href,
+        options: ZXING_CPP_OPTIONS
+      }
     });
   }
 
@@ -567,6 +630,54 @@
         } finally {
           reader.reset();
         }
+      }
+    };
+  }
+
+  // ZXing-C++ は 'Code39' という独自の表記で返してくるので、他のエンジンと同じ
+  // 大文字表記（CODE_39）に直す。barcode-worker.js にも同じものがある
+  function zxingCppFormat(result) {
+    // symbology は変種（Code39Ext など）を束ねた親を返すので、あればそちらを見る
+    const name = String(result.symbology || result.format || '');
+    const known = FORMATS.find(
+      (format) => format.zxingCpp.toLowerCase() === name.toLowerCase()
+    );
+    return known ? known.zxing : name.toUpperCase();
+  }
+
+  // Worker を使えない環境向けの ZXing-C++ 経路。解析のあいだメインスレッドが止まる
+  async function createZXingCppMainDetector() {
+    await loadScript(ZXING_CPP_SRC);
+
+    const ZXingWASM = window.ZXingWASM;
+    if (!ZXingWASM) throw new Error('ZXing-C++ の初期化に失敗しました。');
+
+    const options = {
+      ...ZXING_CPP_OPTIONS,
+      formats: FORMATS.map((format) => format.zxingCpp)
+    };
+
+    // fireImmediately で、wasm の取得とコンパイルまでここで終わらせる
+    // （待たずに返すと、最初の数フレームの解析がまとめて待たされる）
+    await withTimeout(
+      ZXingWASM.prepareZXingModule({
+        overrides: ZXING_CPP_OVERRIDES,
+        fireImmediately: true
+      }),
+      WASM_INIT_TIMEOUT_MS,
+      `wasm の読み込みがタイムアウトしました: ${ZXING_CPP_WASM}`
+    );
+
+    return {
+      kind: 'zxing-cpp',
+      name: 'ZXing-C++',
+      detect: async (source) => {
+        // 既に 2d コンテキストがあるので、getContext は作成済みのものを返す
+        const image = source.getContext('2d').getImageData(0, 0, source.width, source.height);
+        const results = await ZXingWASM.readBarcodes(image, options);
+
+        if (!results.length) return null;
+        return { text: results[0].text, format: zxingCppFormat(results[0]) };
       }
     };
   }
@@ -636,6 +747,16 @@
     });
   }
 
+  // ZXing-C++ の経路。ZXing と同じく、Worker を作れない環境ではメインスレッド実行に落ちる
+  function useZXingCpp() {
+    setEngine('ZXing-C++ 読み込み中…');
+
+    return createZXingCppWorkerDetector().catch((err) => {
+      console.warn('ZXing-C++ を Worker で動かせないため、メインスレッドで実行します', err);
+      return createZXingCppMainDetector();
+    });
+  }
+
   // 「自動」。BarcodeDetector が使えなければ ZXing に落ちる（従来どおりの順序）
   function useAuto() {
     return createNativeDetector()
@@ -652,6 +773,8 @@
       if (engineChoice === 'quagga') {
         setEngine('Quagga2 読み込み中…');
         detectorCache.set(engineChoice, createQuaggaDetector());
+      } else if (engineChoice === 'zxing-cpp') {
+        detectorCache.set(engineChoice, useZXingCpp());
       } else if (engineChoice === 'zxing') {
         detectorCache.set(engineChoice, useZXing());
       } else {
@@ -803,8 +926,8 @@
   // BarcodeDetector は端末側のモジュール未取得などで例外を返すことがあり、
   // Worker も動き出したあとで落ちることがある。どちらも黙って止まらず、
   // ひとつ下の経路（ネイティブ -> ZXing、Worker -> メインスレッド）に切り替える。
-  // メインスレッドの ZXing と、明示的に選ばれた Quagga2 には落ちる先が無いので、
-  // そのまま投げ返して #engine にエラーを出す
+  // メインスレッド実行の ZXing / ZXing-C++ と、明示的に選ばれた Quagga2 には
+  // 落ちる先が無いので、そのまま投げ返して #engine にエラーを出す
   async function runDetect(source) {
     try {
       return await detect(source);
@@ -817,6 +940,9 @@
       } else if (engineKind === 'zxing-worker') {
         console.warn('Worker での解析が失敗したため、メインスレッドに切り替えます', err);
         fallback = createZXingMainDetector();
+      } else if (engineKind === 'zxing-cpp-worker') {
+        console.warn('Worker での解析が失敗したため、メインスレッドに切り替えます', err);
+        fallback = createZXingCppMainDetector();
       }
 
       if (!fallback) throw err;

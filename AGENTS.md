@@ -10,9 +10,10 @@
 ```
 index.html   画面（マークアップ + CSS 全部）と、js を動的に読み込むローダ
 camera.js    getUserMedia でのカメラ制御。barcode.js / photo.js のライフサイクル管理
-barcode.js   バーコード検出（BarcodeDetector → ZXing フォールバック、選択で Quagga2）
+barcode.js   バーコード検出（BarcodeDetector → ZXing フォールバック、
+             選択で ZXing-C++ / Quagga2）
 barcode-worker.js
-             ZXing の解析を回す Worker。barcode.js からのみ使う
+             ZXing / ZXing-C++ の解析を回す Worker。barcode.js からのみ使う
 photo.js     静止画撮影（ImageCapture → video フレーム取得フォールバック）
 vendor/      第三者ライブラリ（無改変で同梱）
 ```
@@ -73,33 +74,41 @@ const scanner = window.BarcodeScanner || { start() {}, stop() {} };
 
 ### barcode.js
 
-検出エンジンは 3 系統。**まず `BarcodeDetector`、駄目なら同梱 ZXing** に落ちる。
+検出エンジンは 4 系統。**まず `BarcodeDetector`、駄目なら同梱 ZXing** に落ちる。
 ZXing はさらに **Worker → メインスレッド** の 2 段になっていて、自動では
 `BarcodeDetector` → `ZXing (Worker)` → `ZXing` の順に落ちる。
-**Quagga2 はこの自動の連鎖には入らない**（下の「エンジンの選択」を参照）。
+**ZXing-C++ と Quagga2 はこの自動の連鎖には入らない**（下の「エンジンの選択」を参照）。
 いま何で動いているかは `#engine` のバッジにそのまま出る。
 
 - **読み取る種類は `FORMATS` に集約してある。現状は CODE39 のみ。**
   `BarcodeDetector` には `code_39`、ZXing には `POSSIBLE_FORMATS` として、
+  ZXing-C++ には `formats` として `Code39` を、
   Quagga2 には `decoder.readers` として `code_39_reader` を渡す。
-  3 者とも表記が違うので 1 件につき 3 つ書く（`pdf417` / `PDF_417` のように
+  4 者とも表記が違うので 1 件につき 4 つ書く（`pdf417` / `PDF_417` のように
   大文字化だけでは揃わないものがあるため、機械変換にしていない）。
   結果の `format` は全経路で大文字表記（`CODE_39`）に揃えてから返す。
+  ZXing-C++ だけは `Code39` のような独自表記で返ってくるので、`FORMATS` を逆に引いて直す
+  （`zxingCppFormat()`。barcode.js と barcode-worker.js の両方に同じものがある）。
 - `BarcodeDetector` は API があっても `getSupportedFormats()` が空配列を返す環境がある
   （`FORMATS` のどれも含まれない場合も同じ扱い。いずれも ZXing へ）。
   実行中に例外を投げた場合も `runDetect()` が捕まえて ZXing に切り替える。
-- ZXing (`vendor/zxing-0.21.3.min.js`, 約 330KB) と
+- ZXing (`vendor/zxing-0.21.3.min.js`, 約 330KB)、
+  ZXing-C++ (`vendor/zxing-wasm-reader-3.1.4.min.js`, 約 36KB ＋ wasm 約 930KB)、
   Quagga2 (`vendor/quagga2-1.12.1.min.js`, 約 150KB) は**必要になった時だけ**
-  読み込む（ZXing の Worker なら `importScripts`、それ以外は `loadScript()`）。
-  どちらも `LIB_TIMEOUT_MS` = 10 秒でタイムアウトさせる。
-- **ZXing の解析は既定で `barcode-worker.js` に投げる。** ZXing は同期処理なので、
-  メインスレッドで回すと解析のあいだ画面が固まる。Worker 側に移すと、メインスレッドに
-  残るのは `drawImage` と `getImageData` だけになる。
+  読み込む（Worker なら `importScripts`、それ以外は `loadScript()`）。
+  ZXing と Quagga2 は `LIB_TIMEOUT_MS` = 10 秒、ZXing-C++ は wasm の取得とコンパイルまで
+  待つので `WASM_INIT_TIMEOUT_MS` = 30 秒でタイムアウトさせる。
+- **ZXing と ZXing-C++ の解析は既定で `barcode-worker.js` に投げる。** どちらも
+  呼び出したスレッドを止めるので、メインスレッドで回すと解析のあいだ画面が固まる。
+  Worker 側に移すと、メインスレッドに残るのは `drawImage` と `getImageData` だけになる。
   `ImageData` の `ArrayBuffer` は転送で渡す（コピーしない）ので、
   送ったあと元の `ImageData` は使えなくなる（毎フレーム作り捨てにしている）。
+  どちらのエンジンを動かすかは init メッセージの `engine` で決まり、
+  Worker 側の口（`{ id, width, height, buffer }` → `{ text, format } | null`）は共通。
+  メインスレッド側も `createWorkerDetector()` 1 つを使い回す。
 - Worker を作れない場合と、動き出した Worker が途中で落ちた場合は、
-  `createZXingMainDetector()` でメインスレッド実行に落ちる（`runDetect()` が面倒を見る）。
-  遅くはなるが読み取り自体は続く。
+  `createZXingMainDetector()` / `createZXingCppMainDetector()` でメインスレッド実行に
+  落ちる（`runDetect()` が面倒を見る）。遅くはなるが読み取り自体は続く。
 - Worker には canvas が無いので `HTMLCanvasElementLuminanceSource` は使えない。
   代わりに同じ係数で自前に RGBA → 輝度へ変換し（メインスレッド経路と 1 バイトも
   違わないことを確認済み）、`RGBLuminanceSource` に渡している。
@@ -108,11 +117,12 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
 
 #### エンジンの選択
 
-Android 実機では `BarcodeDetector` が常に勝つため、自動のままだと ZXing や Quagga2 の
-実力を実機で確かめられない。そこで「エンジン」ボタン（`#engineBtn`）で
-**自動 / ZXing / Quagga2** を巡回して選べるようにしてある。
+Android 実機では `BarcodeDetector` が常に勝つため、自動のままだと ZXing や ZXing-C++、
+Quagga2 の実力を実機で確かめられない。そこで「エンジン」ボタン（`#engineBtn`）で
+**自動 / ZXing / ZXing-C++ / Quagga2** を巡回して選べるようにしてある。
 
-- 選択は `localStorage['barcodeEngine']`（`'auto'` / `'zxing'` / `'quagga'`）に保存。
+- 選択は `localStorage['barcodeEngine']`
+  （`'auto'` / `'zxing'` / `'zxing-cpp'` / `'quagga'`）に保存。
   既定は `'auto'`。camera.js の向き設定と同じく、読み書きとも try/catch で握りつぶす。
 - カメラ稼働中に押した場合は**カメラを止めずに検出器だけ差し替える**。
   切替に失敗したら選択を元に戻し、直前のエンジンのまま読み取りを続ける
@@ -120,8 +130,33 @@ Android 実機では `BarcodeDetector` が常に勝つため、自動のまま�
 - 一度作った検出器は `detectorCache`（選択値 → `Promise<エンジン>`）に取っておく。
   行き来のたびにライブラリを読み直したり、ZXing の Worker を作り直したりしないため。
 - 各検出器は `{ kind, name, detect }` を返し、`applyEngine()` が現在値として据える。
-  `kind`（`'native'` / `'zxing-worker'` / `'zxing'` / `'quagga'`）が、切り出し方
+  `kind`（`'native'` / `'zxing-worker'` / `'zxing'` / `'zxing-cpp-worker'` /
+  `'zxing-cpp'` / `'quagga'`）が、切り出し方
   （余白 `needsQuietZone()` ・回転 `needsRotation()`）とフォールバック先を決める。
+
+#### ZXing-C++（wasm）
+
+`vendor/zxing-wasm-reader-3.1.4.min.js` ＋ `vendor/zxing-wasm-reader-3.1.4.wasm`
+（[zxing-wasm](https://github.com/Sec-ant/zxing-wasm) の `reader` サブパスの IIFE 版）。
+Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路で、自動では選ばれない。
+
+- **js と wasm の 2 つで 1 組。** 版を上げるときは `ZXING_CPP_SRC` と
+  `ZXING_CPP_WASM` を両方とも直すこと。
+- 既定の `locateFile` は wasm を jsDelivr から取りに行くので、`prepareZXingModule()` で
+  同梱したもの（絶対 URL）を指すように差し替えている。`fireImmediately: true` にして、
+  wasm の取得とコンパイルまで初期化のうちに終わらせる。ここを待たずに検出器を返すと、
+  最初の数フレームの解析がまとめて待たされる。
+- 解析オプションは `ZXING_CPP_OPTIONS`。`maxNumberOfSymbols: 1`（枠内に複数は想定しない）と
+  `tryInvert: false`（ZXing 経路で `HTMLCanvasElementLuminanceSource` の第 2 引数を
+  `false` にしているのと同じ理由）だけを指定し、`tryHarder` / `tryRotate` /
+  `tryDownscale` は既定（いずれも true）のまま。
+- **`tryRotate` が効くので 90 度回転は渡さない**（`needsRotation()` が false）。
+  左右の白い帯（`SCAN_PAD_X`）は ZXing / Quagga2 と同じく足す。
+- `readBarcodes()` は `{ data, width, height }` を `ImageData` として受け取るので、
+  Quagga2 のように PNG に起こす必要は無い。RGBA → 輝度の変換はライブラリ側で
+  ZXing 経路と同じ係数で行われる。
+- 明示的に選ばれた経路なので、Worker が落ちたときにメインスレッド実行へ下りる以外は
+  他のエンジンに落ちない。
 
 #### Quagga2
 
@@ -146,12 +181,13 @@ Android 実機では `BarcodeDetector` が常に勝つため、自動のまま�
 - 明示的に選ばれた経路なので、失敗しても他のエンジンには落ちない。
   `#engine` に「解析エラー」を出してループは回り続ける。
 
-性能に直結するので、次の 4 点は安易に変えないこと（いずれもコメントに理由あり）。
+性能に直結するので、次の 4 点は安易に変えないこと（いずれもコメントに理由あり。
+1 と 2 は ZXing（zxing-js）経路の話で、3 と 4 は全経路に効く）。
 
 1. **`TRY_HARDER` を付けない。** 全フォーマット有効だと 1 回の解析が約 31ms → 311ms になり、
    実効 3 回/秒まで落ちる。縦向きバーコードは代わりに**こちら側で 1 フレームおきに
    90 度回転**させて対応している（`rotateNext`、ZXing 経路のみ。
-   `BarcodeDetector` と Quagga2 は向きを自前で処理するので常に正立で渡す）。
+   `BarcodeDetector` / ZXing-C++ / Quagga2 は向きを自前で処理するので常に正立で渡す）。
    なお 311ms は全フォーマット時の数字なので、`FORMATS` を絞った今なら
    入れられる可能性はある。試すなら `#engine` の N/s で実測してから。
 2. **`HTMLCanvasElementLuminanceSource(source, false)`** の第 2 引数は `false`。
@@ -190,7 +226,7 @@ Android 実機では `BarcodeDetector` が常に勝つため、自動のまま�
     GPU からの読み戻しになって逆に重くなる。
   - `stop()` で `releasePreviewFrame()` を呼び、停止後に古いフレームを解析／表示しない
     ようにする。
-- ZXing / Quagga2 経路では、切り出した画像の**左右に幅 `SCAN_PAD_X` = 50px の白い帯**を
+- 同梱ライブラリの経路（ZXing / ZXing-C++ / Quagga2）では、切り出した画像の**左右に幅 `SCAN_PAD_X` = 50px の白い帯**を
   足してから渡す。枠いっぱいにバーコードが写っているとクワイエットゾーンが足りず
   読めないため。回転経路でもバーが並ぶのは canvas の横方向なので、足す位置は正立時と同じ。
   `BarcodeDetector` には足さない（端末側の実装に任せる）。
@@ -261,24 +297,31 @@ Android 実機では `BarcodeDetector` が常に勝つため、自動のまま�
 
 `vendor/README.md` に取得元・SHA-256・更新手順がある。**ファイルは無改変で置く。**
 ファイル名にバージョンが入っているので、更新したら `barcode.js` の `ZXING_SRC` /
-`QUAGGA_SRC` も併せて変えること。ZXing のライセンス表記は上流に既知の不整合
+`ZXING_CPP_SRC` / `ZXING_CPP_WASM` / `QUAGGA_SRC` も併せて変えること
+（ZXing-C++ は js と wasm の 2 つで 1 組）。ZXing のライセンス表記は上流に既知の不整合
 （MIT / Apache-2.0）があり、同梱されていた Apache-2.0 全文を
 `vendor/zxing-LICENSE.txt` に置いている。Quagga2 は MIT で、全文は
-`vendor/quagga2-LICENSE.txt`。
+`vendor/quagga2-LICENSE.txt`。zxing-wasm は MIT で `vendor/zxing-wasm-LICENSE.txt`、
+wasm の中身の ZXing-C++ 本体は Apache-2.0（全文は `vendor/zxing-LICENSE.txt` と同じもの）。
 
 ## 作業するときの注意
 
 - **HTTPS か localhost でしか動かない。** `file://` で開くとカメラは起動しない。
   ローカル確認は `python -m http.server` 等でサーバ経由にする。
+  ZXing-C++ を試すときは、そのサーバが `.wasm` を `application/wasm` で返すかも見ること
+  （返さないと `WebAssembly.instantiateStreaming` が失敗する。ArrayBuffer 経由に
+  落ちるので動きはするが、実機の GitHub Pages と条件が変わる）。
 - デスクトップ Chrome は `BarcodeDetector` が使えず ZXing 経路になる。
   ネイティブ経路を確認したいなら Android 実機が必要。`ImageCapture` も
   同様に端末差が大きいので、**両方の経路を実機で確認する**こと。
 - エンジンを変えたら `#engine` の N/s を実機で見ること。特に Quagga2 は
   PNG 経由でメインスレッド実行なので、端末によって速度が大きく変わる。
+  ZXing-C++ は `tryHarder` / `tryRotate` / `tryDownscale` を既定のまま入れてあるので、
+  端末によっては重く出る可能性がある。落ちるようなら `ZXING_CPP_OPTIONS` を削る。
 - ブラウザ差分に対する防御（try/catch で握りつぶす、未対応なら `null` を返す、
   ダミーオブジェクトにフォールバックする）が随所にある。これは意図的なもので、
   「エラーを握りつぶしている」ように見えても消さないこと。理由はコメントに書いてある。
 - コメントもコミットメッセージも日本語。既存の文体に合わせる。
 - 性能に関わる定数（`SCAN_INTERVAL_MS`, `MAX_SCAN_SIDE`, `JPEG_QUALITY`,
-  `LIB_TIMEOUT_MS`, `QUAGGA_DECODE_TIMEOUT_MS`）は各ファイル先頭にまとめてある。
-  新しい定数も同じ場所に置く。
+  `LIB_TIMEOUT_MS`, `WASM_INIT_TIMEOUT_MS`, `QUAGGA_DECODE_TIMEOUT_MS`,
+  `ZXING_CPP_OPTIONS`）は各ファイル先頭にまとめてある。新しい定数も同じ場所に置く。
