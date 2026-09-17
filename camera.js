@@ -135,6 +135,19 @@
     console.error(err);
   }
 
+  // 権限が既に許可済みかを調べる。
+  // Permissions API の 'camera' は未対応のブラウザ（Firefox / 一部の Safari）があるため、
+  // 失敗しても致命的に扱わない
+  async function queryCameraPermission() {
+    if (!navigator.permissions || !navigator.permissions.query) return null;
+
+    try {
+      return await navigator.permissions.query({ name: 'camera' });
+    } catch (err) {
+      return null;
+    }
+  }
+
   startBtn.addEventListener('click', startCamera);
   stopBtn.addEventListener('click', () => stopCamera());
   switchBtn.addEventListener('click', switchCamera);
@@ -146,5 +159,32 @@
   // ページを離れるときにカメラを確実に解放する
   window.addEventListener('pagehide', () => stopCamera({ silent: true }));
 
-  setRunning(false);
+  async function init() {
+    setRunning(false);
+
+    // 安全なコンテキスト (https:// か localhost) でないと、
+    // ブラウザは権限を永続化しないため毎回ダイアログが出る
+    if (!window.isSecureContext) {
+      setStatus(
+        `${location.protocol}// では権限が保存されません。https:// か http://localhost で開いてください。`
+      );
+      return;
+    }
+
+    const permission = await queryCameraPermission();
+    if (!permission) return;
+
+    // 許可済みならダイアログは出ないので、そのまま起動する
+    if (permission.state === 'granted') {
+      startCamera();
+    } else if (permission.state === 'denied') {
+      setStatus('カメラがブロックされています。アドレスバーのアイコンから許可してください。');
+    }
+
+    permission.addEventListener('change', () => {
+      if (permission.state === 'granted' && !stream) startCamera();
+    });
+  }
+
+  init();
 })();
