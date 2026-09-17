@@ -10,9 +10,22 @@
   const SCAN_INTERVAL_MS = 120;      // 1 秒あたり約 8 回スキャンする
   const COPY_LABEL_RESET_MS = 1500;
 
-  // 解析に回す画像の最大辺。1080p の枠内をそのまま渡すと 1 回の解析が重く、
-  // 実質のスキャン回数が落ちるため縮小する（バーの太さは十分残る）
-  const MAX_SCAN_SIDE = 900;
+  // 解析に回す画像の最大辺。切り出したあとの処理（getImageData →
+  // グレースケール変換 → 二値化 → デコード）はすべて画素数に比例するので、
+  // ここを絞るのが一番素直に効く。
+  //
+  // 900 では大半の端末で切り出しサイズを下回らず、実質的に無効だった
+  // （例: 1080p 縦持ちの iPhone で切り出しは 864x768）。640 まで落としても
+  // CODE39 のバーの太さは十分残る
+  const MAX_SCAN_SIDE = 640;
+
+  // 読み取る対象のフォーマット。現状は CODE39 のみ。
+  // BarcodeDetector と ZXing で表記が違うので両方を持つ。大半は大文字小文字の
+  // 差でしかないが、PDF417 だけ 'pdf417' / 'PDF_417' と規則が揃わないため
+  // 機械的な変換はせず、増やすときは 2 つとも書くこと
+  const FORMATS = [
+    { native: 'code_39', zxing: 'CODE_39' }
+  ];
 
   const video = document.getElementById('video');
   const scanArea = document.getElementById('scanArea');
@@ -26,9 +39,18 @@
   const closeBtn = document.getElementById('resultCloseBtn');
 
   // 検出領域だけを切り出すための作業用キャンバス。
-  // ZXing は getImageData を多用するので willReadFrequently を立てておく
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  // ZXing は getImageData を多用するので willReadFrequently を立てておく。
+  //
+  // 正立用と回転用で 2 枚持つ。1 枚を使い回すと、ZXing 経路では 1 フレームおきに
+  // 幅と高さが入れ替わるせいで、下の再確保ガードが毎回すり抜けてしまう
+  // （canvas への width/height 代入はバッキングストアの再確保とゼロクリアを伴う）
+  function createScanCanvas() {
+    const element = document.createElement('canvas');
+    return { canvas: element, ctx: element.getContext('2d', { willReadFrequently: true }) };
+  }
+
+  // [0] = 正立, [1] = 90 度回転
+  const scanCanvases = [createScanCanvas(), createScanCanvas()];
 
   let detect = null;         // (canvas) => { text, format } | null （Promise でも可）
   let detectorPromise = null;
@@ -158,14 +180,17 @@
     });
   }
 
-  // BarcodeDetector が対応しているフォーマットをすべて有効にする
+  // 読み取る対象のうち、この端末の BarcodeDetector が扱えるものだけを有効にする。
+  // 無関係なフォーマットを渡さないぶん、ネイティブ側の 1 回の検出も軽くなる
   async function createNativeDetector() {
     if (!('BarcodeDetector' in window)) return null;
 
-    const formats = (await window.BarcodeDetector.getSupportedFormats()).filter(
-      (format) => format !== 'unknown'
+    const supported = await window.BarcodeDetector.getSupportedFormats();
+    const formats = FORMATS.map((format) => format.native).filter((name) =>
+      supported.includes(name)
     );
-    // API はあってもプラットフォーム側が未対応だと空配列が返る
+    // API はあってもプラットフォーム側が未対応だと空配列が返る。
+    // 読みたいフォーマットが 1 つも無い場合も同じく ZXing に任せる
     if (!formats.length) return null;
 
     const detector = new window.BarcodeDetector({ formats });
@@ -185,14 +210,24 @@
     const ZXing = window.ZXing;
     if (!ZXing) throw new Error('ZXing の初期化に失敗しました。');
 
-    // POSSIBLE_FORMATS を渡さないと、MultiFormatReader は
-    // 1D 系・QR・DataMatrix・Aztec・PDF417 のリーダーをすべて使う。
+    // POSSIBLE_FORMATS を渡さないと、MultiFormatReader は 1D 系・QR・DataMatrix・
+    // Aztec・PDF417 のリーダーをすべて用意し、しかも未検出のフレームでは
+    // 毎回その全部を走らせる（未検出が大半なので、これが 1 回の解析の主な中身になる）。
+    // CODE39 だけに絞ると Code39Reader 1 本で済む。
     //
     // TRY_HARDER は付けない。全フォーマット有効だと 1 回の解析が 10 倍（約 31ms -> 311ms）になり、
     // 実効スキャン数が 3 回/秒まで落ちてしまう。TRY_HARDER の主な利点である
-    // 縦向きバーコードの走査は、こちらでフレームごとに 90 度回転させて代替する
+    // 縦向きバーコードの走査は、こちらでフレームごとに 90 度回転させて代替する。
+    // （フォーマットを絞った今なら TRY_HARDER でも間に合うかもしれないが、
+    //   入れるなら #engine の N/s で実測してから）
+    const hints = new Map();
+    hints.set(
+      ZXing.DecodeHintType.POSSIBLE_FORMATS,
+      FORMATS.map((format) => ZXing.BarcodeFormat[format.zxing])
+    );
+
     const reader = new ZXing.MultiFormatReader();
-    reader.setHints(new Map());
+    reader.setHints(hints);
 
     return (source) => {
       // 第 2 引数を true にすると 1 フレームおきに白黒反転した画像を試す挙動になり、
@@ -274,8 +309,11 @@
     const dw = Math.max(1, Math.round(sw * ratio));
     const dh = Math.max(1, Math.round(sh * ratio));
 
+    const { canvas, ctx } = scanCanvases[rotate ? 1 : 0];
+
     const cw = rotate ? dh : dw;
     const chh = rotate ? dw : dh;
+    // 向きごとに canvas を分けたので、ここを通るのは画面回転やリサイズのときだけ
     if (canvas.width !== cw || canvas.height !== chh) {
       canvas.width = cw;
       canvas.height = chh;
