@@ -13,7 +13,7 @@
   //     scanArea,              // 必須。この要素の矩形の内側だけを切り出して解析する
   //     basePath,              // barcode-worker.js の基準。既定はこの js の場所
   //     vendorPath,            // 同梱ライブラリの置き場所。既定は basePath + 'vendor/'
-  //     formats,               // 読み取る対象（既定は FORMATS ＝ CODE39 のみ）
+  //     formats,               // 読み取る対象（既定は FORMATS ＝ CODE128 と JAN）
   //     engine,                // 'auto' | 'zxing' | 'zxing-cpp' | 'quagga'
   //     storageKey,            // エンジン選択の保存先。null で保存しない
   //     autoPause,             // 検出したら自動で pause する（既定 true）
@@ -89,25 +89,33 @@
   //
   // 900 では大半の端末で切り出しサイズを下回らず、実質的に無効だった
   // （例: 1080p 縦持ちの iPhone で切り出しは 864x768）。640 まで落としても
-  // CODE39 のバーの太さは十分残る
+  // JAN（95 モジュール）や短めの CODE128 ならバーの太さは十分残る。
+  // 桁数の多い CODE128（20 桁で 250 モジュール程度）は細バーが 2〜3px まで
+  // 痩せるので、読めないときはここを戻して実機で見ること
   const MAX_SCAN_SIDE = 640;
 
   // ZXing / Quagga2 に渡す画像の左右に足す白い余白の幅（px）。
-  // 検出枠いっぱいにバーコードが写っていると、CODE39 の開始/終了記号の外側に
-  // 必要な静止領域（クワイエットゾーン）まで切り落とされて読めないことがあるので、
+  // 検出枠いっぱいにバーコードが写っていると、開始/終了記号の外側に必要な
+  // 静止領域（クワイエットゾーン）まで切り落とされて読めないことがあるので、
   // 切り出した画像の左右を白で埋めて補う。
   // 回転経路でもバーが並ぶ向きは canvas の横方向なので、足す位置は同じ
   const SCAN_PAD_X = 50;
 
-  // 読み取る対象のフォーマット。既定は CODE39 のみ。
+  // 読み取る対象のフォーマット。既定は CODE128 と JAN（＝ EAN-13 / EAN-8）。
+  // JAN は 13 桁と 8 桁で別のフォーマット扱いなので 2 件書く。
   // BarcodeDetector / ZXing / ZXing-C++ / Quagga2 で表記が違うので 4 つとも持つ。大半は
   // 大文字小文字と区切りの差でしかないが、PDF417 だけ 'pdf417' / 'PDF_417' と規則が
   // 揃わないため機械的な変換はせず、増やすときは 4 つとも書くこと。
   // Quagga2 はリーダー名で指定する（対応表は同梱ライブラリの Readers を参照）。
-  // ZXing-C++ の表記は zxing-wasm の README にある一覧を参照。
-  // 結果の format は全経路で zxing の表記（CODE_39）に揃えてから返す
+  // EAN-13 だけ 'ean_13_reader' ではなく 'ean_reader' なので注意。
+  // ZXing-C++ の表記は同梱の js が持つ `ZXingWASM.barcodeFormats` が一覧（区切りは入らない。
+  // 'EAN-13' のような綴りも受け付けるが、結果に入るのは 'EAN13' のほうなので一覧に合わせる。
+  // **綴りが違っても例外にはならず、黙って全フォーマットを見に行く**ので注意）。
+  // 結果の format は全経路で zxing の表記（CODE_128 / EAN_13 / EAN_8）に揃えてから返す
   const FORMATS = [
-    { native: 'code_39', zxing: 'CODE_39', zxingCpp: 'Code39', quagga: 'code_39_reader' }
+    { native: 'code_128', zxing: 'CODE_128', zxingCpp: 'Code128', quagga: 'code_128_reader' },
+    { native: 'ean_13', zxing: 'EAN_13', zxingCpp: 'EAN13', quagga: 'ean_reader' },
+    { native: 'ean_8', zxing: 'EAN_8', zxingCpp: 'EAN8', quagga: 'ean_8_reader' }
   ];
 
   // 同じバーコードを同じ端末で読み比べられるように、使うエンジンを選べるようにしてある。
@@ -433,7 +441,7 @@
         const results = await detector.detect(source);
         if (!results.length) return null;
 
-        // 他のエンジンと表記を揃える（code_39 -> CODE_39）
+        // 他のエンジンと表記を揃える（code_128 -> CODE_128）
         return { text: results[0].rawValue, format: String(results[0].format).toUpperCase() };
       }
     };
@@ -567,14 +575,16 @@
     // POSSIBLE_FORMATS を渡さないと、MultiFormatReader は 1D 系・QR・DataMatrix・
     // Aztec・PDF417 のリーダーをすべて用意し、しかも未検出のフレームでは
     // 毎回その全部を走らせる（未検出が大半なので、これが 1 回の解析の主な中身になる）。
-    // CODE39 だけに絞ると Code39Reader 1 本で済む。
+    // CODE128 と JAN に絞ると Code128Reader と MultiFormatUPCEANReader
+    // （EAN13Reader / EAN8Reader を束ねたもの）の 2 本で済む。
     //
     // TRY_HARDER を付けると、doDecode が高さ方向に見る行が 15 行から画像の高さぶん
     // 全部に増える（行ステップも h>>5 から h>>8 になる）。
     // 全フォーマット有効だった頃は 1 回の解析が 10 倍（約 31ms -> 311ms）になり
-    // 実効 3 回/秒まで落ちたが、POSSIBLE_FORMATS を CODE39 だけに絞った今は
-    // Code39Reader 1 本ぶんの増加で済む。**重くなったらまずここを外す。**
-    // 判断は onEngineChange の rate を実機で見て行うこと。
+    // 実効 3 回/秒まで落ちたが、POSSIBLE_FORMATS を絞った今はこの 2 本ぶんの
+    // 増加で済む。**重くなったらまずここを外す。**
+    // 判断は onEngineChange の rate を実機で見て行うこと
+    // （CODE39 1 本だった頃より重いので、フォーマットを増やしたら測り直すこと）。
     //
     // なお TRY_HARDER の回転リトライ（未検出なら 90 度回してもう一度）は、この
     // ライブラリでは使い物にならない。Worker 経路の RGBLuminanceSource は
@@ -585,7 +595,7 @@
     //
     // setHints は TRY_HARDER をキーの有無で見る（値が false でも「あり」扱い）。
     // 外すときは false を入れるのではなく set ごと消すこと。
-    // 1D リーダーを最後尾に回す副作用もあるが、CODE39 だけなので並びは変わらない
+    // 1D リーダーを最後尾に回す副作用もあるが、1D だけなので並びは変わらない
     const hints = new Map();
     hints.set(
       ZXing.DecodeHintType.POSSIBLE_FORMATS,
@@ -622,15 +632,27 @@
     };
   }
 
-  // ZXing-C++ は 'Code39' という独自の表記で返してくるので、他のエンジンと同じ
-  // 大文字表記（CODE_39）に直す。barcode-worker.js にも同じものがある
+  // ZXing-C++ は 'EAN13' という独自の表記で返してくるので、他のエンジンと同じ
+  // 大文字表記（EAN_13）に直す。barcode-worker.js にも同じものがある。
+  //
+  // symbology と format の 2 つがあり、symbology のほうが粗い。EAN13 / EAN8 は
+  // どちらも symbology が 'EANUPC'（EAN/UPC 系をまとめた親）になり、13 桁と 8 桁の
+  // 区別が付かない（3.1.4 で確認）。**先に format を見て、駄目なら symbology** の順で
+  // FORMATS を引く。symbology 側にしか無い括り（Code39Ext をまとめた Code39 など）も
+  // これで拾える
   function zxingCppFormat(result) {
-    // symbology は変種（Code39Ext など）を束ねた親を返すので、あればそちらを見る
-    const name = String(result.symbology || result.format || '');
-    const known = config.formats.find(
-      (format) => format.zxingCpp.toLowerCase() === name.toLowerCase()
-    );
-    return known ? known.zxing : name.toUpperCase();
+    const names = [result.format, result.symbology]
+      .map((name) => String(name || ''))
+      .filter(Boolean);
+
+    for (const name of names) {
+      const known = config.formats.find(
+        (format) => format.zxingCpp.toLowerCase() === name.toLowerCase()
+      );
+      if (known) return known.zxing;
+    }
+
+    return (names[0] || '').toUpperCase();
   }
 
   // Worker を使えない環境向けの ZXing-C++ 経路。解析のあいだメインスレッドが止まる
@@ -735,7 +757,7 @@
         const code = result && result.codeResult;
         if (!code || !code.code) return null;
 
-        // 他のエンジンと表記を揃える（code_39 -> CODE_39）
+        // 他のエンジンと表記を揃える（code_128 -> CODE_128）
         return { text: code.code, format: String(code.format).toUpperCase() };
       }
     };

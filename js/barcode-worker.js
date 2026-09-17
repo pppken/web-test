@@ -84,16 +84,25 @@ function initZXing(message) {
 
 // --- ZXing-C++（wasm）-------------------------------------------------
 
-// ZXing-C++ は 'Code39' という独自の表記で返してくるので、他のエンジンと同じ
-// 大文字表記（CODE_39）に直す。対応は FORMATS が持っているのでそれを引く。
-// メインスレッド経路（barcode.js）にも同じものがある
+// ZXing-C++ は 'EAN13' という独自の表記で返してくるので、他のエンジンと同じ
+// 大文字表記（EAN_13）に直す。対応は FORMATS が持っているのでそれを引く。
+// メインスレッド経路（barcode.js）にも同じものがある。
+//
+// symbology は EAN13 / EAN8 のどちらでも 'EANUPC' になり 13 桁と 8 桁を区別できない
+// （3.1.4 で確認）ので、先に format を見る。理由は barcode.js 側に詳しく書いてある
 function zxingCppFormat(result, formats) {
-  // symbology は変種（Code39Ext など）を束ねた親を返すので、あればそちらを見る
-  const name = String(result.symbology || result.format || '');
-  const known = formats.find(
-    (format) => format.zxingCpp.toLowerCase() === name.toLowerCase()
-  );
-  return known ? known.zxing : name.toUpperCase();
+  const names = [result.format, result.symbology]
+    .map((name) => String(name || ''))
+    .filter(Boolean);
+
+  for (const name of names) {
+    const known = formats.find(
+      (format) => format.zxingCpp.toLowerCase() === name.toLowerCase()
+    );
+    if (known) return known.zxing;
+  }
+
+  return (names[0] || '').toUpperCase();
 }
 
 async function initZXingCpp(message) {

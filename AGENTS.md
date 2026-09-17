@@ -197,15 +197,24 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
 **ZXing-C++ と Quagga2 はこの自動の連鎖には入らない**（下の「エンジンの選択」を参照）。
 いま何で動いているかは `onEngineChange` の `name` に出る（このページでは `#engine` のバッジ）。
 
-- **読み取る種類は `FORMATS` に集約してある。既定は CODE39 のみ**（`configure({ formats })` で差し替えられる）。
-  `BarcodeDetector` には `code_39`、ZXing には `POSSIBLE_FORMATS` として、
-  ZXing-C++ には `formats` として `Code39` を、
-  Quagga2 には `decoder.readers` として `code_39_reader` を渡す。
-  4 者とも表記が違うので 1 件につき 4 つ書く（`pdf417` / `PDF_417` のように
+- **読み取る種類は `FORMATS` に集約してある。既定は CODE128 と JAN**
+  （＝ EAN-13 / EAN-8。13 桁と 8 桁は別フォーマット扱いなので 3 件ある。
+  `configure({ formats })` で差し替えられる）。
+  `BarcodeDetector` には `code_128` / `ean_13` / `ean_8`、ZXing には `POSSIBLE_FORMATS`
+  として `CODE_128` / `EAN_13` / `EAN_8`、ZXing-C++ には `formats` として
+  `Code128` / `EAN13` / `EAN8`、Quagga2 には `decoder.readers` として
+  `code_128_reader` / `ean_reader` / `ean_8_reader` を渡す。
+  4 者とも表記が違うので 1 件につき 4 つ書く（`pdf417` / `PDF_417` や
+  EAN-13 の Quagga2 名が `ean_reader` であるように、
   大文字化だけでは揃わないものがあるため、機械変換にしていない）。
-  結果の `format` は全経路で大文字表記（`CODE_39`）に揃えてから返す。
-  ZXing-C++ だけは `Code39` のような独自表記で返ってくるので、`FORMATS` を逆に引いて直す
+  ZXing-C++ の綴りは同梱 js の `ZXingWASM.barcodeFormats` が一覧。
+  **綴りを間違えても例外にはならず黙って全フォーマットを見に行く**ので、
+  増やすときはこの一覧と突き合わせること。
+  結果の `format` は全経路で大文字表記（`CODE_128` / `EAN_13`）に揃えてから返す。
+  ZXing-C++ だけは `EAN13` のような独自表記で返ってくるので、`FORMATS` を逆に引いて直す
   （`zxingCppFormat()`。barcode.js と barcode-worker.js の両方に同じものがある）。
+  **引く順は `format` → `symbology`。** `symbology` は EAN13 / EAN8 のどちらでも
+  `EANUPC` になり、13 桁と 8 桁を区別できない（3.1.4 で確認）。
 - `BarcodeDetector` は API があっても `getSupportedFormats()` が空配列を返す環境がある
   （`FORMATS` のどれも含まれない場合も同じ扱い。いずれも ZXing へ）。
   実行中に例外を投げた場合も `runDetect()` が捕まえて ZXing に切り替える。
@@ -312,7 +321,9 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
    （740x568、実機相当のサイズ）で **ZXing 0.9ms → 12.9ms、ZXing-C++ 1.0ms → 3.5ms**
    で収まった（検出フレームは 1 行目で当たるのでどちらも変わらない）。
    `SCAN_INTERVAL_MS = 120` に対しては十分小さい。**ただしこれはデスクトップでの数字で、
-   実写フレームはもっと当たりが多く重い。** 実機では必ず `#engine` の N/s を見ること。
+   しかも CODE39 1 本だった頃のもの。** いまは CODE128 と JAN の
+   `Code128Reader` + `MultiFormatUPCEANReader` の 2 本を回すぶん重く、
+   実写フレームはさらに当たりが多い。実機では必ず `#engine` の N/s を見ること。
    なお縦向きバーコードは `TRY_HARDER` の回転リトライ任せにはできない。
    Worker 経路の `RGBLuminanceSource` は `isRotateSupported()` が false で走らず、
    メインスレッド経路の `HTMLCanvasElementLuminanceSource` は true を返すのに
