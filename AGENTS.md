@@ -136,8 +136,9 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
 - Worker には canvas が無いので `HTMLCanvasElementLuminanceSource` は使えない。
   代わりに同じ係数で自前に RGBA → 輝度へ変換し（メインスレッド経路と 1 バイトも
   違わないことを確認済み）、`RGBLuminanceSource` に渡している。
-  こちらは `isRotateSupported()` が false だが、回転が要るのは `TRY_HARDER` を
-  付けたときだけなので今は影響しない。**`TRY_HARDER` を入れるならここも見直すこと。**
+  こちらは `isRotateSupported()` が false なので、`TRY_HARDER` を入れてある今も
+  **ZXing 側の 90 度回転リトライはこの経路では走らない**。縦向きバーコードは
+  `rotateNext` で拾うので、Worker 経路でもそちらは外せない。
 
 #### エンジンの選択
 
@@ -170,21 +171,11 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
   同梱したもの（絶対 URL）を指すように差し替えている。`fireImmediately: true` にして、
   wasm の取得とコンパイルまで初期化のうちに終わらせる。ここを待たずに検出器を返すと、
   最初の数フレームの解析がまとめて待たされる。
-- 解析オプションは `ZXING_CPP_OPTIONS`。指定しているのは次の 4 つで、
-  `tryHarder` / `tryRotate` / `tryDownscale` は既定（いずれも true）のまま。
-  - `maxNumberOfSymbols: 1` 枠内に複数は想定しない。
-  - `tryInvert: false` ZXing 経路で `HTMLCanvasElementLuminanceSource` の第 2 引数を
-    `false` にしているのと同じ理由。
-  - `binarizer: 'GlobalHistogram'` 既定は `'LocalAverage'`（局所平均）。ZXing 経路が
-    使う `GlobalHistogramBinarizer` と揃えて、読み比べに二値化の違いを混ぜないため。
-    ライブラリが `'LocalAverage'` を既定にしているのは照明ムラのある実写を想定して
-    のことなので、**実機で読めなくなるようなら戻すこと**（照明ムラを掛けた合成画像で
-    両者を比べた範囲では差が出なかった。FixedThreshold / BoolCast とは差が出る）。
-    なお zxing-js 側では `HybridBinarizer` が `getBlackMatrix()` しか上書きしておらず、
-    1D が使う `getBlackRow()` は `GlobalHistogramBinarizer` のものなので、
-    どちらを選んでも 1D の結果は変わらない（ZXing-C++ は 1D でも方式が効く）。
-  - `minLineCount: 1` 既定は 2（同じ結果が 2 行ぶん揃わないと採用しない）。
-    1 行で通すぶん速いが、行をまたいだ照合が無くなるので誤読は出やすくなる。
+- 解析オプションは `ZXING_CPP_OPTIONS`。`maxNumberOfSymbols: 1`（枠内に複数は想定しない）、
+  `tryInvert: false`（ZXing 経路で `HTMLCanvasElementLuminanceSource` の第 2 引数を
+  `false` にしているのと同じ理由）、`tryHarder: true` の 3 つを指定する。
+  `tryHarder` は既定でも true だが、ZXing 経路と揃えて明示している（重いときに最初に
+  外す場所なので既定任せにしない）。`tryRotate` / `tryDownscale` は既定（true）のまま。
 - **`tryRotate` が効くので 90 度回転は渡さない**（`needsRotation()` が false）。
   左右の白い帯（`SCAN_PAD_X`）は ZXing / Quagga2 と同じく足す。
 - `readBarcodes()` は `{ data, width, height }` を `ImageData` として受け取るので、
@@ -219,12 +210,23 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
 性能に直結するので、次の 4 点は安易に変えないこと（いずれもコメントに理由あり。
 1 と 2 は ZXing（zxing-js）経路の話で、3 と 4 は全経路に効く）。
 
-1. **`TRY_HARDER` を付けない。** 全フォーマット有効だと 1 回の解析が約 31ms → 311ms になり、
-   実効 3 回/秒まで落ちる。縦向きバーコードは代わりに**こちら側で 1 フレームおきに
-   90 度回転**させて対応している（`rotateNext`、ZXing 経路のみ。
-   `BarcodeDetector` / ZXing-C++ / Quagga2 は向きを自前で処理するので常に正立で渡す）。
-   なお 311ms は全フォーマット時の数字なので、`FORMATS` を絞った今なら
-   入れられる可能性はある。試すなら `#engine` の N/s で実測してから。
+1. **`TRY_HARDER` は入れてあるが、重くなったら最初にここを外す。** 全フォーマット有効
+   だった頃は 1 回の解析が約 31ms → 311ms（実効 3 回/秒）まで落ちたので付けていなかったが、
+   `FORMATS` を CODE39 だけに絞ったあとに測り直したところ、未検出フレーム
+   （740x568、実機相当のサイズ）で **ZXing 0.9ms → 12.9ms、ZXing-C++ 1.0ms → 3.5ms**
+   で収まった（検出フレームは 1 行目で当たるのでどちらも変わらない）。
+   `SCAN_INTERVAL_MS = 120` に対しては十分小さい。**ただしこれはデスクトップでの数字で、
+   実写フレームはもっと当たりが多く重い。** 実機では必ず `#engine` の N/s を見ること。
+   なお縦向きバーコードは `TRY_HARDER` の回転リトライ任せにはできない。
+   Worker 経路の `RGBLuminanceSource` は `isRotateSupported()` が false で走らず、
+   メインスレッド経路の `HTMLCanvasElementLuminanceSource` は true を返すのに
+   `rotateCounterClockwise()` が縦横を入れ替えずに同じ寸法を返す（0.21.3 で確認済み。
+   縦向きの画像を渡しても読めない）。
+   これまで通り**こちら側で 1 フレームおきに 90 度回転**させて対応する
+   （`rotateNext`、ZXing 経路のみ。`BarcodeDetector` / ZXing-C++ / Quagga2 は
+   向きを自前で処理するので常に正立で渡す）。
+   外すときは `false` を入れるのではなく `hints.set` ごと消すこと
+   （`setHints` はキーの有無で見るため、`false` でも「あり」扱いになる）。
 2. **`HTMLCanvasElementLuminanceSource(source, false)`** の第 2 引数は `false`。
    `true` だと 1 フレームおきに白黒反転画像を試し、通常のバーコードの実効回数が半減する。
 3. **`MAX_SCAN_SIDE = 640`** に縮小してから解析に渡す。グレースケール変換・二値化は
@@ -357,10 +359,9 @@ wasm の中身の ZXing-C++ 本体は Apache-2.0（全文は `vendor/zxing-LICEN
   再現するかを確かめること。
 - エンジンを変えたら `#engine` の N/s を実機で見ること。特に Quagga2 は
   PNG 経由でメインスレッド実行なので、端末によって速度が大きく変わる。
-  ZXing-C++ は `tryHarder` / `tryRotate` / `tryDownscale` を既定のまま入れてあるので、
+  ZXing-C++ は `tryHarder`（明示）/ `tryRotate` / `tryDownscale` がいずれも有効なので、
   端末によっては重く出る可能性がある。落ちるようなら `ZXING_CPP_OPTIONS` を削る。
-  `binarizer` と `minLineCount` は既定から変えてあるので、ZXing-C++ が読めないときは
-  まずこの 2 つを既定（`'LocalAverage'` / `2`）に戻して切り分けること。
+  ZXing（zxing-js）側の `TRY_HARDER` も同じで、重いときに最初に外す候補。
 - ブラウザ差分に対する防御（try/catch で握りつぶす、未対応なら `null` を返す、
   ダミーオブジェクトにフォールバックする）が随所にある。これは意図的なもので、
   「エラーを握りつぶしている」ように見えても消さないこと。理由はコメントに書いてある。

@@ -40,12 +40,14 @@ function initZXing(message) {
   const ZXing = self.ZXing;
   if (!ZXing) throw new Error('ZXing の初期化に失敗しました。');
 
-  // フォーマットを絞る理由は barcode.js の FORMATS のコメントを参照
+  // フォーマットを絞る理由は barcode.js の FORMATS のコメントを参照。
+  // TRY_HARDER を付ける理由と外し方は barcode.js の createZXingMainDetector 側に書いてある
   const hints = new Map();
   hints.set(
     ZXing.DecodeHintType.POSSIBLE_FORMATS,
     message.formats.map((format) => ZXing.BarcodeFormat[format.zxing])
   );
+  hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
 
   const reader = new ZXing.MultiFormatReader();
   reader.setHints(hints);
@@ -57,9 +59,10 @@ function initZXing(message) {
       request.height
     );
 
-    // RGBLuminanceSource は isRotateSupported() が false だが、
-    // 回転が要るのは TRY_HARDER を付けたときだけなので今は影響しない。
-    // TRY_HARDER を入れる場合はここも見直すこと
+    // RGBLuminanceSource は isRotateSupported() が false なので、TRY_HARDER を
+    // 付けても ZXing 側の 90 度回転リトライはこの経路では走らない。縦向きバーコードは
+    // barcode.js 側の rotateNext（1 フレームおきに 90 度回して渡す）で拾うので、
+    // こちらはそのままでよい
     const source = new ZXing.RGBLuminanceSource(gray, request.width, request.height);
     const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(source));
 

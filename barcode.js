@@ -26,24 +26,15 @@
   //   tryInvert           白黒反転した画像は試さない。ZXing 経路で
   //                       HTMLCanvasElementLuminanceSource の第 2 引数を false に
   //                       しているのと同じ理由で、通常のバーコードの実効回数が落ちる
-  //   binarizer           既定の 'LocalAverage'（ブロックごとの局所平均）ではなく
-  //                       'GlobalHistogram'（輝度ヒストグラムから画像全体で 1 つの閾値）。
-  //                       ZXing 経路の GlobalHistogramBinarizer と同じ考え方なので、
-  //                       読み比べたときに二値化の違いが結果に混ざらない。
-  //                       ライブラリが 'LocalAverage' を既定にしているのは照明ムラの
-  //                       ある実写を想定してのことなので、実機で読めなくなるようなら
-  //                       ここを戻すこと（合成画像での比較では差が出なかった）
-  //   minLineCount        既定は 2（同じ結果が 2 行ぶん揃わないと採用しない）。
-  //                       1 にすると 1 行読めた時点で通す。読み取りは速くなるが、
-  //                       行をまたいだ照合が無くなるぶん誤読は出やすくなる
-  // tryHarder / tryRotate / tryDownscale は既定（いずれも true）のまま。
+  //   tryHarder           既定でも true だが、ZXing 経路と揃えて明示しておく。
+  //                       重いときに最初に外す場所なので、既定任せにしない
+  // tryRotate / tryDownscale は既定（いずれも true）のまま。
   // 特に tryRotate が効くので、この経路ではこちら側で 90 度回転させない
   // （needsRotation() が false）。速度が足りないときは #engine の N/s を見ながら外す
   const ZXING_CPP_OPTIONS = {
     maxNumberOfSymbols: 1,
     tryInvert: false,
-    binarizer: 'GlobalHistogram',
-    minLineCount: 1
+    tryHarder: true
   };
 
   // 既定の locateFile は wasm を jsDelivr から取りに行くので、同梱したものを指すように
@@ -604,16 +595,29 @@
     // 毎回その全部を走らせる（未検出が大半なので、これが 1 回の解析の主な中身になる）。
     // CODE39 だけに絞ると Code39Reader 1 本で済む。
     //
-    // TRY_HARDER は付けない。全フォーマット有効だと 1 回の解析が 10 倍（約 31ms -> 311ms）になり、
-    // 実効スキャン数が 3 回/秒まで落ちてしまう。TRY_HARDER の主な利点である
-    // 縦向きバーコードの走査は、こちらでフレームごとに 90 度回転させて代替する。
-    // （フォーマットを絞った今なら TRY_HARDER でも間に合うかもしれないが、
-    //   入れるなら #engine の N/s で実測してから）
+    // TRY_HARDER を付けると、doDecode が高さ方向に見る行が 15 行から画像の高さぶん
+    // 全部に増える（行ステップも h>>5 から h>>8 になる）。
+    // 全フォーマット有効だった頃は 1 回の解析が 10 倍（約 31ms -> 311ms）になり
+    // 実効 3 回/秒まで落ちたが、POSSIBLE_FORMATS を CODE39 だけに絞った今は
+    // Code39Reader 1 本ぶんの増加で済む。**重くなったらまずここを外す。**
+    // 判断は #engine の N/s を実機で見て行うこと。
+    //
+    // なお TRY_HARDER の回転リトライ（未検出なら 90 度回してもう一度）は、この
+    // ライブラリでは使い物にならない。Worker 経路の RGBLuminanceSource は
+    // isRotateSupported() が false で走らず、メインスレッド経路の
+    // HTMLCanvasElementLuminanceSource は true を返すのに rotateCounterClockwise() が
+    // 縦横を入れ替えずに同じ寸法を返す（0.21.3 で確認）。縦向きバーコードは
+    // これまで通り rotateNext で拾う。
+    //
+    // setHints は TRY_HARDER をキーの有無で見る（値が false でも「あり」扱い）。
+    // 外すときは false を入れるのではなく set ごと消すこと。
+    // 1D リーダーを最後尾に回す副作用もあるが、CODE39 だけなので並びは変わらない
     const hints = new Map();
     hints.set(
       ZXing.DecodeHintType.POSSIBLE_FORMATS,
       FORMATS.map((format) => ZXing.BarcodeFormat[format.zxing])
     );
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
 
     const reader = new ZXing.MultiFormatReader();
     reader.setHints(hints);
