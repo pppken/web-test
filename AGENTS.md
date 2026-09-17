@@ -131,6 +131,10 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
   `BarcodeDetector` には足さない（端末側の実装に任せる）。
 - 右上の `#engine` バッジは **`エンジン名 · N/s`** を 1 秒ごとに表示する動作確認用。
   `0/s` ならループが回っていない。デバッグの第一手として見る。
+- 「検出画像」ボタン（`#scanPreviewBtn`）で、いま解析に渡しているのと同じ画像を
+  `#scanPreview` ダイアログに出す。枠のズレ・余白・縮小後のバーの潰れを実機で見るための
+  動作確認用。常に正立（`captureScanArea(false)`）で切り出し、PNG の data URL にして
+  `<img>` に入れる。ボタンの有効・無効は `BarcodeScanner` の `start` / `stop` が切り替える。
 - 結果ダイアログを開いている間は解析を止め、`close` で即座に再開する。
   同じバーコードが枠内にあればすぐ読み直す（`1912ba5` で入れた検証用の挙動）。
 - 作業用 canvas は `getContext('2d', { willReadFrequently: true })`。
@@ -156,6 +160,8 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
   **`img` から src を外してから** revoke する（表示中に revoke すると消える）。
 - 撮影ダイアログを開いている間は `scanner.pause()`、閉じたら `resume()`。
   結果ダイアログと撮影ダイアログが重なるのを防ぐため。
+  同じ理由で、barcode.js 側も結果／検出画像のどちらかが開いていれば解析しない
+  （`anyDialogOpen()`）。
 
 ## UI の約束ごと
 
@@ -166,7 +172,8 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
 - ダイアログは `<dialog>` + `showModal()`。未対応ブラウザ向けに
   `setAttribute('open', '')` のフォールバックを両方のダイアログに入れてある。
 - ボタンの一時的なラベル変更（「コピーしました」「共有できません」など）は
-  1.5 秒で元に戻す。`photo.js` は `dataset.label` に原文を退避している。
+  1.5 秒で元に戻す。`barcode.js` / `photo.js` とも `setLabel()` で行い、
+  原文は `dataset.label` に退避している。
 
 ## vendor/
 

@@ -12,7 +12,7 @@
   const ZXING_WORKER_SRC = 'barcode-worker.js';
 
   const SCAN_INTERVAL_MS = 120;      // 1 秒あたり約 8 回スキャンする
-  const COPY_LABEL_RESET_MS = 1500;
+  const LABEL_RESET_MS = 1500;
 
   // 解析に回す画像の最大辺。切り出したあとの処理（getImageData →
   // グレースケール変換 → 二値化 → デコード）はすべて画素数に比例するので、
@@ -49,6 +49,12 @@
   const copyBtn = document.getElementById('resultCopyBtn');
   const closeBtn = document.getElementById('resultCloseBtn');
 
+  const previewBtn = document.getElementById('scanPreviewBtn');
+  const previewDialog = document.getElementById('scanPreview');
+  const previewImage = document.getElementById('scanPreviewImage');
+  const previewInfo = document.getElementById('scanPreviewInfo');
+  const previewCloseBtn = document.getElementById('scanPreviewCloseBtn');
+
   // 検出領域だけを切り出すための作業用キャンバス。
   // ZXing は getImageData を多用するので willReadFrequently を立てておく。
   //
@@ -70,7 +76,7 @@
   let active = false;        // カメラ稼働中か（camera.js が制御する）
   let paused = false;        // 撮影中など、一時的に解析を止めているか
   let timerId = null;
-  let copyTimerId = null;
+  let labelTimerId = null;
   let rotateNext = false;
 
   // --- エンジン表示（動作確認用）-----------------------------------------
@@ -110,7 +116,25 @@
     scanRate = null;
   }
 
-  // --- 結果ダイアログ ---------------------------------------------------
+  // --- ダイアログ -------------------------------------------------------
+
+  // 結果と検出画像のどちらかを開いている間は解析を止める。
+  // 解析を続けるとモーダルが重なってしまう
+  function anyDialogOpen() {
+    return dialog.open || previewDialog.open;
+  }
+
+  // ボタンのラベルを一時的に差し替える（原文は dataset.label に退避する）
+  function setLabel(button, text) {
+    const original = button.dataset.label || button.textContent;
+    button.dataset.label = original;
+    button.textContent = text;
+
+    clearTimeout(labelTimerId);
+    labelTimerId = setTimeout(() => {
+      button.textContent = original;
+    }, LABEL_RESET_MS);
+  }
 
   function openDialog() {
     if (dialog.open) return;
@@ -142,16 +166,11 @@
   async function copyValue() {
     try {
       await navigator.clipboard.writeText(dialogValue.textContent);
-      copyBtn.textContent = 'コピーしました';
+      setLabel(copyBtn, 'コピーしました');
     } catch (err) {
       console.warn('クリップボードへのコピーに失敗しました', err);
-      copyBtn.textContent = 'コピーできません';
+      setLabel(copyBtn, 'コピーできません');
     }
-
-    clearTimeout(copyTimerId);
-    copyTimerId = setTimeout(() => {
-      copyBtn.textContent = 'コピー';
-    }, COPY_LABEL_RESET_MS);
   }
 
   copyBtn.addEventListener('click', copyValue);
@@ -160,8 +179,42 @@
   // Esc でもボタンでも、閉じたらスキャンを再開する。
   // 同じバーコードが枠内に残っていれば、そのまますぐ読み直す
   dialog.addEventListener('close', () => {
-    clearTimeout(copyTimerId);
-    copyBtn.textContent = 'コピー';
+    clearTimeout(labelTimerId);
+    copyBtn.textContent = copyBtn.dataset.label || copyBtn.textContent;
+
+    if (active && !paused && timerId === null) tick();
+  });
+
+  // --- 検出画像のプレビュー（動作確認用）---------------------------------
+
+  // 解析に渡しているのと同じ画像を、そのままダイアログに出す。
+  // 枠のズレや余白の付き方、縮小後にバーが潰れていないかをその場で確認する
+  function showPreview() {
+    // 回転経路は 1 フレームおきなので、見比べやすいよう常に正立で切り出す
+    const source = captureScanArea(false);
+    if (!source) {
+      setLabel(previewBtn, '取得できません');
+      return;
+    }
+
+    const pad = usingNative ? 0 : SCAN_PAD_X;
+    previewInfo.textContent = pad
+      ? `${source.width} × ${source.height}（うち左右 ${pad}px は白の余白）`
+      : `${source.width} × ${source.height}`;
+    // 解析に渡すのと同じ画素をそのまま見たいので、非可逆な形式にはしない
+    previewImage.src = source.toDataURL('image/png');
+
+    // <dialog> 非対応ブラウザでも最低限は表示されるようにしておく
+    if (typeof previewDialog.showModal === 'function') previewDialog.showModal();
+    else previewDialog.setAttribute('open', '');
+  }
+
+  previewBtn.addEventListener('click', showPreview);
+  previewCloseBtn.addEventListener('click', () => previewDialog.close());
+
+  previewDialog.addEventListener('close', () => {
+    // data URL を抱えたままにしない
+    previewImage.removeAttribute('src');
 
     if (active && !paused && timerId === null) tick();
   });
@@ -503,7 +556,7 @@
   async function tick() {
     timerId = null;
     // ダイアログを開いている間は解析を止める
-    if (!active || paused || dialog.open) return;
+    if (!active || paused || anyDialogOpen()) return;
 
     try {
       // ZXing 経路だけ、縦向きバーコード用に 1 フレームおきで 90 度回転させる。
@@ -514,7 +567,7 @@
       if (source) {
         scanCount += 1;
         const result = await runDetect(source);
-        if (active && !dialog.open && result) handleResult(result);
+        if (active && !anyDialogOpen() && result) handleResult(result);
       }
     } catch (err) {
       console.error('バーコードの解析に失敗しました', err);
@@ -522,18 +575,20 @@
     }
 
     // 解析が遅れてもフレームが溜まらないよう、完了してから次を予約する
-    if (active && !paused && !dialog.open) timerId = setTimeout(tick, SCAN_INTERVAL_MS);
+    if (active && !paused && !anyDialogOpen()) timerId = setTimeout(tick, SCAN_INTERVAL_MS);
   }
 
   async function start() {
     if (active) return;
     active = true;
+    previewBtn.disabled = false;
     setEngine('準備中…');
 
     try {
       detect = await getDetector();
     } catch (err) {
       active = false;
+      previewBtn.disabled = true;
       detectorPromise = null; // 次回の起動で読み込みを再試行する
       stopRateMeter();
       setEngine('');
@@ -556,7 +611,7 @@
 
   function resume() {
     paused = false;
-    if (active && !dialog.open && timerId === null) tick();
+    if (active && !anyDialogOpen() && timerId === null) tick();
   }
 
   function stop() {
@@ -564,6 +619,8 @@
     paused = false;
     clearTimeout(timerId);
     timerId = null;
+    previewBtn.disabled = true;
+    if (previewDialog.open) previewDialog.close();
     stopRateMeter();
     setEngine('');
   }
