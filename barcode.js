@@ -2,8 +2,9 @@
   'use strict';
 
   // 検出は BarcodeDetector（Chrome / Android 等）を優先し、
-  // 非対応のブラウザ（iOS Safari / Firefox / デスクトップ Chrome）では ZXing を CDN から読み込む
-  const ZXING_SRC = 'https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
+  // 非対応のブラウザ（iOS Safari / Firefox / デスクトップ Chrome）では同梱の ZXing を使う。
+  // 初回に必要になったときだけ読み込む（約 330KB）
+  const ZXING_SRC = 'vendor/zxing-0.21.3.min.js';
   const ZXING_TIMEOUT_MS = 10000;
 
   const SCAN_INTERVAL_MS = 120;      // 1 秒あたり約 8 回スキャンする
@@ -137,7 +138,7 @@
 
   // --- 検出エンジン -----------------------------------------------------
 
-  // プロキシ等で応答が返らないまま固まるのを避けるため、必ずタイムアウトさせる
+  // 読み込みが返らないまま固まるのを避けるため、必ずタイムアウトさせる
   function loadScript(src) {
     return new Promise((resolve, reject) => {
       const script = document.createElement('script');
@@ -148,7 +149,6 @@
       }, ZXING_TIMEOUT_MS);
 
       script.src = src;
-      script.crossOrigin = 'anonymous';
       script.onload = () => {
         clearTimeout(timer);
         resolve();
