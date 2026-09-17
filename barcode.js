@@ -23,6 +23,13 @@
   // CODE39 のバーの太さは十分残る
   const MAX_SCAN_SIDE = 640;
 
+  // ZXing に渡す画像の左右に足す白い余白の幅（px）。
+  // 検出枠いっぱいにバーコードが写っていると、CODE39 の開始/終了記号の外側に
+  // 必要な静止領域（クワイエットゾーン）まで切り落とされて読めないことがあるので、
+  // 切り出した画像の左右を白で埋めて補う。
+  // 回転経路でもバーが並ぶ向きは canvas の横方向なので、足す位置は同じ
+  const SCAN_PAD_X = 50;
+
   // 読み取る対象のフォーマット。現状は CODE39 のみ。
   // BarcodeDetector と ZXing で表記が違うので両方を持つ。大半は大文字小文字の
   // 差でしかないが、PDF417 だけ 'pdf417' / 'PDF_417' と規則が揃わないため
@@ -431,7 +438,11 @@
 
     const { canvas, ctx } = scanCanvases[rotate ? 1 : 0];
 
-    const cw = rotate ? dh : dw;
+    // 余白を足すのは ZXing 経路だけ。BarcodeDetector は向きも含めて端末側の実装に
+    // 任せるので、余分な画素を渡して 1 回の検出を重くしない
+    const pad = usingNative ? 0 : SCAN_PAD_X;
+
+    const cw = (rotate ? dh : dw) + pad * 2;
     const chh = rotate ? dw : dh;
     // 向きごとに canvas を分けたので、ここを通るのは画面回転やリサイズのときだけ
     if (canvas.width !== cw || canvas.height !== chh) {
@@ -439,9 +450,19 @@
       canvas.height = chh;
     }
 
+    // 余白は drawImage が触らない領域なので自分で塗る。canvas を再確保した直後は
+    // 透明のままなので、毎フレーム塗り直しておく（左右の細い帯だけなので安い）
+    if (pad) {
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, pad, chh);
+      ctx.fillRect(cw - pad, 0, pad, chh);
+    }
+
     ctx.save();
+    // 左の余白のぶんだけずらして映像を描く
+    ctx.translate(pad, 0);
     if (rotate) {
-      ctx.translate(cw, 0);
+      ctx.translate(dh, 0);
       ctx.rotate(Math.PI / 2);
     }
     ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
