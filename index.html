@@ -143,6 +143,7 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 17px;
       line-height: 1.5;
+      white-space: pre-line;
       word-break: break-all;
       user-select: text;
     }
@@ -185,6 +186,26 @@
 
     #status:empty {
       opacity: 0;
+    }
+
+    /* 使用中の検出エンジン。動いているかどうかの確認用 */
+    #engine {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      margin: 0;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(6px);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      color: rgba(255, 255, 255, 0.75);
+    }
+
+    #engine:empty,
+    #frame.idle #engine {
+      display: none;
     }
 
     #controls {
@@ -243,6 +264,7 @@
       <div id="scanArea" aria-hidden="true"></div>
 
       <p id="status"></p>
+      <p id="engine"></p>
 
       <div id="controls">
         <button id="startBtn">カメラを起動</button>
