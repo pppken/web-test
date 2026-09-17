@@ -3,6 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <!-- GitHub Pages は max-age=600 を付けて返すので、HTML は必ず再検証させる（更新が無ければ 304 で軽い） -->
+  <meta http-equiv="Cache-Control" content="no-cache">
   <title>カメラテスト</title>
   <style>
     * {
@@ -287,7 +289,18 @@
     </div>
   </dialog>
 
-  <script src="barcode.js"></script>
-  <script src="camera.js"></script>
+  <!-- js は読み込みのたびに別URLにして、ブラウザキャッシュを確実に迂回する（検証用） -->
+  <script>
+    (() => {
+      const version = Date.now();
+      // async = false で、記述した順（barcode.js → camera.js）に実行される
+      for (const src of ['barcode.js', 'camera.js']) {
+        const script = document.createElement('script');
+        script.src = `${src}?v=${version}`;
+        script.async = false;
+        document.body.appendChild(script);
+      }
+    })();
+  </script>
 </body>
 </html>
