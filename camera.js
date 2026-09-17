@@ -34,8 +34,9 @@
   let stream = null;
   let facingMode = loadFacingMode();
 
-  // barcode.js が読み込めなかった場合でもカメラ単体で動くようにしておく
+  // barcode.js / photo.js が読み込めなかった場合でもカメラ単体で動くようにしておく
   const scanner = window.BarcodeScanner || { start() {}, stop() {} };
+  const photo = window.PhotoCapture || { start() {}, stop() {} };
 
   function setStatus(message) {
     status.textContent = message;
@@ -91,6 +92,7 @@
       setRunning(true);
       updateStatus();
       scanner.start();
+      photo.start({ facingMode });
     } catch (err) {
       handleError(err);
     }
@@ -100,6 +102,7 @@
     if (!stream) return;
 
     scanner.stop();
+    photo.stop();
     stream.getTracks().forEach((track) => track.stop());
     stream = null;
     video.srcObject = null;

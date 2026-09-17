@@ -256,6 +256,110 @@
     #startBtn:hover:not(:disabled) {
       background: rgba(45, 127, 249, 1);
     }
+
+    /* --- 撮影 --- */
+
+    /* シャッターを切ったときにプレビューを一瞬白く光らせる */
+    #flash {
+      position: absolute;
+      inset: 0;
+      background: #fff;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    #flash.on {
+      animation: flash 0.35s ease-out;
+    }
+
+    @keyframes flash {
+      from {
+        opacity: 0.85;
+      }
+
+      to {
+        opacity: 0;
+      }
+    }
+
+    #frame.idle #flash {
+      display: none;
+    }
+
+    /* 撮影結果のダイアログ。写真を見せる分だけ #result より広くしている */
+    #photo {
+      width: 100%;
+      max-width: min(520px, calc(100vw - 32px));
+      margin: auto;
+      padding: 0;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 16px;
+      background: rgba(28, 28, 30, 0.97);
+      color: #fff;
+    }
+
+    #photo::backdrop {
+      background: rgba(0, 0, 0, 0.6);
+    }
+
+    #photoBody {
+      padding: 18px 18px 0;
+    }
+
+    #photoImage {
+      display: block;
+      width: 100%;
+      max-height: 60vh;
+      object-fit: contain;
+      border-radius: 10px;
+      background: #000;
+    }
+
+    #photoInfo {
+      margin: 10px 0 0;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-align: center;
+      color: rgba(255, 255, 255, 0.55);
+    }
+
+    #photoActions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 16px 18px 18px;
+    }
+
+    /* 保存は <a download> なので、button と同じ見た目を別途あてる */
+    #photoSaveBtn {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 999px;
+      background: rgba(20, 20, 20, 0.55);
+      color: #fff;
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    #photoSaveBtn:hover {
+      background: rgba(60, 60, 60, 0.7);
+    }
+
+    #photoActions > * {
+      padding: 9px 18px;
+      font-size: 14px;
+    }
+
+    #photoCloseBtn {
+      background: rgba(45, 127, 249, 0.85);
+      border-color: transparent;
+    }
+
+    #photoCloseBtn:hover:not(:disabled) {
+      background: rgba(45, 127, 249, 1);
+    }
+
   </style>
 </head>
 <body>
@@ -265,11 +369,14 @@
 
       <div id="scanArea" aria-hidden="true"></div>
 
+      <div id="flash" aria-hidden="true"></div>
+
       <p id="status"></p>
       <p id="engine"></p>
 
       <div id="controls">
         <button id="startBtn">カメラを起動</button>
+        <button id="shutterBtn" disabled>撮影</button>
         <button id="switchBtn" disabled>前後切替</button>
         <button id="stopBtn" disabled>停止</button>
       </div>
@@ -289,12 +396,25 @@
     </div>
   </dialog>
 
+  <dialog id="photo" aria-label="撮影した写真">
+    <div id="photoBody">
+      <img id="photoImage" alt="">
+      <p id="photoInfo"></p>
+    </div>
+
+    <div id="photoActions">
+      <a id="photoSaveBtn" download>保存</a>
+      <button id="photoShareBtn" type="button" hidden>共有</button>
+      <button id="photoCloseBtn" type="button" autofocus>閉じる</button>
+    </div>
+  </dialog>
+
   <!-- js は読み込みのたびに別URLにして、ブラウザキャッシュを確実に迂回する（検証用） -->
   <script>
     (() => {
       const version = Date.now();
       // async = false で、記述した順（barcode.js → camera.js）に実行される
-      for (const src of ['barcode.js', 'camera.js']) {
+      for (const src of ['barcode.js', 'photo.js', 'camera.js']) {
         const script = document.createElement('script');
         script.src = `${src}?v=${version}`;
         script.async = false;

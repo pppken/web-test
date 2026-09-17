@@ -34,6 +34,7 @@
   let detectorPromise = null;
   let usingNative = false;   // BarcodeDetector で動いているか
   let active = false;        // カメラ稼働中か（camera.js が制御する）
+  let paused = false;        // 撮影中など、一時的に解析を止めているか
   let timerId = null;
   let copyTimerId = null;
   let rotateNext = false;
@@ -128,7 +129,7 @@
     clearTimeout(copyTimerId);
     copyBtn.textContent = 'コピー';
 
-    if (active && timerId === null) tick();
+    if (active && !paused && timerId === null) tick();
   });
 
   // --- 検出エンジン -----------------------------------------------------
@@ -313,7 +314,7 @@
   async function tick() {
     timerId = null;
     // ダイアログを開いている間は解析を止める
-    if (!active || dialog.open) return;
+    if (!active || paused || dialog.open) return;
 
     try {
       // ZXing 経路だけ、縦向きバーコード用に 1 フレームおきで 90 度回転させる。
@@ -332,7 +333,7 @@
     }
 
     // 解析が遅れてもフレームが溜まらないよう、完了してから次を予約する
-    if (active && !dialog.open) timerId = setTimeout(tick, SCAN_INTERVAL_MS);
+    if (active && !paused && !dialog.open) timerId = setTimeout(tick, SCAN_INTERVAL_MS);
   }
 
   async function start() {
@@ -357,13 +358,26 @@
     tick();
   }
 
+  // 撮影プレビューを開いている間など、カメラは動かしたまま解析だけ止める
+  function pause() {
+    paused = true;
+    clearTimeout(timerId);
+    timerId = null;
+  }
+
+  function resume() {
+    paused = false;
+    if (active && !dialog.open && timerId === null) tick();
+  }
+
   function stop() {
     active = false;
+    paused = false;
     clearTimeout(timerId);
     timerId = null;
     stopRateMeter();
     setEngine('');
   }
 
-  window.BarcodeScanner = { start, stop };
+  window.BarcodeScanner = { start, stop, pause, resume };
 })();
