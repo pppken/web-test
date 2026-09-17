@@ -72,6 +72,30 @@ const scanner = window.BarcodeScanner || { start() {}, stop() {} };
 - `window.isSecureContext` でない場合は起動せず、https / localhost で開くよう案内する。
 - `pagehide` で必ずカメラを解放する。
 
+#### ズーム
+
+「ズーム」ボタン（`#zoomBtn`）で倍率を巡回させる。**設定できる値は端末が
+`track.getCapabilities().zoom`（`{ min, max, step }`）で返したものだけ**で、
+こちらから任意の倍率を投げることはしない。
+
+- 巡回する段は `ZOOM_FACTORS`（現状 `[1, 2, 3, 5]`）を起動時に `buildZoomLevels()` で
+  実際の値へ落として作る。`zoom` の尺度は端末差があり、`1〜8` で返すものもあれば
+  `100〜400` で返すものもあるので、**絶対値ではなく `min`（＝等倍）の何倍か**で持つ。
+  `step` がある端末は `min + step * n` しか受け付けないので `snapZoom()` で丸め、
+  範囲を超えて `max` に張り付いたぶんは前の段と重なるので落とす
+  （例: `max` が 2.5 倍の端末なら 1x / 2x / 2.5x の 3 段）。
+- 次のいずれでもボタンは無効＋ラベル `ズーム: 非対応` になる。
+  `getCapabilities()` が無い（Firefox）／例外を投げる／`zoom` を返さない
+  （iOS Safari や大半の PC）／`min` と `max` が同じ／段が 1 つしか作れない。
+- 適用は `applyConstraints({ advanced: [{ zoom }] })`。失敗したら選択を元に戻し、
+  直前の倍率のまま使い続ける（前後切替・エンジン切替と同じ扱い）。
+- ラベルの倍率は要求値ではなく `getSettings().zoom` の実値から出す（`currentZoom()`）。
+  端末側で丸められることがあるため。起動時も同じ値を見て、一番近い段から巡回を始める。
+- 段の並びはカメラごとに違うので、**起動のたびに `setupZoom()` で作り直す**
+  （前後切替でも作り直す）。停止時は `clearZoom()` で捨てる。
+- ズームしても `videoWidth / videoHeight` は変わらないので、barcode.js の切り出し座標には
+  影響しない。photo.js も同じトラックを使うため、撮影結果にもそのまま効く。
+
 ### barcode.js
 
 検出エンジンは 4 系統。**まず `BarcodeDetector`、駄目なら同梱 ZXing** に落ちる。
@@ -291,6 +315,9 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
   （`エンジン: 自動` など）ので、`setLabel()` は通さず `renderEngineButton()` が書く。
   HTML 側の文字列は barcode.js が読めなかったときの見た目でしかない。
   カメラの状態に依らず押せる（停止中は選択を覚えるだけ）。
+- 「ズーム」ボタン（`#zoomBtn`）も同じ扱いで、`renderZoomButton()` が
+  `ズーム: 2.0x` / `ズーム: 非対応` / 停止中の `ズーム` を書く。
+  こちらは端末の能力に依るので、稼働中でも非対応なら無効のまま。
 
 ## vendor/
 
