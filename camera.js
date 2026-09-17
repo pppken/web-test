@@ -92,7 +92,7 @@
       setRunning(true);
       updateStatus();
       scanner.start();
-      photo.start({ facingMode });
+      photo.start({ facingMode, track: stream.getVideoTracks()[0] });
     } catch (err) {
       handleError(err);
     }
