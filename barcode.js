@@ -81,6 +81,23 @@
   // [0] = 正立, [1] = 90 度回転
   const scanCanvases = [createScanCanvas(), createScanCanvas()];
 
+  // プレビュー（<video>）の複製先。解析はこのコピーに対して行い、解析のあいだは
+  // 映像そのものには一切触らない。
+  //
+  // 持つのは検出枠のぶんだけ・縮小済み（正立・余白なし）。映像を丸ごと複製すると
+  // 1080p 縦持ちで 1 回あたり約 200 万画素を読むことになるが、実際に要るのは
+  // その 1/3 ほどしかない。映像に触る量は少ないほどよい。
+  //
+  // こちらは getImageData を呼ばない（描き込むだけ・読むのは scanCanvases 側）ので
+  // willReadFrequently は立てない。立てるとソフトウェア canvas になり、
+  // 映像からの複製が GPU からの読み戻しになって逆に重くなる
+  const frameBuffer = {
+    canvas: document.createElement('canvas'),
+    ctx: null,
+    ready: false
+  };
+  frameBuffer.ctx = frameBuffer.canvas.getContext('2d');
+
   let detect = null;         // (canvas) => { text, format } | null （Promise でも可）
 
   // いま動いている経路。切り出し方（余白・回転）とフォールバック先をこれで決める。
@@ -100,6 +117,15 @@
   let labelTimerId = null;
   let rotateNext = false;
   let runToken = 0;          // ループを畳むたびに進める。tick の世代を見分ける
+
+  // 解析中の件数。0 でないあいだはプレビューのコピーを行わない。
+  // 真偽値ではなく数で持つのは、ループを畳んだ直後に古い tick の解析が
+  // まだ返っていないことがあるため（それぞれが自分のぶんだけ戻す）
+  let pendingDetects = 0;
+
+  function isAnalyzing() {
+    return pendingDetects > 0;
+  }
 
   // 余白を足すのは ZXing / Quagga2 経路だけ。BarcodeDetector は向きも含めて
   // 端末側の実装に任せるので、余分な画素を渡して 1 回の検出を重くしない
@@ -299,6 +325,9 @@
   // 解析に渡しているのと同じ画像を、そのままダイアログに出す。
   // 枠のズレや余白の付き方、縮小後にバーが潰れていないかをその場で確認する
   function showPreview() {
+    // 解析中はバッファを書き換えない（＝いま解析に渡している画像がそのまま出る）
+    copyPreviewFrame();
+
     // 回転経路は 1 フレームおきなので、見比べやすいよう常に正立で切り出す
     const source = captureScanArea(false);
     if (!source) {
@@ -643,11 +672,8 @@
 
   // --- スキャンループ ---------------------------------------------------
 
-  // 画面上の検出枠を、映像の実ピクセル座標に変換して切り出す。
-  // rotate=true なら 90 度回転して描画する（縦向きバーコード用）
-  function captureScanArea(rotate) {
-    if (!video.videoWidth || !video.videoHeight) return null;
-
+  // 画面上の検出枠を、映像の実ピクセル座標に変換する
+  function measureScanArea() {
     const videoRect = video.getBoundingClientRect();
     const areaRect = scanArea.getBoundingClientRect();
     if (!videoRect.width || !videoRect.height || !areaRect.width) return null;
@@ -663,10 +689,60 @@
     const sh = Math.min(video.videoHeight - sy, Math.round(areaRect.height * scaleY));
     if (sw <= 0 || sh <= 0) return null;
 
-    // 大きすぎる場合は縮小して描画する
+    return { sx, sy, sw, sh };
+  }
+
+  // プレビューの現在のフレームから、検出枠のぶんをバッファに複製する。
+  // 解析に渡すのはこのコピーで、映像そのものを読むのはここだけ。
+  //
+  // 解析中は呼ばれても何もしない。1 回のコピーにつき解析は 1 回、その結果が
+  // 返ってから次をコピーする（tick() が回す）。切り出し範囲はここで確定させる
+  // （あとから測ると、コピーした絵と枠がずれる）
+  function copyPreviewFrame() {
+    if (isAnalyzing()) return false;
+    if (!video.videoWidth || !video.videoHeight) return false;
+
+    const crop = measureScanArea();
+    if (!crop) return false;
+
+    const { sx, sy, sw, sh } = crop;
+
+    // 大きすぎる場合は縮小して取り込む
     const ratio = Math.min(1, MAX_SCAN_SIDE / Math.max(sw, sh));
     const dw = Math.max(1, Math.round(sw * ratio));
     const dh = Math.max(1, Math.round(sh * ratio));
+
+    const { canvas, ctx } = frameBuffer;
+    // 大きさが変わったときだけ再確保する（代入はゼロクリアを伴う）
+    if (canvas.width !== dw || canvas.height !== dh) {
+      canvas.width = dw;
+      canvas.height = dh;
+    }
+
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+    frameBuffer.ready = true;
+    return true;
+  }
+
+  // コピーを捨てる。停止後に古いフレームを解析／表示しないため
+  function releasePreviewFrame() {
+    frameBuffer.ready = false;
+    frameBuffer.canvas.width = 0;
+    frameBuffer.canvas.height = 0;
+  }
+
+  // コピー済みのフレームに、経路ごとの味付け（余白・回転）をして解析用の画像にする。
+  // rotate=true なら 90 度回転して描画する（縦向きバーコード用）
+  function captureScanArea(rotate) {
+    if (!frameBuffer.ready) return null;
+
+    const dw = frameBuffer.canvas.width;
+    const dh = frameBuffer.canvas.height;
+    if (!dw || !dh) return null;
+
+    // 余白も回転も要らない経路（＝ BarcodeDetector）では、コピーをそのまま渡す。
+    // 解析中はコピーが止まるので、渡したあとに書き換わることはない
+    if (!needsQuietZone() && !rotate) return frameBuffer.canvas;
 
     const { canvas, ctx } = scanCanvases[rotate ? 1 : 0];
 
@@ -695,7 +771,8 @@
       ctx.translate(dh, 0);
       ctx.rotate(Math.PI / 2);
     }
-    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+    // 縮小はコピーの時点で済んでいるので、ここは等倍で置くだけ
+    ctx.drawImage(frameBuffer.canvas, 0, 0);
     ctx.restore();
 
     return canvas;
@@ -760,11 +837,18 @@
       // ZXing 経路だけ、縦向きバーコード用に 1 フレームおきで 90 度回転させる
       rotateNext = needsRotation() && !rotateNext;
 
-      const source = captureScanArea(rotateNext);
+      // プレビューのコピーはここだけ。前回の結果が返ってから次を取る
+      const source = copyPreviewFrame() ? captureScanArea(rotateNext) : null;
       if (source) {
         scanCount += 1;
-        const result = await runDetect(source);
-        if (active && !anyDialogOpen() && result) handleResult(result);
+        pendingDetects += 1;
+        try {
+          const result = await runDetect(source);
+          if (active && !anyDialogOpen() && result) handleResult(result);
+        } finally {
+          // 解析が終わるまではコピーを止めておきたいので、必ずここで戻す
+          pendingDetects -= 1;
+        }
       }
     } catch (err) {
       console.error('バーコードの解析に失敗しました', err);
@@ -819,6 +903,7 @@
     active = false;
     paused = false;
     cancelLoop();
+    releasePreviewFrame();
     previewBtn.disabled = true;
     if (previewDialog.open) previewDialog.close();
     stopRateMeter();
