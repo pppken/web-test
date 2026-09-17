@@ -8,7 +8,6 @@
   const ZXING_TIMEOUT_MS = 10000;
 
   const SCAN_INTERVAL_MS = 120;      // 1 秒あたり約 8 回スキャンする
-  const DUPLICATE_WINDOW_MS = 2000;  // 同じ値を続けて読み直さない猶予
   const COPY_LABEL_RESET_MS = 1500;
 
   // 解析に回す画像の最大辺。1080p の枠内をそのまま渡すと 1 回の解析が重く、
@@ -37,8 +36,6 @@
   let active = false;        // カメラ稼働中か（camera.js が制御する）
   let timerId = null;
   let copyTimerId = null;
-  let lastText = '';
-  let lastAt = 0;
   let rotateNext = false;
 
   // --- エンジン表示（動作確認用）-----------------------------------------
@@ -125,14 +122,12 @@
   copyBtn.addEventListener('click', copyValue);
   closeBtn.addEventListener('click', () => dialog.close());
 
-  // Esc でもボタンでも、閉じたらスキャンを再開する
+  // Esc でもボタンでも、閉じたらスキャンを再開する。
+  // 同じバーコードが枠内に残っていれば、そのまますぐ読み直す
   dialog.addEventListener('close', () => {
     clearTimeout(copyTimerId);
     copyBtn.textContent = 'コピー';
 
-    // 同じバーコードが写ったままでもすぐには開き直さないよう、
-    // 重複判定の起点を閉じた時刻にずらす
-    lastAt = Date.now();
     if (active && timerId === null) tick();
   });
 
@@ -297,17 +292,6 @@
   }
 
   function handleResult(result) {
-    const now = Date.now();
-
-    // 同じバーコードを映し続けている間は繰り返し開かない
-    if (result.text === lastText && now - lastAt < DUPLICATE_WINDOW_MS) {
-      lastAt = now;
-      return;
-    }
-
-    lastText = result.text;
-    lastAt = now;
-
     if (navigator.vibrate) navigator.vibrate(60);
     showResult(result);
   }
@@ -369,7 +353,6 @@
     }
 
     if (!active) return; // 初期化中に停止された
-    lastText = '';
     startRateMeter();
     tick();
   }
