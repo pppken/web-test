@@ -26,12 +26,24 @@
   //   tryInvert           白黒反転した画像は試さない。ZXing 経路で
   //                       HTMLCanvasElementLuminanceSource の第 2 引数を false に
   //                       しているのと同じ理由で、通常のバーコードの実効回数が落ちる
+  //   binarizer           既定の 'LocalAverage'（ブロックごとの局所平均）ではなく
+  //                       'GlobalHistogram'（輝度ヒストグラムから画像全体で 1 つの閾値）。
+  //                       ZXing 経路の GlobalHistogramBinarizer と同じ考え方なので、
+  //                       読み比べたときに二値化の違いが結果に混ざらない。
+  //                       ライブラリが 'LocalAverage' を既定にしているのは照明ムラの
+  //                       ある実写を想定してのことなので、実機で読めなくなるようなら
+  //                       ここを戻すこと（合成画像での比較では差が出なかった）
+  //   minLineCount        既定は 2（同じ結果が 2 行ぶん揃わないと採用しない）。
+  //                       1 にすると 1 行読めた時点で通す。読み取りは速くなるが、
+  //                       行をまたいだ照合が無くなるぶん誤読は出やすくなる
   // tryHarder / tryRotate / tryDownscale は既定（いずれも true）のまま。
   // 特に tryRotate が効くので、この経路ではこちら側で 90 度回転させない
   // （needsRotation() が false）。速度が足りないときは #engine の N/s を見ながら外す
   const ZXING_CPP_OPTIONS = {
     maxNumberOfSymbols: 1,
-    tryInvert: false
+    tryInvert: false,
+    binarizer: 'GlobalHistogram',
+    minLineCount: 1
   };
 
   // 既定の locateFile は wasm を jsDelivr から取りに行くので、同梱したものを指すように

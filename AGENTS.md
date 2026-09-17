@@ -170,10 +170,21 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
   同梱したもの（絶対 URL）を指すように差し替えている。`fireImmediately: true` にして、
   wasm の取得とコンパイルまで初期化のうちに終わらせる。ここを待たずに検出器を返すと、
   最初の数フレームの解析がまとめて待たされる。
-- 解析オプションは `ZXING_CPP_OPTIONS`。`maxNumberOfSymbols: 1`（枠内に複数は想定しない）と
-  `tryInvert: false`（ZXing 経路で `HTMLCanvasElementLuminanceSource` の第 2 引数を
-  `false` にしているのと同じ理由）だけを指定し、`tryHarder` / `tryRotate` /
-  `tryDownscale` は既定（いずれも true）のまま。
+- 解析オプションは `ZXING_CPP_OPTIONS`。指定しているのは次の 4 つで、
+  `tryHarder` / `tryRotate` / `tryDownscale` は既定（いずれも true）のまま。
+  - `maxNumberOfSymbols: 1` 枠内に複数は想定しない。
+  - `tryInvert: false` ZXing 経路で `HTMLCanvasElementLuminanceSource` の第 2 引数を
+    `false` にしているのと同じ理由。
+  - `binarizer: 'GlobalHistogram'` 既定は `'LocalAverage'`（局所平均）。ZXing 経路が
+    使う `GlobalHistogramBinarizer` と揃えて、読み比べに二値化の違いを混ぜないため。
+    ライブラリが `'LocalAverage'` を既定にしているのは照明ムラのある実写を想定して
+    のことなので、**実機で読めなくなるようなら戻すこと**（照明ムラを掛けた合成画像で
+    両者を比べた範囲では差が出なかった。FixedThreshold / BoolCast とは差が出る）。
+    なお zxing-js 側では `HybridBinarizer` が `getBlackMatrix()` しか上書きしておらず、
+    1D が使う `getBlackRow()` は `GlobalHistogramBinarizer` のものなので、
+    どちらを選んでも 1D の結果は変わらない（ZXing-C++ は 1D でも方式が効く）。
+  - `minLineCount: 1` 既定は 2（同じ結果が 2 行ぶん揃わないと採用しない）。
+    1 行で通すぶん速いが、行をまたいだ照合が無くなるので誤読は出やすくなる。
 - **`tryRotate` が効くので 90 度回転は渡さない**（`needsRotation()` が false）。
   左右の白い帯（`SCAN_PAD_X`）は ZXing / Quagga2 と同じく足す。
 - `readBarcodes()` は `{ data, width, height }` を `ImageData` として受け取るので、
@@ -348,6 +359,8 @@ wasm の中身の ZXing-C++ 本体は Apache-2.0（全文は `vendor/zxing-LICEN
   PNG 経由でメインスレッド実行なので、端末によって速度が大きく変わる。
   ZXing-C++ は `tryHarder` / `tryRotate` / `tryDownscale` を既定のまま入れてあるので、
   端末によっては重く出る可能性がある。落ちるようなら `ZXING_CPP_OPTIONS` を削る。
+  `binarizer` と `minLineCount` は既定から変えてあるので、ZXing-C++ が読めないときは
+  まずこの 2 つを既定（`'LocalAverage'` / `2`）に戻して切り分けること。
 - ブラウザ差分に対する防御（try/catch で握りつぶす、未対応なら `null` を返す、
   ダミーオブジェクトにフォールバックする）が随所にある。これは意図的なもので、
   「エラーを握りつぶしている」ように見えても消さないこと。理由はコメントに書いてある。
