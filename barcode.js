@@ -3,9 +3,18 @@
 
   // 検出は BarcodeDetector（Chrome / Android 等）を優先し、
   // 非対応のブラウザ（iOS Safari / Firefox / デスクトップ Chrome）では同梱の ZXing を使う。
-  // 初回に必要になったときだけ読み込む（約 330KB）
+  // Quagga2 は自動では選ばれず、「エンジン」ボタンで明示的に選んだときだけ使う。
+  // どちらのライブラリも、初回に必要になったときだけ読み込む
+  // （ZXing 約 330KB / Quagga2 約 150KB）
   const ZXING_SRC = 'vendor/zxing-0.21.3.min.js';
-  const ZXING_TIMEOUT_MS = 10000;
+  const QUAGGA_SRC = 'vendor/quagga2-1.12.1.min.js';
+  const LIB_TIMEOUT_MS = 10000;
+
+  // Quagga2 の 1 フレームぶんの解析を打ち切るまでの時間。
+  // decodeSingle は画像を <img> 経由でしか受け取れない作りで、読み込みが返らないと
+  // Promise が解決も棄却もされないまま残る。そうなるとスキャンループが二度と
+  // 進まなくなる（0/s のまま無反応になる）ので、必ず打ち切れるようにしておく
+  const QUAGGA_DECODE_TIMEOUT_MS = 3000;
 
   // ZXing は同期処理なので、メインスレッドで回すと解析のあいだ画面が固まる。
   // 既定では Worker に投げ、Worker を使えない環境だけメインスレッドで実行する
@@ -23,7 +32,7 @@
   // CODE39 のバーの太さは十分残る
   const MAX_SCAN_SIDE = 640;
 
-  // ZXing に渡す画像の左右に足す白い余白の幅（px）。
+  // ZXing / Quagga2 に渡す画像の左右に足す白い余白の幅（px）。
   // 検出枠いっぱいにバーコードが写っていると、CODE39 の開始/終了記号の外側に
   // 必要な静止領域（クワイエットゾーン）まで切り落とされて読めないことがあるので、
   // 切り出した画像の左右を白で埋めて補う。
@@ -31,11 +40,12 @@
   const SCAN_PAD_X = 50;
 
   // 読み取る対象のフォーマット。現状は CODE39 のみ。
-  // BarcodeDetector と ZXing で表記が違うので両方を持つ。大半は大文字小文字の
-  // 差でしかないが、PDF417 だけ 'pdf417' / 'PDF_417' と規則が揃わないため
-  // 機械的な変換はせず、増やすときは 2 つとも書くこと
+  // BarcodeDetector / ZXing / Quagga2 で表記が違うので 3 つとも持つ。大半は
+  // 大文字小文字の差でしかないが、PDF417 だけ 'pdf417' / 'PDF_417' と規則が
+  // 揃わないため機械的な変換はせず、増やすときは 3 つとも書くこと。
+  // Quagga2 はリーダー名で指定する（対応表は同梱ライブラリの Readers を参照）
   const FORMATS = [
-    { native: 'code_39', zxing: 'CODE_39' }
+    { native: 'code_39', zxing: 'CODE_39', quagga: 'code_39_reader' }
   ];
 
   const video = document.getElementById('video');
@@ -48,6 +58,8 @@
   const dialogValue = document.getElementById('resultValue');
   const copyBtn = document.getElementById('resultCopyBtn');
   const closeBtn = document.getElementById('resultCloseBtn');
+
+  const engineBtn = document.getElementById('engineBtn');
 
   const previewBtn = document.getElementById('scanPreviewBtn');
   const previewDialog = document.getElementById('scanPreview');
@@ -70,14 +82,36 @@
   const scanCanvases = [createScanCanvas(), createScanCanvas()];
 
   let detect = null;         // (canvas) => { text, format } | null （Promise でも可）
-  let detectorPromise = null;
-  let usingNative = false;   // BarcodeDetector で動いているか
-  let usingWorker = false;   // ZXing を Worker で動かしているか
+
+  // いま動いている経路。切り出し方（余白・回転）とフォールバック先をこれで決める。
+  //   'native'       BarcodeDetector
+  //   'zxing-worker' ZXing（Worker）
+  //   'zxing'        ZXing（メインスレッド）
+  //   'quagga'       Quagga2
+  let engineKind = '';
+
+  // 選択値 -> Promise<エンジン>。一度作ったものは取っておき、エンジンを
+  // 切り替えて戻したときにライブラリの読み直しや Worker の作り直しをしない
+  const detectorCache = new Map();
+
   let active = false;        // カメラ稼働中か（camera.js が制御する）
   let paused = false;        // 撮影中など、一時的に解析を止めているか
   let timerId = null;
   let labelTimerId = null;
   let rotateNext = false;
+  let runToken = 0;          // ループを畳むたびに進める。tick の世代を見分ける
+
+  // 余白を足すのは ZXing / Quagga2 経路だけ。BarcodeDetector は向きも含めて
+  // 端末側の実装に任せるので、余分な画素を渡して 1 回の検出を重くしない
+  function needsQuietZone() {
+    return engineKind !== 'native';
+  }
+
+  // 1 フレームおきの 90 度回転が要るのは ZXing だけ。
+  // BarcodeDetector と Quagga2 はバーコードの向きを自前で処理する
+  function needsRotation() {
+    return engineKind === 'zxing' || engineKind === 'zxing-worker';
+  }
 
   // --- エンジン表示（動作確認用）-----------------------------------------
 
@@ -115,6 +149,81 @@
     scanCount = 0;
     scanRate = null;
   }
+
+  // --- エンジンの選択 ---------------------------------------------------
+
+  // 同じバーコードを同じ端末で読み比べられるように、使うエンジンを選べるようにしてある。
+  // '自動' は従来どおり BarcodeDetector → ZXing。Android 実機では BarcodeDetector が
+  // 常に勝つので、'自動' のままだと ZXing / Quagga2 の実力を実機で見られない
+  const ENGINE_KEY = 'barcodeEngine';
+  const ENGINE_CHOICES = [
+    { value: 'auto', label: '自動' },
+    { value: 'zxing', label: 'ZXing' },
+    { value: 'quagga', label: 'Quagga2' }
+  ];
+
+  // camera.js の向き設定と同じ理由で、localStorage は読み書きとも握りつぶす
+  function loadEngineChoice() {
+    try {
+      const saved = localStorage.getItem(ENGINE_KEY);
+      if (ENGINE_CHOICES.some((choice) => choice.value === saved)) return saved;
+    } catch (err) {
+      console.warn('エンジン設定の読み込みに失敗しました', err);
+    }
+    return ENGINE_CHOICES[0].value;
+  }
+
+  function saveEngineChoice(value) {
+    try {
+      localStorage.setItem(ENGINE_KEY, value);
+    } catch (err) {
+      console.warn('エンジン設定の保存に失敗しました', err);
+    }
+  }
+
+  let engineChoice = loadEngineChoice();
+
+  function renderEngineButton() {
+    const choice = ENGINE_CHOICES.find((item) => item.value === engineChoice);
+    engineBtn.textContent = `エンジン: ${choice.label}`;
+  }
+
+  // 押すたびに 自動 -> ZXing -> Quagga2 と巡回する。
+  // 動作中ならカメラは止めずに、検出器だけその場で差し替える
+  async function switchEngine() {
+    const previous = engineChoice;
+    const previousLabel = engineName;
+    const index = ENGINE_CHOICES.findIndex((choice) => choice.value === previous);
+
+    engineChoice = ENGINE_CHOICES[(index + 1) % ENGINE_CHOICES.length].value;
+    saveEngineChoice(engineChoice);
+    renderEngineButton();
+
+    // 停止中は選択を覚えるだけ。次の start() がこの選択で初期化する
+    if (!active) return;
+
+    engineBtn.disabled = true;
+    setEngine('準備中…');
+
+    try {
+      await applyEngine(getDetector());
+    } catch (err) {
+      // 切り替えに失敗しても直前のエンジンはそのまま動いているので、
+      // 選択だけ戻して読み取りは続ける（camera.js の前後切替と同じ扱い）
+      detectorCache.delete(engineChoice);
+      engineChoice = previous;
+      saveEngineChoice(previous);
+      renderEngineButton();
+      setEngine(previousLabel);
+      console.error(err);
+      showError(`エンジンを切り替えられませんでした。\n${err.message}`);
+    } finally {
+      engineBtn.disabled = false;
+    }
+  }
+
+  engineBtn.addEventListener('click', switchEngine);
+  renderEngineButton();
 
   // --- ダイアログ -------------------------------------------------------
 
@@ -182,7 +291,7 @@
     clearTimeout(labelTimerId);
     copyBtn.textContent = copyBtn.dataset.label || copyBtn.textContent;
 
-    if (active && !paused && timerId === null) tick();
+    restartLoop();
   });
 
   // --- 検出画像のプレビュー（動作確認用）---------------------------------
@@ -197,7 +306,7 @@
       return;
     }
 
-    const pad = usingNative ? 0 : SCAN_PAD_X;
+    const pad = needsQuietZone() ? SCAN_PAD_X : 0;
     previewInfo.textContent = pad
       ? `${source.width} × ${source.height}（うち左右 ${pad}px は白の余白）`
       : `${source.width} × ${source.height}`;
@@ -216,7 +325,7 @@
     // data URL を抱えたままにしない
     previewImage.removeAttribute('src');
 
-    if (active && !paused && timerId === null) tick();
+    restartLoop();
   });
 
   // --- 検出エンジン -----------------------------------------------------
@@ -229,7 +338,7 @@
       const timer = setTimeout(() => {
         script.remove();
         reject(new Error(`スクリプトの読み込みがタイムアウトしました: ${src}`));
-      }, ZXING_TIMEOUT_MS);
+      }, LIB_TIMEOUT_MS);
 
       script.src = src;
       script.onload = () => {
@@ -242,6 +351,24 @@
       };
 
       document.head.appendChild(script);
+    });
+  }
+
+  // 解決も棄却もされないままの Promise でスキャンループが止まらないようにする
+  function withTimeout(promise, ms, message) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(message)), ms);
+
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      );
     });
   }
 
@@ -261,12 +388,13 @@
     const detector = new window.BarcodeDetector({ formats });
 
     return {
+      kind: 'native',
       name: 'BarcodeDetector',
       detect: async (source) => {
         const results = await detector.detect(source);
         if (!results.length) return null;
 
-        // ZXing 側と表記を揃える（code_39 -> CODE_39）
+        // 他のエンジンと表記を揃える（code_39 -> CODE_39）
         return { text: results[0].rawValue, format: String(results[0].format).toUpperCase() };
       }
     };
@@ -308,7 +436,7 @@
       const timer = setTimeout(() => {
         worker.terminate();
         reject(new Error(`Worker の初期化がタイムアウトしました: ${ZXING_WORKER_SRC}`));
-      }, ZXING_TIMEOUT_MS);
+      }, LIB_TIMEOUT_MS);
 
       // 初期化前なら初期化の失敗として、初期化後なら解析中の失敗として伝える
       // （解決済みの Promise への reject は無視される）
@@ -331,7 +459,7 @@
 
         if (message.type === 'ready') {
           clearTimeout(timer);
-          resolve({ name: 'ZXing (Worker)', detect });
+          resolve({ kind: 'zxing-worker', name: 'ZXing (Worker)', detect });
           return;
         }
 
@@ -387,6 +515,7 @@
     reader.setHints(hints);
 
     return {
+      kind: 'zxing',
       name: 'ZXing',
       detect: (source) => {
         // 第 2 引数を true にすると 1 フレームおきに白黒反転した画像を試す挙動になり、
@@ -411,55 +540,105 @@
     };
   }
 
-  // メインスレッドで ZXing を動かす経路。Worker を作れない環境と、
-  // 動き出した Worker が途中で落ちた場合の受け皿
-  function useZXingMain() {
-    usingNative = false;
-    usingWorker = false;
+  // Quagga2 の経路。自動では選ばれず、「エンジン」ボタンで選んだときだけ使う。
+  //
+  // 公開 API の decodeSingle は画像を URL でしか受け取れないので、切り出した canvas を
+  // 毎フレーム data URL にしてから渡している（ZXing のように ImageData を直接渡す口が
+  // 無く、PNG のエンコードとデコードが 1 フレームぶん余計に乗る）。
+  // 同梱の UMD は読み込み時に window を直接参照するので Worker にも移せず、
+  // 解析のあいだメインスレッドが止まる。読み比べ用の経路と割り切って、
+  // この重さはそのままにしてある（実際に何回回っているかは #engine の N/s を見る）
+  async function createQuaggaDetector() {
+    await loadScript(QUAGGA_SRC);
 
-    return createZXingMainDetector().then((engine) => {
-      setEngine(engine.name);
-      return engine.detect;
+    const Quagga = window.Quagga;
+    if (!Quagga) throw new Error('Quagga2 の初期化に失敗しました。');
+
+    const readers = FORMATS.map((format) => format.quagga);
+
+    return {
+      kind: 'quagga',
+      name: 'Quagga2',
+      detect: async (source) => {
+        const decoding = Quagga.decodeSingle({
+          src: source.toDataURL('image/png'),
+          inputStream: {
+            // 既定の 800 のままだと切り出した画像が引き伸ばされるので実寸を渡す
+            size: Math.max(source.width, source.height),
+            willReadFrequently: true
+          },
+          // 検出枠の描画用 canvas は使わないので作らせない
+          canvas: { createOverlay: false },
+          // ZXing の POSSIBLE_FORMATS と同じ意図。既定の code_128_reader を置き換える
+          decoder: { readers },
+          // 縮小は MAX_SCAN_SIDE で済ませてあるので、locator の halfSample は
+          // decodeSingle の既定（false）のまま。ここで更に半分にするとバーが潰れる。
+          // バーコードの位置と傾きは locator が探すので、ZXing のように
+          // こちら側で 90 度回転させる必要は無い
+          locate: true
+        });
+
+        const result = await withTimeout(
+          decoding,
+          QUAGGA_DECODE_TIMEOUT_MS,
+          'Quagga2 の解析がタイムアウトしました。'
+        );
+
+        const code = result && result.codeResult;
+        if (!code || !code.code) return null;
+
+        // 他のエンジンと表記を揃える（code_39 -> CODE_39）
+        return { text: code.code, format: String(code.format).toUpperCase() };
+      }
+    };
+  }
+
+  // ZXing の経路。Worker を作れない環境ではメインスレッド実行に落ちる
+  function useZXing() {
+    setEngine('ZXing 読み込み中…');
+
+    return createZXingWorkerDetector().catch((err) => {
+      // Worker が駄目でも読み取り自体は続けられるようにする。
+      // どちらで動いているかは #engine のバッジで分かる
+      console.warn('ZXing を Worker で動かせないため、メインスレッドで実行します', err);
+      return createZXingMainDetector();
     });
   }
 
-  function useZXing() {
-    setEngine('ZXing 読み込み中…');
-    usingNative = false;
-    usingWorker = true;
-
-    detectorPromise = createZXingWorkerDetector()
-      .then((engine) => {
-        setEngine(engine.name);
-        return engine.detect;
-      })
-      .catch((err) => {
-        // Worker が駄目でも読み取り自体は続けられるようにする。
-        // どちらで動いているかは #engine のバッジで分かる
-        console.warn('ZXing を Worker で動かせないため、メインスレッドで実行します', err);
-        return useZXingMain();
-      });
-
-    return detectorPromise;
-  }
-
-  function getDetector() {
-    if (detectorPromise) return detectorPromise;
-
-    detectorPromise = createNativeDetector()
+  // 「自動」。BarcodeDetector が使えなければ ZXing に落ちる（従来どおりの順序）
+  function useAuto() {
+    return createNativeDetector()
       .catch((err) => {
         console.warn('BarcodeDetector を利用できません', err);
         return null;
       })
-      .then((native) => {
-        if (!native) return useZXing();
+      .then((native) => native || useZXing());
+  }
 
-        usingNative = true;
-        setEngine(native.name);
-        return native.detect;
-      });
+  // いまの選択に対応する検出器。一度作ったものは detectorCache から使い回す
+  function getDetector() {
+    if (!detectorCache.has(engineChoice)) {
+      if (engineChoice === 'quagga') {
+        setEngine('Quagga2 読み込み中…');
+        detectorCache.set(engineChoice, createQuaggaDetector());
+      } else if (engineChoice === 'zxing') {
+        detectorCache.set(engineChoice, useZXing());
+      } else {
+        detectorCache.set(engineChoice, useAuto());
+      }
+    }
 
-    return detectorPromise;
+    return detectorCache.get(engineChoice);
+  }
+
+  // 出来上がった検出器を「いま動いているもの」として据える。
+  // 切り出し方（余白・回転）とフォールバック先は、ここで入る kind で決まる
+  async function applyEngine(promise) {
+    const engine = await promise;
+
+    detect = engine.detect;
+    engineKind = engine.kind;
+    setEngine(engine.name);
   }
 
   // --- スキャンループ ---------------------------------------------------
@@ -491,9 +670,7 @@
 
     const { canvas, ctx } = scanCanvases[rotate ? 1 : 0];
 
-    // 余白を足すのは ZXing 経路だけ。BarcodeDetector は向きも含めて端末側の実装に
-    // 任せるので、余分な画素を渡して 1 回の検出を重くしない
-    const pad = usingNative ? 0 : SCAN_PAD_X;
+    const pad = needsQuietZone() ? SCAN_PAD_X : 0;
 
     const cw = (rotate ? dh : dw) + pad * 2;
     const chh = rotate ? dw : dh;
@@ -529,39 +706,59 @@
     showResult(result);
   }
 
+  // 予約済みの次回ぶんを取り消し、世代を進める。
+  // 解析の途中（await 中）の tick は、完了時に世代のずれを見て自分で畳む
+  function cancelLoop() {
+    runToken += 1;
+    clearTimeout(timerId);
+    timerId = null;
+  }
+
+  // 停止・一時停止・ダイアログを閉じたあとにループを回し直す。
+  // 走りっぱなしの tick があっても、世代が変わるので二重には回らない
+  function restartLoop() {
+    cancelLoop();
+    if (active && !paused && !anyDialogOpen()) tick();
+  }
+
   // BarcodeDetector は端末側のモジュール未取得などで例外を返すことがあり、
   // Worker も動き出したあとで落ちることがある。どちらも黙って止まらず、
-  // ひとつ下の経路（ネイティブ -> ZXing、Worker -> メインスレッド）に切り替える
+  // ひとつ下の経路（ネイティブ -> ZXing、Worker -> メインスレッド）に切り替える。
+  // メインスレッドの ZXing と、明示的に選ばれた Quagga2 には落ちる先が無いので、
+  // そのまま投げ返して #engine にエラーを出す
   async function runDetect(source) {
     try {
       return await detect(source);
     } catch (err) {
-      if (usingNative) {
+      let fallback = null;
+
+      if (engineKind === 'native') {
         console.warn('BarcodeDetector が失敗したため ZXing に切り替えます', err);
-        detect = await useZXing();
-        return null;
-      }
-
-      if (usingWorker) {
+        fallback = useZXing();
+      } else if (engineKind === 'zxing-worker') {
         console.warn('Worker での解析が失敗したため、メインスレッドに切り替えます', err);
-        detectorPromise = useZXingMain();
-        detect = await detectorPromise;
-        return null;
+        fallback = createZXingMainDetector();
       }
 
-      throw err;
+      if (!fallback) throw err;
+
+      // 次に start() したときも、落ちた先から始める
+      detectorCache.set(engineChoice, fallback);
+      await applyEngine(fallback);
+      return null;
     }
   }
 
   async function tick() {
     timerId = null;
+    // 解析を待っている間にループが畳まれたかどうかを、あとで見分けるための世代番号
+    const token = runToken;
     // ダイアログを開いている間は解析を止める
     if (!active || paused || anyDialogOpen()) return;
 
     try {
-      // ZXing 経路だけ、縦向きバーコード用に 1 フレームおきで 90 度回転させる。
-      // BarcodeDetector は向きを自前で処理するので常に正立のまま渡す
-      rotateNext = !usingNative && !rotateNext;
+      // ZXing 経路だけ、縦向きバーコード用に 1 フレームおきで 90 度回転させる
+      rotateNext = needsRotation() && !rotateNext;
 
       const source = captureScanArea(rotateNext);
       if (source) {
@@ -574,6 +771,11 @@
       setEngine('解析エラー（コンソール参照）');
     }
 
+    // 解析を待っている間にループが畳まれて回し直されていたら、この呼び出しは
+    // 古い世代なのでここで終わる。放っておくとループが二重に回り、
+    // ZXing の Worker には解析要求が重なって届く
+    if (token !== runToken) return;
+
     // 解析が遅れてもフレームが溜まらないよう、完了してから次を予約する
     if (active && !paused && !anyDialogOpen()) timerId = setTimeout(tick, SCAN_INTERVAL_MS);
   }
@@ -585,11 +787,11 @@
     setEngine('準備中…');
 
     try {
-      detect = await getDetector();
+      await applyEngine(getDetector());
     } catch (err) {
       active = false;
       previewBtn.disabled = true;
-      detectorPromise = null; // 次回の起動で読み込みを再試行する
+      detectorCache.delete(engineChoice); // 次回の起動で読み込みを再試行する
       stopRateMeter();
       setEngine('');
       console.error(err);
@@ -605,20 +807,18 @@
   // 撮影プレビューを開いている間など、カメラは動かしたまま解析だけ止める
   function pause() {
     paused = true;
-    clearTimeout(timerId);
-    timerId = null;
+    cancelLoop();
   }
 
   function resume() {
     paused = false;
-    if (active && !anyDialogOpen() && timerId === null) tick();
+    restartLoop();
   }
 
   function stop() {
     active = false;
     paused = false;
-    clearTimeout(timerId);
-    timerId = null;
+    cancelLoop();
     previewBtn.disabled = true;
     if (previewDialog.open) previewDialog.close();
     stopRateMeter();

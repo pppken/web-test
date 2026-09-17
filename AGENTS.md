@@ -10,7 +10,7 @@
 ```
 index.html   画面（マークアップ + CSS 全部）と、js を動的に読み込むローダ
 camera.js    getUserMedia でのカメラ制御。barcode.js / photo.js のライフサイクル管理
-barcode.js   バーコード検出（BarcodeDetector → ZXing フォールバック）
+barcode.js   バーコード検出（BarcodeDetector → ZXing フォールバック、選択で Quagga2）
 barcode-worker.js
              ZXing の解析を回す Worker。barcode.js からのみ使う
 photo.js     静止画撮影（ImageCapture → video フレーム取得フォールバック）
@@ -73,28 +73,32 @@ const scanner = window.BarcodeScanner || { start() {}, stop() {} };
 
 ### barcode.js
 
-検出エンジンは 2 系統。**まず `BarcodeDetector`、駄目なら同梱 ZXing** に落ちる。
-ZXing はさらに **Worker → メインスレッド** の 2 段になっていて、全体では
+検出エンジンは 3 系統。**まず `BarcodeDetector`、駄目なら同梱 ZXing** に落ちる。
+ZXing はさらに **Worker → メインスレッド** の 2 段になっていて、自動では
 `BarcodeDetector` → `ZXing (Worker)` → `ZXing` の順に落ちる。
+**Quagga2 はこの自動の連鎖には入らない**（下の「エンジンの選択」を参照）。
 いま何で動いているかは `#engine` のバッジにそのまま出る。
 
 - **読み取る種類は `FORMATS` に集約してある。現状は CODE39 のみ。**
-  `BarcodeDetector` には `code_39`、ZXing には `POSSIBLE_FORMATS` として渡す。
-  両者で表記が違うので 1 件につき 2 つ書く（`pdf417` / `PDF_417` のように
+  `BarcodeDetector` には `code_39`、ZXing には `POSSIBLE_FORMATS` として、
+  Quagga2 には `decoder.readers` として `code_39_reader` を渡す。
+  3 者とも表記が違うので 1 件につき 3 つ書く（`pdf417` / `PDF_417` のように
   大文字化だけでは揃わないものがあるため、機械変換にしていない）。
+  結果の `format` は全経路で大文字表記（`CODE_39`）に揃えてから返す。
 - `BarcodeDetector` は API があっても `getSupportedFormats()` が空配列を返す環境がある
   （`FORMATS` のどれも含まれない場合も同じ扱い。いずれも ZXing へ）。
   実行中に例外を投げた場合も `runDetect()` が捕まえて ZXing に切り替える。
-- ZXing (`vendor/zxing-0.21.3.min.js`, 約 330KB) は**必要になった時だけ**
-  読み込む（Worker なら `importScripts`、メインスレッドなら `loadScript()`）。
-  どちらも `ZXING_TIMEOUT_MS` = 10 秒でタイムアウトさせる。
+- ZXing (`vendor/zxing-0.21.3.min.js`, 約 330KB) と
+  Quagga2 (`vendor/quagga2-1.12.1.min.js`, 約 150KB) は**必要になった時だけ**
+  読み込む（ZXing の Worker なら `importScripts`、それ以外は `loadScript()`）。
+  どちらも `LIB_TIMEOUT_MS` = 10 秒でタイムアウトさせる。
 - **ZXing の解析は既定で `barcode-worker.js` に投げる。** ZXing は同期処理なので、
   メインスレッドで回すと解析のあいだ画面が固まる。Worker 側に移すと、メインスレッドに
   残るのは `drawImage` と `getImageData` だけになる。
   `ImageData` の `ArrayBuffer` は転送で渡す（コピーしない）ので、
   送ったあと元の `ImageData` は使えなくなる（毎フレーム作り捨てにしている）。
 - Worker を作れない場合と、動き出した Worker が途中で落ちた場合は、
-  `useZXingMain()` でメインスレッド実行に落ちる（`runDetect()` が面倒を見る）。
+  `createZXingMainDetector()` でメインスレッド実行に落ちる（`runDetect()` が面倒を見る）。
   遅くはなるが読み取り自体は続く。
 - Worker には canvas が無いので `HTMLCanvasElementLuminanceSource` は使えない。
   代わりに同じ係数で自前に RGBA → 輝度へ変換し（メインスレッド経路と 1 バイトも
@@ -102,12 +106,52 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
   こちらは `isRotateSupported()` が false だが、回転が要るのは `TRY_HARDER` を
   付けたときだけなので今は影響しない。**`TRY_HARDER` を入れるならここも見直すこと。**
 
+#### エンジンの選択
+
+Android 実機では `BarcodeDetector` が常に勝つため、自動のままだと ZXing や Quagga2 の
+実力を実機で確かめられない。そこで「エンジン」ボタン（`#engineBtn`）で
+**自動 / ZXing / Quagga2** を巡回して選べるようにしてある。
+
+- 選択は `localStorage['barcodeEngine']`（`'auto'` / `'zxing'` / `'quagga'`）に保存。
+  既定は `'auto'`。camera.js の向き設定と同じく、読み書きとも try/catch で握りつぶす。
+- カメラ稼働中に押した場合は**カメラを止めずに検出器だけ差し替える**。
+  切替に失敗したら選択を元に戻し、直前のエンジンのまま読み取りを続ける
+  （camera.js の前後切替と同じ扱い）。停止中に押したときは選択を覚えるだけ。
+- 一度作った検出器は `detectorCache`（選択値 → `Promise<エンジン>`）に取っておく。
+  行き来のたびにライブラリを読み直したり、ZXing の Worker を作り直したりしないため。
+- 各検出器は `{ kind, name, detect }` を返し、`applyEngine()` が現在値として据える。
+  `kind`（`'native'` / `'zxing-worker'` / `'zxing'` / `'quagga'`）が、切り出し方
+  （余白 `needsQuietZone()` ・回転 `needsRotation()`）とフォールバック先を決める。
+
+#### Quagga2
+
+`vendor/quagga2-1.12.1.min.js`。**選択したときだけ**使う読み比べ用の経路で、
+自動では選ばれない。ZXing と違って次の制約がある。
+
+- 公開 API の `decodeSingle()` は画像を **URL でしか受け取れない**ので、切り出した
+  canvas を毎フレーム PNG の data URL にしてから渡している。`ImageData` を直接渡す口が
+  無いため、PNG のエンコードとデコードが 1 フレームぶん丸ごと乗る。
+- 同梱の UMD は読み込み時に `window` を直接参照するため、**Worker では動かない**。
+  解析のあいだメインスレッドが止まる。上の 2 点とも読み比べ用と割り切って
+  そのままにしてある。実際に何回回っているかは `#engine` の N/s を見ること。
+- バーコードの位置と傾きは Quagga2 の locator が探すので、**90 度回転は渡さない**
+  （`needsRotation()` が false）。`locator.halfSample` は `decodeSingle` の既定
+  （`false`）のまま。`MAX_SCAN_SIDE` で既に縮めてあり、更に半分にするとバーが潰れる。
+- 既定の `inputStream.size`（800）のままだと切り出した画像が引き伸ばされるので、
+  実寸（`Math.max(width, height)`）を渡している。
+  既定の `decoder.readers`（`code_128_reader`）は `FORMATS` の内容で置き換わる。
+- `decodeSingle()` は画像の読み込みに失敗すると Promise が解決も棄却もされないまま
+  残り、スキャンループが二度と進まなくなる。`QUAGGA_DECODE_TIMEOUT_MS` = 3 秒で
+  必ず打ち切る（`withTimeout()`）。
+- 明示的に選ばれた経路なので、失敗しても他のエンジンには落ちない。
+  `#engine` に「解析エラー」を出してループは回り続ける。
+
 性能に直結するので、次の 4 点は安易に変えないこと（いずれもコメントに理由あり）。
 
 1. **`TRY_HARDER` を付けない。** 全フォーマット有効だと 1 回の解析が約 31ms → 311ms になり、
    実効 3 回/秒まで落ちる。縦向きバーコードは代わりに**こちら側で 1 フレームおきに
    90 度回転**させて対応している（`rotateNext`、ZXing 経路のみ。
-   `BarcodeDetector` は向きを自前で処理するので常に正立で渡す）。
+   `BarcodeDetector` と Quagga2 は向きを自前で処理するので常に正立で渡す）。
    なお 311ms は全フォーマット時の数字なので、`FORMATS` を絞った今なら
    入れられる可能性はある。試すなら `#engine` の N/s で実測してから。
 2. **`HTMLCanvasElementLuminanceSource(source, false)`** の第 2 引数は `false`。
@@ -125,9 +169,9 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
 - `captureScanArea()` が `#scanArea` の画面座標を `getBoundingClientRect()` 差分で
   映像の実ピクセル座標に変換して切り出す。枠は中央基準なので、CSS の左右反転が
   あっても座標は変わらない。
-- ZXing 経路では、切り出した画像の**左右に幅 `SCAN_PAD_X` = 50px の白い帯**を足してから渡す。
-  枠いっぱいにバーコードが写っているとクワイエットゾーンが足りず読めないため。
-  回転経路でもバーが並ぶのは canvas の横方向なので、足す位置は正立時と同じ。
+- ZXing / Quagga2 経路では、切り出した画像の**左右に幅 `SCAN_PAD_X` = 50px の白い帯**を
+  足してから渡す。枠いっぱいにバーコードが写っているとクワイエットゾーンが足りず
+  読めないため。回転経路でもバーが並ぶのは canvas の横方向なので、足す位置は正立時と同じ。
   `BarcodeDetector` には足さない（端末側の実装に任せる）。
 - 右上の `#engine` バッジは **`エンジン名 · N/s`** を 1 秒ごとに表示する動作確認用。
   `0/s` ならループが回っていない。デバッグの第一手として見る。
@@ -137,6 +181,10 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
   `<img>` に入れる。ボタンの有効・無効は `BarcodeScanner` の `start` / `stop` が切り替える。
 - 結果ダイアログを開いている間は解析を止め、`close` で即座に再開する。
   同じバーコードが枠内にあればすぐ読み直す（`1912ba5` で入れた検証用の挙動）。
+- ループを外から止める／回し直すのは `cancelLoop()` / `restartLoop()` の 2 つだけ。
+  解析（`await`）の途中で停止されてもその呼び出しを畳めるよう、`runToken` で世代を
+  数えている。これが無いと、解析待ちのあいだに停止 → 再開したときにループが
+  二重に回り、ZXing の Worker には解析要求が重なって届く。
 - 作業用 canvas は `getContext('2d', { willReadFrequently: true })`。
   ZXing が `getImageData` を多用するため。
 
@@ -174,13 +222,19 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
 - ボタンの一時的なラベル変更（「コピーしました」「共有できません」など）は
   1.5 秒で元に戻す。`barcode.js` / `photo.js` とも `setLabel()` で行い、
   原文は `dataset.label` に退避している。
+- 「エンジン」ボタン（`#engineBtn`）のラベルだけは常時その時の選択を表す
+  （`エンジン: 自動` など）ので、`setLabel()` は通さず `renderEngineButton()` が書く。
+  HTML 側の文字列は barcode.js が読めなかったときの見た目でしかない。
+  カメラの状態に依らず押せる（停止中は選択を覚えるだけ）。
 
 ## vendor/
 
 `vendor/README.md` に取得元・SHA-256・更新手順がある。**ファイルは無改変で置く。**
-ファイル名にバージョンが入っているので、更新したら `barcode.js` の `ZXING_SRC` も
-併せて変えること。ライセンス表記は上流に既知の不整合（MIT / Apache-2.0）があり、
-同梱されていた Apache-2.0 全文を `vendor/zxing-LICENSE.txt` に置いている。
+ファイル名にバージョンが入っているので、更新したら `barcode.js` の `ZXING_SRC` /
+`QUAGGA_SRC` も併せて変えること。ZXing のライセンス表記は上流に既知の不整合
+（MIT / Apache-2.0）があり、同梱されていた Apache-2.0 全文を
+`vendor/zxing-LICENSE.txt` に置いている。Quagga2 は MIT で、全文は
+`vendor/quagga2-LICENSE.txt`。
 
 ## 作業するときの注意
 
@@ -189,9 +243,12 @@ ZXing はさらに **Worker → メインスレッド** の 2 段になってい
 - デスクトップ Chrome は `BarcodeDetector` が使えず ZXing 経路になる。
   ネイティブ経路を確認したいなら Android 実機が必要。`ImageCapture` も
   同様に端末差が大きいので、**両方の経路を実機で確認する**こと。
+- エンジンを変えたら `#engine` の N/s を実機で見ること。特に Quagga2 は
+  PNG 経由でメインスレッド実行なので、端末によって速度が大きく変わる。
 - ブラウザ差分に対する防御（try/catch で握りつぶす、未対応なら `null` を返す、
   ダミーオブジェクトにフォールバックする）が随所にある。これは意図的なもので、
   「エラーを握りつぶしている」ように見えても消さないこと。理由はコメントに書いてある。
 - コメントもコミットメッセージも日本語。既存の文体に合わせる。
 - 性能に関わる定数（`SCAN_INTERVAL_MS`, `MAX_SCAN_SIDE`, `JPEG_QUALITY`,
-  `ZXING_TIMEOUT_MS`）は各ファイル先頭にまとめてある。新しい定数も同じ場所に置く。
+  `LIB_TIMEOUT_MS`, `QUAGGA_DECODE_TIMEOUT_MS`）は各ファイル先頭にまとめてある。
+  新しい定数も同じ場所に置く。
