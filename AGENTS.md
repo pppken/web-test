@@ -278,9 +278,11 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
   最初の数フレームの解析がまとめて待たされる。
 - 解析オプションは `ZXING_CPP_OPTIONS`。`maxNumberOfSymbols: 1`（枠内に複数は想定しない）、
   `tryInvert: false`（ZXing 経路で `HTMLCanvasElementLuminanceSource` の第 2 引数を
-  `false` にしているのと同じ理由）、`tryHarder: true` の 3 つを指定する。
-  `tryHarder` は既定でも true だが、ZXing 経路と揃えて明示している（重いときに最初に
-  外す場所なので既定任せにしない）。`tryRotate` / `tryDownscale` は既定（true）のまま。
+  `false` にしているのと同じ理由）、`tryHarder: true`、`tryDownscale: true` の 4 つを指定する。
+  `tryHarder` / `tryDownscale` は既定でも true だが、ZXing 経路と揃えて明示している
+  （重いときに最初に外す場所なので既定任せにしない）。`tryDownscale` はライブラリ側が
+  `downscaleThreshold`（500）を超える辺だけを `downscaleFactor`（3）で縮めるので、
+  `MAX_SCAN_SIDE` = 640 のこの経路では実際に走る。`tryRotate` は既定（true）のまま。
 - **`tryRotate` が効くので 90 度回転は渡さない**（`needsRotation()` が false）。
   左右の白い帯（`SCAN_PAD_X`）は ZXing / Quagga2 と同じく足す。
 - `readBarcodes()` は `{ data, width, height }` を `ImageData` として受け取るので、
@@ -542,7 +544,7 @@ BarcodeScanner.configure({
 - エンジンを変えたら `onEngineChange` の `rate`（このページでは `#engine` の N/s）を
   実機で見ること。特に Quagga2 は
   PNG 経由でメインスレッド実行なので、端末によって速度が大きく変わる。
-  ZXing-C++ は `tryHarder`（明示）/ `tryRotate` / `tryDownscale` がいずれも有効なので、
+  ZXing-C++ は `tryHarder` / `tryDownscale`（いずれも明示）/ `tryRotate` が有効なので、
   端末によっては重く出る可能性がある。落ちるようなら `ZXING_CPP_OPTIONS` を削る。
   ZXing（zxing-js）側の `TRY_HARDER` も同じで、重いときに最初に外す候補。
 - ブラウザ差分に対する防御（try/catch で握りつぶす、未対応なら `null` を返す、

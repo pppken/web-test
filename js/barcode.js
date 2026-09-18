@@ -62,13 +62,19 @@
   //                       しているのと同じ理由で、通常のバーコードの実効回数が落ちる
   //   tryHarder           既定でも true だが、ZXing 経路と揃えて明示しておく。
   //                       重いときに最初に外す場所なので、既定任せにしない
-  // tryRotate / tryDownscale は既定（いずれも true）のまま。
-  // 特に tryRotate が効くので、この経路ではこちら側で 90 度回転させない
-  // （needsRotation() が false）。速度が足りないときは onEngineChange の rate を見ながら外す
+  //   tryDownscale        こちらも既定で true だが、tryHarder と同じ理由で明示しておく。
+  //                       縮小した画像でも読みに行くので、細バーが潰れ気味のときに効く。
+  //                       ライブラリ側は downscaleThreshold（500）を超える辺だけを
+  //                       downscaleFactor（3）で縮めるため、MAX_SCAN_SIDE = 640 の
+  //                       この経路では実際に走る（重いときは tryHarder の次に外す）
+  // tryRotate は既定（true）のまま。これが効くので、この経路ではこちら側で
+  // 90 度回転させない（needsRotation() が false）。
+  // 速度が足りないときは onEngineChange の rate を見ながら外す
   const ZXING_CPP_OPTIONS = {
     maxNumberOfSymbols: 1,
     tryInvert: false,
-    tryHarder: true
+    tryHarder: true,
+    tryDownscale: true
   };
 
   // Quagga2 の 1 フレームぶんの解析を打ち切るまでの時間。
