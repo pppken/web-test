@@ -37,7 +37,7 @@ vendor/      第三者ライブラリ（無改変で同梱）
 | ファイル | 公開するもの |
 | --- | --- |
 | `camera.js` | `window.CameraController = { configure, start, stop, switchCamera, watchPermission, zoomNext, setBrightness, getZoomState, getBrightnessState, isRunning, getFacingMode, getTrack }` |
-| `barcode.js` | `window.BarcodeScanner = { configure, start, stop, pause, resume, setEngine, nextEngine, capturePreview, getEngineState, getEngineChoices, isActive, isPaused }` |
+| `barcode.js` | `window.BarcodeScanner = { configure, start, stop, pause, resume, setEngine, nextEngine, capturePreview, getEngineState, getEngineChoices, setPreprocess, nextPreprocess, getPreprocessState, getPreprocessChoices, getStats, resetStats, isActive, isPaused }` |
 | `photo.js` | `window.PhotoCapture = { configure, attach, detach, capture, isActive, isBusy }` |
 | `app.js` | なし（上記 3 つを組み合わせる側） |
 
@@ -313,6 +313,100 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
   必ず打ち切る（`withTimeout()`）。
 - 明示的に選ばれた経路なので、失敗しても他のエンジンには落ちない。
   `#engine` に「解析エラー」を出してループは回り続ける。
+
+#### 前処理（縦方向の集約）
+
+ラベルプリンタで刷った細いバーコードは、**印字そのものが荒れている**せいで読めないことがある
+（バーの縁が 1px 単位でがたつく・かすれる・黒点が乗る）。1D デコーダは 1 本のスキャンライン
+だけを見るので、この 1px がそのまま run length の誤差になる。ZXing-C++ の Code128 は
+1 要素あたり **±0.7 モジュール**までしか許さない（`ODCode128Reader.cpp` の
+`MAX_INDIVIDUAL_VARIANCE`）ので、モジュールが 2〜3px の画像では余裕がほとんど無い。
+
+バーコードは高さ方向には同じ模様が続くので、**複数ラインを 1 本の波形に集約してから
+画像を作り直す**経路を足してある（`configure({ preprocess })`、このページでは
+「前処理」ボタン `#preprocessBtn`）。`'off' | 'mean' | 'median' | 'trimmed' | 'ab'` で、
+**既定は `'median'`**。選択は `localStorage['barcodePreprocess']` に保存する。
+
+```
+█ █▓█ █  ██
+█ ███ █░ ██   →  高さ方向に集約  →  ████    ██████    ███    █████
+█ ██▓ █  ██
+```
+
+処理は `capturePreprocessed()` の中で完結していて、順に次のとおり。
+
+1. 検出枠のぶんを **横は実寸のまま**（`PRE_MAX_WIDTH` = 1280）・縦だけ `PRE_ROWS` = 32 段に
+   潰して取り込む。**素通しの経路と違って `MAX_SCAN_SIDE`（640）は掛けない。**
+   細バーの太さは横の解像度でしか決まらないため。縦を潰すぶん画素数はむしろ減る
+   （1280x32 = 4 万画素 < 640x267 = 17 万画素）。
+2. 上下の帯の波形を突き合わせて**傾き（シアー）を測る**（`preEstimateShear()`）。
+3. 段ごとに横へずらしながら、x ごとに mean / median / trimmed mean で集約する。
+4. 振幅を 0〜255 に伸ばす（`preNormalize()`）。ZXing-C++ は 1 行のヒストグラムで
+   山を 2 つ探し、間隔が 16 階調未満だとその行を捨てる（`EstimateBlackPoint` が -1）。
+5. **横に `PRE_SCALE` = 2 倍へ線形補間で引き伸ばす**（`preUpsample()`）。
+6. `PRE_OUT_ROWS` = 2 行の画像に起こして解析へ渡す。
+
+**5 は 3 とセットで、片方だけでは効かない。** 集約で得られるのは「エッジが x と x+1 の
+どこにあるか」というサブピクセルの情報で、そのまま出すと run length が整数に丸められて
+元に戻る。最近傍で伸ばしても同じなので、**必ず線形補間**にすること。
+
+**`PRE_OUT_ROWS` が 2 なのには理由が 3 つある**（増やさないこと）。
+`minLineCount`（既定 2）を満たす最小の行数であり、3 行以上あると `LumImagePyramid` が
+縮小層を作って（`min(w, h) >= downscaleFactor` = 3）細バーを潰した層を毎フレーム
+無駄に走査し、2 行なら `tryRotate` 側の走査も `width < 3` で即座に打ち切られる。
+
+合成した荒れ印字（module 3px・傾き 1.2 度・縁のゆらぎ ±1px・ドット抜けあり、
+ZXing-C++ で n=90）での実測は次のとおり。**荒れていないラベルではどれも 100% で、
+解析回数（7〜8/s）も変わらない。**
+
+| | 検出率 |
+| --- | --- |
+| A 前処理なし | 0% |
+| B 縦 mean | 3〜5% |
+| C 縦 median | 36〜44% |
+| C2 縦 trimmed mean | 42〜45% |
+| D median + 1D 平滑化 | 18〜21% |
+| E median + adaptive 二値化 | 33〜38% |
+| E2 median + otsu 二値化 | 34〜36%（荒れていないラベルで 0% になることあり） |
+| F median + 傾き補正なし | 0% |
+
+ここから決まっている既定が 4 つある。**理由なしに動かさないこと。**
+
+- **mean ではなく median。** 縁が 1px 単位でゆらいでいるとき、mean はそのゆらぎの
+  累積分布（＝数 px かけてなだらかに変わる傾斜）を作る。ZXing-C++ 側は 1 行の
+  ヒストグラムでしきい値を決めるので、その傾斜のどこで切るかが黒白の面積比に
+  引きずられて run length が systematic にずれる。median は「エッジ位置の中央値」に
+  段を立て直すので縁の鋭さが戻る。trimmed mean はほぼ同じ（差は測定誤差の範囲）。
+- **傾き補正は必須。** 1.2 度でも外すと 0%（荒れていないラベルでも 0%）。
+  ROI の高さが 500px あれば 2 度で 17px ずれ、細バーは完全に潰れる。
+- **こちら側で二値化しない**（`preprocessThreshold` の既定は `'none'`）。ZXing-C++ 側は
+  `(-p[-1] + 4*p[0] - p[1]) / 2` の鋭化を掛けてから run length を取る
+  （`GlobalHistogramBinarizer.cpp` の `ThresholdSharpened`）。この鋭化は直線的な傾斜を
+  素通しするので、傾斜のまま渡したほうがサブピクセルのエッジ位置が残る。
+  `'otsu'` は ROI に台紙や背景が写り込むと山を「白 vs 灰」に割ってしまい、
+  クワイエットゾーンごと黒に倒れる。読み比べ用に残してあるだけ。
+- **1D 平滑化を入れない**（`preprocessSmooth` の既定は false）。縦の集約でノイズは
+  既に落ちていて、横に鈍らせると細バーの縁まで鈍る。
+
+**縦に潰すので、バーが縦に並んでいることが前提になる。** 振幅が `PRE_MIN_CONTRAST`
+未満のとき（枠内にバーコードが無い・バーが横向き）は前処理を諦め、その場で素通しの
+経路に落ちる。ZXing-C++ の `tryRotate` 任せの縦向き読み取りはそちらで従来どおり動く。
+
+**module width（最細バーが何 px あるか）が足りないとどうにもならない。** 同じ荒れ方で
+module を 2px にすると、前処理あり・なしのどれも 0% になった。実測値は「検出画像」
+ダイアログの波形の下に出る（集約画像の尺と、元映像に割り戻した尺の両方）。
+2px しか無いようなら、前処理ではなくズーム・距離・解像度で稼ぐこと。
+
+検証用の表示は `preprocessDebug`（既定 true）で切る。切ると波形も最細バーの実測も
+出なくなる代わりに、ROI のコピー以外は何も残さない。
+
+##### 検出率の比較（A/B）
+
+`'ab'` を選ぶと、**1 フレームおきに前処理あり／なしを入れ替えて**それぞれの検出率を数える
+（`getStats()`、`onEngineChange` の `state.stats`）。このページでは `#engine` バッジに
+`前 42% / 素 0%` と出る。別々に試すと持ち方や明るさが変わってしまうので、
+**必ず交互に回したこのモードで比べること。** `app.js` はこのとき結果ダイアログを出さず、
+`autoPause` も切る（1 枚読めたところで止まると数が溜まらないため）。
 
 性能に直結するので、次の 4 点は安易に変えないこと（いずれもコメントに理由あり。
 1 と 2 は ZXing（zxing-js）経路の話で、3 と 4 は全経路に効く）。

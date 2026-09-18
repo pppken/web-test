@@ -23,6 +23,17 @@
     quagga: 'Quagga2'
   };
 
+  // 前処理（縦方向の集約）の選択値 -> ボタンに出す表示。
+  // 'ab' は前処理ありと無しを 1 フレームおきに交互に回して検出率を比べる計測用で、
+  // このときだけ結果ダイアログを出さない（止まると数が溜まらない）
+  const PREPROCESS_LABELS = {
+    off: 'なし',
+    mean: '平均',
+    median: '中央値',
+    trimmed: 'トリム平均',
+    ab: 'A/B 比較'
+  };
+
   // 撮影がどちらの経路を通ったか（photo.js の method）
   const PHOTO_METHOD_LABELS = {
     still: '静止画撮影',
@@ -54,6 +65,7 @@
   const brightnessRange = $('brightnessRange');
   const brightnessValueLabel = $('brightnessValue');
   const previewBtn = $('scanPreviewBtn');
+  const preprocessBtn = $('preprocessBtn');
 
   const resultDialog = $('result');
   const resultTitle = $('resultTitle');
@@ -72,6 +84,8 @@
   const previewDialog = $('scanPreview');
   const previewImage = $('scanPreviewImage');
   const previewInfo = $('scanPreviewInfo');
+  const previewWave = $('scanWave');
+  const previewWaveInfo = $('scanWaveInfo');
   const previewCloseBtn = $('scanPreviewCloseBtn');
 
   // どれかの js の読み込みに失敗しても、残りは動き続けるようにする。
@@ -85,6 +99,9 @@
   const scanner = window.BarcodeScanner || {
     configure() {}, start() {}, stop() {}, pause() {}, resume() {},
     setEngine() {}, nextEngine() {}, capturePreview: () => null,
+    setPreprocess() {}, nextPreprocess() {}, resetStats() {},
+    getPreprocessState: () => ({ choice: 'off' }), getPreprocessChoices: () => [],
+    getStats: () => ({ plain: {}, pre: {} }),
     getEngineChoices: () => [], isActive: () => false, isPaused: () => false
   };
 
@@ -200,7 +217,16 @@
       return;
     }
 
-    engineLabel.textContent = state.rate === null ? state.name : `${state.name} · ${state.rate}/s`;
+    const rate = state.rate === null ? state.name : `${state.name} · ${state.rate}/s`;
+    engineLabel.textContent = state.preprocess === 'ab' ? `${rate} · ${formatStats(state.stats)}` : rate;
+  }
+
+  // A/B 比較の途中経過。前処理あり／なしそれぞれの「解析した回数のうち読めた割合」
+  function formatStats(stats) {
+    if (!stats) return '';
+    const pct = (bucket) =>
+      bucket && bucket.tries ? `${Math.round((bucket.hits / bucket.tries) * 100)}%` : '–';
+    return `前 ${pct(stats.pre)} / 素 ${pct(stats.plain)}`;
   }
 
   // 「エンジン」ボタンのラベルは常にその時の選択を表すので、setLabel() は通さない。
@@ -210,11 +236,29 @@
     engineBtn.disabled = state.busy;
   }
 
+  // 「前処理」ボタンも常に選択を表す。エンジンと同じくカメラの状態に依らず押せる
+  function renderPreprocessButton(state) {
+    const choice = state.preprocess || 'off';
+    preprocessBtn.textContent = `前処理: ${PREPROCESS_LABELS[choice] || choice}`;
+  }
+
   function handleEngineChange(state) {
     renderEngineBadge(state);
     renderEngineButton(state);
+    renderPreprocessButton(state);
     previewBtn.disabled = !state.active;
   }
+
+  // A/B 比較の間は結果ダイアログを出さない。1 枚読めたところで止まってしまうと
+  // 検出率が溜まらないため、autoPause ごと切る
+  function isBenchmarking() {
+    return scanner.getPreprocessState().choice === 'ab';
+  }
+
+  preprocessBtn.addEventListener('click', () => {
+    scanner.nextPreprocess();
+    scanner.configure({ autoPause: !isBenchmarking() });
+  });
 
   // --- ズーム -----------------------------------------------------------
 
@@ -341,7 +385,95 @@
     // 解析に渡すのと同じ画素をそのまま見たいので、非可逆な形式にはしない
     previewImage.src = preview.canvas.toDataURL('image/png');
 
+    renderWave(preview.preprocess);
+
     openDialog(previewDialog);
+  }
+
+  // --- 集約した 1 次元波形の表示（前処理の検証用）------------------------
+  //
+  // X 座標・輝度・しきい値・黒白の判定を 1 枚に重ねて出す。
+  // 前処理が実際にどう効いているかは、この波形を見るのが一番早い
+
+  function renderWave(debug) {
+    if (!debug || !debug.profile) {
+      previewWave.hidden = true;
+      previewWaveInfo.textContent = debug && debug.skipped
+        ? '波形の振幅が足りないので前処理を見送りました（枠内にバーコードが無いか、バーが横向き）'
+        : '';
+      return;
+    }
+
+    previewWave.hidden = false;
+
+    const profile = debug.profile;
+    const width = profile.length;
+    const height = 140;
+    if (previewWave.width !== width || previewWave.height !== height) {
+      previewWave.width = width;
+      previewWave.height = height;
+    }
+
+    const ctx = previewWave.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, width, height);
+
+    const at = (i) => (typeof debug.threshold === 'number' ? debug.threshold : debug.threshold[i]);
+    const y = (v) => height - 1 - (v / 255) * (height - 1);
+
+    // 黒と判定された区間を先に塗る（波形の下敷きにする）
+    ctx.fillStyle = 'rgba(45, 127, 249, 0.18)';
+    for (let i = 0; i < width; i++) {
+      if (profile[i] <= at(i)) ctx.fillRect(i, 0, 1, height);
+    }
+
+    // しきい値
+    ctx.strokeStyle = '#d33';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < width; i++) {
+      const py = y(at(i));
+      if (i === 0) ctx.moveTo(i, py);
+      else ctx.lineTo(i, py);
+    }
+    ctx.stroke();
+
+    // 輝度
+    ctx.strokeStyle = '#111';
+    ctx.beginPath();
+    for (let i = 0; i < width; i++) {
+      const py = y(profile[i]);
+      if (i === 0) ctx.moveTo(i, py);
+      else ctx.lineTo(i, py);
+    }
+    ctx.stroke();
+
+    previewWaveInfo.textContent = describeWave(debug);
+  }
+
+  // 最細バー／最細スペースは、実際の module width が何 px あるかの答えそのもの。
+  // 集約画像の尺と、元映像の尺（srcScale で割り戻したもの）の両方を出す
+  function describeWave(debug) {
+    const parts = [`集約: ${PREPROCESS_LABELS[debug.mode] || debug.mode}（${debug.width} × ${debug.height} 段）`];
+
+    if (debug.runs) {
+      const src = (px) => (debug.srcScale ? ` / 元映像 ${(px / debug.srcScale).toFixed(1)}px` : '');
+      parts.push(`最細バー: ${debug.runs.minBar}px${src(debug.runs.minBar)}`);
+      parts.push(`最細スペース: ${debug.runs.minSpace}px${src(debug.runs.minSpace)}`);
+      parts.push(`本数: ${debug.runs.bars}`);
+    }
+
+    parts.push(`傾き補正: ${debug.shear}px`);
+    parts.push(`振幅: ${Math.round(debug.contrast.range)}/255`);
+    // 'none' のときは二値化せずに渡しているので、波形の黒白は実測用の目安でしかない
+    parts.push(
+      debug.thresholdIsMeasureOnly
+        ? `しきい値: ${debug.thresholdMode}（波形の黒白は実測用の目安）`
+        : `しきい値: ${debug.thresholdMode}`
+    );
+    parts.push(`引き伸ばし: ${debug.scale}x → ${debug.out.width} × ${debug.out.height}`);
+
+    return parts.join('　');
   }
 
   previewBtn.addEventListener('click', showPreview);
@@ -467,6 +599,9 @@
     // このページの置き方に合わせてここで指す
     vendorPath: new URL('vendor/', document.baseURI).href,
     onDetect: (result) => {
+      // A/B 比較の間は数えるだけ（バッジに途中経過が出る）
+      if (isBenchmarking()) return;
+
       if (navigator.vibrate) navigator.vibrate(60);
       showResult(result);
     },
@@ -479,6 +614,9 @@
       showError(message);
     }
   });
+
+  // 前処理の選択は localStorage から復元されるので、autoPause をそれに合わせる
+  scanner.configure({ autoPause: !isBenchmarking() });
 
   photo.configure({
     video,

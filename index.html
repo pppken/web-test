@@ -459,6 +459,25 @@
       color: rgba(255, 255, 255, 0.55);
     }
 
+    /* 集約した 1 次元の輝度波形（前処理の検証用）。
+       横に長いので、そのまま幅いっぱいに潰して見る */
+    #scanWave {
+      display: block;
+      width: 100%;
+      height: 140px;
+      margin-top: 12px;
+      border-radius: 10px;
+      background: #fff;
+    }
+
+    #scanWaveInfo {
+      margin: 8px 0 0;
+      font-size: 11px;
+      line-height: 1.7;
+      text-align: center;
+      color: rgba(255, 255, 255, 0.55);
+    }
+
     #scanPreviewActions {
       display: flex;
       justify-content: flex-end;
@@ -508,6 +527,8 @@
         <button id="scanPreviewBtn" disabled>検出画像</button>
         <!-- ラベルは app.js が現在の選択で上書きする -->
         <button id="engineBtn">エンジン: 自動</button>
+        <!-- ラベルは app.js が現在の選択で上書きする -->
+        <button id="preprocessBtn">前処理: なし</button>
         <!-- ラベルは app.js が現在の倍率で上書きする -->
         <button id="zoomBtn" disabled>ズーム</button>
         <!-- ラベルは app.js が現在の明るさで上書きする -->
@@ -548,6 +569,9 @@
     <div id="scanPreviewBody">
       <img id="scanPreviewImage" alt="">
       <p id="scanPreviewInfo"></p>
+      <!-- 前処理を選んでいるときだけ出す。app.js の renderWave() が描く -->
+      <canvas id="scanWave" hidden></canvas>
+      <p id="scanWaveInfo"></p>
     </div>
 
     <div id="scanPreviewActions">
