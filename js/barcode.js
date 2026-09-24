@@ -146,16 +146,9 @@
   // 痩せるので、読めないときはここを戻して実機で見ること
   const MAX_SCAN_SIDE = 640;
 
-  // ZXing / Quagga2 に渡す画像の左右に足す白い余白の幅（px）。
-  // 検出枠いっぱいにバーコードが写っていると、開始/終了記号の外側に必要な
-  // 静止領域（クワイエットゾーン）まで切り落とされて読めないことがあるので、
-  // 切り出した画像の左右を白で埋めて補う。
-  // 回転経路でもバーが並ぶ向きは canvas の横方向なので、足す位置は同じ
-  //
-  // 0 のときは captureScanArea() が白い帯を塗らず、切り出した画像をそのまま渡す
-  // （以前は一時的に 0 にしていた。そのころの戻し先は 50）。
-  // 帯を左右端の画素の色で塗る案も試したが、白に戻した
-  const SCAN_PAD_X = 0;
+  // 以前はここに、ZXing / Quagga2 に渡す画像の左右に足す白い余白の幅（SCAN_PAD_X）があった。
+  // 余白は前処理の 1 段（barcode-preprocess.js の「余白」）に移したので、このファイルは
+  // 切り出した画像に何も足さない。余白が要るなら frameFilter 側で足す
 
   // 読み取る対象のフォーマット。既定は CODE128 と JAN（＝ EAN-13 / EAN-8）と CODE39。
   // JAN は 13 桁と 8 桁で別のフォーマット扱いなので 2 件書く。
@@ -240,7 +233,7 @@
   frameBuffer.ctx = frameBuffer.canvas.getContext('2d');
 
   // いま動いているエンジン。{ base, kind, worker, name, input, decode }
-  //   base    'native' | 'zxing' | 'zxing-cpp' | 'quagga'。切り出し方（余白・回転）を決める
+  //   base    'native' | 'zxing' | 'zxing-cpp' | 'quagga'。切り出し方（回転）を決める
   //   kind    base に Worker かどうかを足したもの（'zxing-worker' など）。状態の通知用
   //   input   decode に渡す形。'pixels'（RGBA）/ 'bitmap'（ImageBitmap）/ 'canvas'
   //   decode  (request) => Promise<{ text, format } | null>
@@ -306,10 +299,10 @@
     return pendingDetects > 0;
   }
 
-  // 余白を足すのは同梱ライブラリの経路だけ。BarcodeDetector は向きも含めて
-  // 端末側の実装に任せるので、余分な画素を渡して 1 回の検出を重くしない
-  function needsQuietZone() {
-    return !engine || engine.base !== 'native';
+  // コピー（frameBuffer）をそのまま渡せるのは BarcodeDetector だけ（ImageBitmap にするだけ）。
+  // 同梱ライブラリの経路は willReadFrequently の作業用 canvas に写してから渡す
+  function passesBufferAsIs() {
+    return Boolean(engine) && engine.base === 'native';
   }
 
   // 1 フレームおきの 90 度回転が要るのは ZXing だけ。BarcodeDetector・
@@ -677,7 +670,7 @@
   }
 
   // 出来上がったエンジンを「いま動いているもの」として据える。
-  // 切り出し方（余白・回転）とフォールバック先は、ここで入る base / worker で決まる
+  // 切り出し方（回転）とフォールバック先は、ここで入る base / worker で決まる
   async function applyEngine(promise) {
     const next = await promise;
 
@@ -801,8 +794,9 @@
     frameBuffer.canvas.height = 0;
   }
 
-  // コピー済みのフレームに、経路ごとの味付け（余白・回転）をして解析用の画像にする。
-  // rotate=true なら 90 度回転して描画する（縦向きバーコード用）
+  // コピー済みのフレームに、経路ごとの味付け（回転）をして解析用の画像にする。
+  // rotate=true なら 90 度回転して描画する（縦向きバーコード用）。
+  // 余白は足さない（前処理の「余白」の段に移した）
   function captureScanArea(rotate) {
     if (!frameBuffer.ready) return null;
 
@@ -810,15 +804,13 @@
     const dh = frameBuffer.canvas.height;
     if (!dw || !dh) return null;
 
-    // 余白も回転も要らない経路（＝ BarcodeDetector）では、コピーをそのまま渡す。
+    // 回転の要らない BarcodeDetector の経路では、コピーをそのまま渡す。
     // 解析中はコピーが止まるので、渡したあとに書き換わることはない
-    if (!needsQuietZone() && !rotate) return frameBuffer.canvas;
+    if (passesBufferAsIs() && !rotate) return frameBuffer.canvas;
 
     const { canvas, ctx } = scanCanvases[rotate ? 1 : 0];
 
-    const pad = needsQuietZone() ? SCAN_PAD_X : 0;
-
-    const cw = (rotate ? dh : dw) + pad * 2;
+    const cw = rotate ? dh : dw;
     const chh = rotate ? dw : dh;
     // 向きごとに canvas を分けたので、ここを通るのは画面回転やリサイズのときだけ
     if (canvas.width !== cw || canvas.height !== chh) {
@@ -826,17 +818,7 @@
       canvas.height = chh;
     }
 
-    // 余白は drawImage が触らない領域なので自分で塗る。canvas を再確保した直後は
-    // 透明のままなので、毎フレーム塗り直しておく（左右の細い帯だけなので安い）
-    if (pad) {
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(0, 0, pad, chh);
-      ctx.fillRect(cw - pad, 0, pad, chh);
-    }
-
     ctx.save();
-    // 左の余白のぶんだけずらして映像を描く
-    ctx.translate(pad, 0);
     if (rotate) {
       ctx.translate(dh, 0);
       ctx.rotate(Math.PI / 2);
@@ -860,7 +842,8 @@
   //     frame.video           <video>。読むのは frame.crop の範囲だけにすること
   //     frame.crop            検出枠を映像の実ピクセル座標にしたもの { sx, sy, sw, sh }
   //     frame.preview         capturePreview() からの呼び出しか（true なら数える類のことはしない）
-  //     frame.plain()         素通しの画像（余白・回転込み）。作れなければ null
+  //     frame.plain()         素通しの画像（回転込み・余白なし）。作れなければ null。
+  //                           ZXing 経路では呼ぶたびに回転を入れ替えるので、1 フレームに 1 回だけ呼ぶ
   //     frame.analyze(source) source を解析して { text, format } | null を返す。
   //                           preview のときは解析せず source をそのまま返す
   //
@@ -946,28 +929,28 @@
   }
 
   // いま解析に渡しているのと同じ画像を返す（動作確認用）。
-  // 枠のズレ・余白の付き方・縮小後にバーが潰れていないかを実機で見るためのもの。
+  // 枠のズレ・縮小後にバーが潰れていないかを実機で見るためのもの。
   // 回転経路は 1 フレームおきなので、見比べやすいよう常に正立で切り出す。
   // 解析中はバッファを書き換えないので、その場合はいま渡している画像がそのまま出る。
   //
-  // frameFilter が作った画像のときは filtered が true で、pad は分からないので null
-  // （余白や検証用の情報は差し込んだ側に問い合わせること）
+  // frameFilter が素通しの画像以外を返したときは filtered が true
+  // （余白などの検証用の情報は差し込んだ側に問い合わせること）
   async function capturePreview() {
     ensureConfigured();
     if (!active || !lastFrame) return null;
 
     const video = lastFrame.video;
     const crop = measureFrame(lastFrame);
-    let plainUsed = false;
+    let plainCanvas = null;
 
     const frame = {
       video,
       crop,
       preview: true,
       plain: () => {
-        plainUsed = true;
         copyPreviewFrame(video, crop);
-        return captureScanArea(false);
+        plainCanvas = captureScanArea(false);
+        return plainCanvas;
       },
       analyze: (source) => source
     };
@@ -981,8 +964,7 @@
       canvas,
       width: canvas.width,
       height: canvas.height,
-      pad: plainUsed ? (needsQuietZone() ? SCAN_PAD_X : 0) : null,
-      filtered: !plainUsed
+      filtered: canvas !== plainCanvas
     };
   }
 

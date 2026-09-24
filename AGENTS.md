@@ -21,8 +21,8 @@ js/          ページに依存しないライブラリ。そのまま他へ持�
   barcode-quagga2.js
                Quagga2 での検出処理。Worker に乗らないので分けてある。barcode.js からのみ使う
   barcode-preprocess.js
-               バーコードの前処理（縦方向の集約）。検討中の機能で、
-               barcode.js の frameFilter に差し込んだときだけ動く
+               バーコードの前処理（領域検出・コントラスト調整・縦集約・余白を段ごとに
+               選べるパイプライン）。検討中の機能で、barcode.js の frameFilter に差し込んだときだけ動く
   photo.js     静止画撮影（ImageCapture → video フレーム取得フォールバック）
 vendor/      第三者ライブラリ（無改変で同梱）
 ```
@@ -48,7 +48,7 @@ vendor/      第三者ライブラリ（無改変で同梱）
 | `barcode.js` | `window.BarcodeScanner = { configure, start, stop, detect, setEngine, nextEngine, capturePreview, getEngineState, getEngineChoices, isActive }` |
 | `barcode-worker.js` | Worker として読まれたときは何も生やさない（`onmessage` だけ）。メインスレッドに読まれたときは `window.BarcodeWorkerCore = { createDecoder }` |
 | `barcode-quagga2.js` | `window.BarcodeQuagga2 = { createDecoder }` |
-| `barcode-preprocess.js` | `window.BarcodePreprocess = { configure, filter, setMode, nextMode, getState, getChoices, getStats, resetStats, getLastOutput }` |
+| `barcode-preprocess.js` | `window.BarcodePreprocess = { configure, filter, setStage, setMethod, setCompare, getState, getStages, getMethods, getStats, resetStats, getLastOutput }` |
 | `photo.js` | `window.PhotoCapture = { configure, attach, detach, capture, isActive, isBusy }` |
 | `app.js` | なし（上記のライブラリを組み合わせる側） |
 
@@ -65,8 +65,8 @@ barcode-quagga2.js は部品の読み込みなので例外）。
 camera.js   フレームを取る（requestVideoFrameCallback で新しいものだけ）
   │ detector(frame)          ← app.js が BarcodeScanner.detect を渡してある
   ▼
-barcode.js  検出枠のぶんを切り出す → 前処理（frameFilter。barcode-preprocess.js）
-  │         → 余白・回転 → いまのエンジンの decode(request)
+barcode.js  検出枠のぶんを切り出す（回転込み）→ 前処理（frameFilter。barcode-preprocess.js。
+  │         領域検出 → コントラスト調整 → 縦集約 → 余白のうち有効な段）→ いまのエンジンの decode(request)
   ▼
 barcode-worker.js（Worker / メインスレッド） or barcode-quagga2.js
   │ { text, format } | null
@@ -337,7 +337,7 @@ Quagga2 の実力を実機で確かめられない。そこで `setEngine(choice
   行き来のたびにライブラリを読み直したり、ZXing の Worker を作り直したりしないため。
 - 各エンジンは `{ base, kind, worker, name, input, decode }` で、`applyEngine()` が現在値として据える。
   `base`（`'native'` / `'zxing'` / `'zxing-cpp'` / `'quagga'`）が切り出し方
-  （余白 `needsQuietZone()` ・回転 `needsRotation()`）を、`worker` がフォールバック先を決める。
+  （回転 `needsRotation()`、コピーをそのまま渡せるか `passesBufferAsIs()`）を、`worker` がフォールバック先を決める。
   `kind` は `base` に `-worker` を足したもの（`'zxing-worker'` など）で、状態の通知用。
 
 #### ZXing-C++（wasm）
@@ -362,7 +362,7 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
   `downscaleThreshold`（500）を超える辺だけを `downscaleFactor`（3）で縮めた層も読むので、
   `MAX_SCAN_SIDE` = 640 のこの経路では実際に走る。`tryRotate` は既定（true）のまま。
 - **`tryRotate` が効くので 90 度回転は渡さない**（`needsRotation()` が false）。
-  左右の白い帯（`SCAN_PAD_X`）は ZXing / Quagga2 と同じく足す。
+  左右の白い帯は barcode.js では足さない（前処理の「余白」の段。全エンジン共通）。
 - `readBarcodes()` は `{ data, width, height }` を `ImageData` として受け取るので、
   Quagga2 のように PNG に起こす必要は無い。RGBA → 輝度の変換はライブラリ側で
   ZXing 経路と同じ係数で行われる。
@@ -405,7 +405,8 @@ barcode.js が持つのはこの口だけ。** 既定の `null` なら従来ど�
 - 呼ぶのは `detect()`（camera.js から来たフレーム）と `capturePreview()` の 2 か所だけ。
 - 受け取る `frame` は `{ video, crop, preview, plain(), analyze(source) }`。
   `crop` は検出枠を映像の実ピクセル座標にしたもの（`measureFrame()` がコピーの直前に決める）。
-  `plain()` は素通しの画像（余白・回転込み）、`analyze()` は解析して結果を返す
+  `plain()` は素通しの画像（回転込み・余白なし。ZXing 経路では呼ぶたびに回転が入れ替わるので
+  1 フレームに 1 回だけ呼ぶ）、`analyze()` は解析して結果を返す
   （preview のときは解析せずに画像をそのまま返す）。
 - 呼ばれるのは解析中でないときだけ。`analyze()` は 1 回の呼び出しにつき 1 回まで。
 - 中身は下の「barcode-preprocess.js」を参照。
@@ -446,13 +447,13 @@ barcode.js が持つのはこの口だけ。** 既定の `null` なら従来ど�
 - ループ（間隔・一時停止・世代の管理）は camera.js 側にある（「フレームの受け渡し」を参照）。
 - **解析はフレームのコピーに対して行う。** `copyPreviewFrame()` が `frame.video` の現在の
   フレームから検出枠のぶんを `frameBuffer` へ複製し（正立・余白なし・`MAX_SCAN_SIDE` まで
-  縮小済み）、`captureScanArea()` がそこに経路ごとの味付け（余白・回転）をして解析用の
+  縮小済み）、`captureScanArea()` がそこに経路ごとの味付け（回転）をして解析用の
   画像にする。**barcode.js の中で `<video>` を読むのはこの 1 箇所だけ**
   （`frameFilter` を差し込んだときは、そちらも同じ `crop` の範囲だけを読む）。
   - **コピーは枠のぶんだけにする。広げないこと。** 映像を丸ごと複製すると 1 回あたり
     約 200 万画素（1080p 縦持ち）を読むことになるが、実際に要るのは枠のぶん
     （縮小後で約 36 万画素）しかない。camera.js が画素ではなく `<video>` を渡してくるのも同じ理由。
-  - 余白も回転も要らない経路（＝ `BarcodeDetector`）では `frameBuffer` をそのまま
+  - 回転の要らない `BarcodeDetector` の経路では `frameBuffer` をそのまま
     `ImageBitmap` にして渡す（canvas 間の複製を 1 回省く）。解析中はコピーが止まるので、
     渡したあとに書き換わることはない。
   - **解析中はコピーしない。** 1 回のコピーにつき解析は 1 回で、結果が返ってから次を
@@ -472,18 +473,19 @@ barcode.js が持つのはこの口だけ。** 既定の `null` なら従来ど�
     GPU からの読み戻しになって逆に重くなる。
   - `stop()` で `releasePreviewFrame()` を呼び、停止後に古いフレームを解析／表示しない
     ようにする。
-- 同梱ライブラリの経路（ZXing / ZXing-C++ / Quagga2）では、切り出した画像の**左右に幅 `SCAN_PAD_X`
-  （いまは 40px。以前は一時的に 0 にしていた）の白い帯**を足してから渡す。枠いっぱいに
-  バーコードが写っているとクワイエットゾーンが足りず読めないため。回転経路でもバーが並ぶのは
-  canvas の横方向なので、足す位置は正立時と同じ。`BarcodeDetector` には足さない（端末側の実装に任せる）。
+- **barcode.js は切り出した画像に余白を足さない。** 以前は同梱ライブラリの経路（ZXing / ZXing-C++ /
+  Quagga2）だけ、左右に幅 `SCAN_PAD_X` の白い帯を足していた（最後は 0 で実質無効）。
+  いまは前処理の「余白」の段（`barcode-preprocess.js` の `padStage()`）に移してあり、
+  チェックボックスで入れたときだけ、どのエンジンにも同じように掛かる（`BarcodeDetector` にも）。
   帯を切り出した画像の左右端の画素の色で塗る案も試したが（`9dd2b57`）、白に戻した。
 - `onEngineChange` は 1 秒ごとにも飛んでくる（`rate` に直近 1 秒の実際の解析回数が入る）。
   このページでは右上の `#engine` バッジに **`エンジン名 · N/s`** として出す動作確認用の表示。
   `0/s` なら camera.js のループが回っていない。デバッグの第一手として見る。
 - `capturePreview()` が、いま解析に渡しているのと同じ画像を
-  `Promise<{ canvas, width, height, pad, filtered }>` で返す（`frameFilter` を通すので非同期）。
-  `frameFilter` が作った画像なら `filtered` が true で、`pad` は分からないので `null`。
-  枠のズレ・余白・縮小後のバーの潰れを実機で見るための動作確認用。
+  `Promise<{ canvas, width, height, filtered }>` で返す（`frameFilter` を通すので非同期）。
+  `frameFilter` が素通しの画像以外を返したら `filtered` が true（余白の幅などは前処理側の
+  `getState().debug` に問い合わせる）。
+  枠のズレ・縮小後のバーの潰れを実機で見るための動作確認用。
   最後に受け取ったフレームの `<video>` から、常に正立（`captureScanArea(false)`）で切り出す。
   data URL にして `<img>` に入れるのは呼び出し側（このページでは「検出画像」ボタン
   `#scanPreviewBtn` → `#scanPreview` ダイアログ。ボタンの有効・無効は `onEngineChange` の
@@ -497,7 +499,7 @@ barcode.js が持つのはこの口だけ。** 既定の `null` なら従来ど�
 
 ### barcode-preprocess.js（前処理・検討中）
 
-`configure({ mode, contrastNormalize, threshold, smooth, shear, debug, storageKey, onChange })`。
+`configure({ stages, contrast, aggregate, compare, threshold, smooth, shear, debug, storageKey, onChange })`。
 **検討中の機能なので、barcode.js から切り出して 1 ファイルに閉じ込めてある。**
 barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけで、
 `BarcodeScanner.configure({ frameFilter: BarcodePreprocess.filter })` を呼んだときだけ動く
@@ -505,20 +507,54 @@ barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけ
 
 - **無効にするだけなら** `app.js` の「組み立て」にある `setupPreprocess();` の 1 行を消す。
   前処理は一切走らず、「前処理」ボタンも出ない（`#preprocessBtn` は HTML 側で `hidden`）。
-  保存済みの選択が `'ab'` でも結果ダイアログは普段どおり出る（`isBenchmarking()` が
+  保存済みの選択が A/B 比較でも結果ダイアログは普段どおり出る（`isBenchmarking()` が
   `setupPreprocess()` を通ったかを見ている）。
 - **完全に外すなら** 次の 4 か所。barcode.js の `frameFilter` は既定 `null` の口なので残してよい。
   - `js/barcode-preprocess.js`
-  - `index.html` のローダの 1 行と、`#preprocessBtn` / `#scanOutput` / `#scanWave` / `#scanWaveInfo` / `#scanLocate`
-  - `app.js` の「前処理」の節と `setupPreprocess();` の行
-  - `app.js` の `isBenchmarking()` / `preprocessDebug()` / `formatStats()` の呼び出し元
+  - `index.html` のローダの 1 行と、`#preprocessBtn` / `#preprocessPanel` / `#scanOutput` / `#scanWave` /
+    `#scanWaveInfo` / `#scanLocate`（と `#preprocessPanel` 周りの CSS）
+  - `app.js` の「前処理」の節と `setupPreprocess();` の行、`showBrightnessPanel()` の中の
+    `showPreprocessPanel()` の呼び出し
+  - `app.js` の `isBenchmarking()` / `preprocessDebug()` / `preprocessOutput()` / `formatStats()` の呼び出し元
     （バッジ・`onDetect`・検出画像ダイアログ。いずれも「前処理」とコメントしてある）
 - ライブラリの約束ごと（DOM を探さない・`emit()` で例外を握る・`storageKey`）は他と同じ。
   映像と切り出し範囲はフレームごとに `frameFilter` の引数で受け取り、barcode.js を直接は参照しない。
 - `filter(frame)` は 1 フレームぶんの画像を作って `frame.analyze()` まで呼ぶ。前処理を
-  使わないフレーム（`'off'`・`'ab'` の素通し側・振幅不足）は `frame.plain()` で素通しの画像を
-  もらう。A/B の入れ替えと検出率の集計もこの中で完結する。
-  `frame.preview` のとき（検出画像の表示）は数えず、`'ab'` でも前処理ありのほうを出す。
+  使わないフレーム（全部の段が無効・A/B 比較の素通し側）は `frame.plain()` の素通しの画像を
+  そのまま渡す。A/B の入れ替えと検出率の集計もこの中で完結する。
+  `frame.preview` のとき（検出画像の表示）は数えず、A/B 比較でも前処理ありのほうを出す。
+
+#### パイプライン（段の選び方）
+
+前処理は**段（stage）を決まった順に並べたパイプライン**で、段ごとに有効・無効を選ぶ
+（このページでは「前処理」ボタン `#preprocessBtn` で開くパネル `#preprocessPanel` のチェックボックス。
+中身は `app.js` の `buildPreprocessPanel()` が `getStages()` / `getMethods()` から作る）。
+**全部の段を無効にしたものが「前処理なし」**で、以前の `'off'` にあたる。**既定は全部無効。**
+
+```
+入力 → locate（領域検出）→ contrast（コントラスト調整）→ aggregate（縦集約）→ pad（余白）→ 解析
+```
+
+- **順番は固定**（`STAGES`）。領域検出は映像から直接切り出すので先頭、余白は解析の直前に
+  白を足すので最後、コントラスト調整は縦集約の傾きの測定を助けるので縦集約の前。
+- **入力**は、領域検出が見つかればその切り出し（バーが縦に立った実寸の画像）、縦集約が有効なら
+  縦に潰した取り込み（下の 1.）、それ以外は素通しの画像（`frame.plain()`。`MAX_SCAN_SIDE` まで縮小・回転込み）。
+- 段から段へは灰色の画像（`{ gray: Uint8Array, width, height }`）で渡し、canvas に戻すのは最後の
+  1 回だけ（`writeOutput()`）。どの段も効かなかったフレームは、素通しの画像をそのまま解析に渡す。
+- **効かなかった段は飛ばして続ける。** 領域検出が見つからない → 素通しの画像を入力にする。
+  stretch で伸ばす幅が無い → 触らない。縦集約の振幅が足りない → 縦集約だけ見送る
+  （入力が縦に潰した取り込みだったときは、それでは解析できないので素通しの画像から組み直す）。
+  余白は常に効く。
+- 方式を選べる段がある。コントラスト調整は `contrast`（`'stretch'` 既定 / `'clahe'`）、
+  縦集約は `aggregate`（`'median'` 既定 / `'mean'` / `'trimmed'`）。パネルでは段の横の `<select>`。
+- 選択（`{ stages, contrast, aggregate, compare }`）は JSON で `localStorage['barcodePreprocess']` に保存する。
+  以前の 1 つの選択値（`'median'` / `'ab'` など）が残っていても、JSON として読めないので既定に戻る。
+  `configure()` に渡した選択は保存値の上に重なる（保存はしない）。
+- 切り替えは `setStage(name, enabled)` / `setMethod(stage, method)` / `setCompare(enabled)`。
+  停止中でも切り替えられ、次のフレームから効く。切り替えると A/B の集計と検証用のデータは捨てる。
+- 検出画像ダイアログの `#scanWaveInfo` に、入力と段ごとの結果（見送った理由を含む）が 1 行ずつ出る。
+
+#### 縦集約の段（aggregate）
 
 ラベルプリンタで刷った細いバーコードは、**印字そのものが荒れている**せいで読めないことがある
 （バーの縁が 1px 単位でがたつく・かすれる・黒点が乗る）。1D デコーダは 1 本のスキャンライン
@@ -527,10 +563,7 @@ barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけ
 `MAX_INDIVIDUAL_VARIANCE`）ので、モジュールが 2〜3px の画像では余裕がほとんど無い。
 
 バーコードは高さ方向には同じ模様が続くので、**複数ラインを 1 本の波形に集約してから
-画像を作り直す**経路を足してある（`configure({ mode })`、このページでは
-「前処理」ボタン `#preprocessBtn`）。`'off' | 'mean' | 'median' | 'trimmed' |
-'contrast-stretch' | 'contrast-clahe' | 'locate' | 'ab' | 'ab-locate'` で、**既定は `'median'`**
-（`'contrast-*'` と `'locate'` は集約しないモード。下の「コントラスト正規化」「領域の検出と切り出し」を参照）。選択は `localStorage['barcodePreprocess']` に保存する。
+画像を作り直す**のがこの段（`aggregateStage()`）。
 
 ```
 █ █▓█ █  ██
@@ -538,12 +571,14 @@ barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけ
 █ ██▓ █  ██
 ```
 
-処理は `capture()` の中で完結していて、順に次のとおり。
+処理は順に次のとおり（1 は入力づくり、2〜6 が `aggregateStage()`）。
 
-1. 検出枠のぶんを **横は実寸のまま**（`PRE_MAX_WIDTH` = 1280）・縦だけ `PRE_ROWS` = 32 段に
+1. 領域検出が無効（または見つからない）なら、検出枠のぶんを **横は実寸のまま**（`PRE_MAX_WIDTH` = 1280）・縦だけ `PRE_ROWS` = 32 段に
    潰して取り込む。**barcode.js の素通しの経路と違って `MAX_SCAN_SIDE`（640）は掛けない。**
    細バーの太さは横の解像度でしか決まらないため。縦を潰すぶん画素数はむしろ減る
-   （1280x32 = 4 万画素 < 640x267 = 17 万画素）。
+   （1280x32 = 4 万画素 < 640x267 = 17 万画素）（`captureRows()`）。
+   領域検出の切り出し（最大 `LOC_MAX_HEIGHT` 行）を入力にしたときは、`binRows()` で
+   `PRE_ROWS` 段に平均してから集約する（中央値の集約は段数の 2 乗で重くなるため）。
 2. 上下の帯の波形を突き合わせて**傾き（シアー）を測る**（`estimateShear()`）。
 3. 段ごとに横へずらしながら、x ごとに mean / median / trimmed mean で集約する。
 4. 振幅を 0〜255 に伸ばす（`normalize()`）。ZXing-C++ は 1 行のヒストグラムで
@@ -552,9 +587,8 @@ barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけ
    伸び縮みさせない）。`PRE_OUT_WIDTH` に数値を入れたときだけ、その幅に合わせて
    伸び縮みさせる（`resample()`。伸ばすときは線形補間、縮めるときは出力の 1px が
    覆う区間の面積平均）。
-6. `PRE_OUT_ROWS` = 100 行の画像に起こして解析へ渡す（全行が同じ内容）。
-   左右の白の余白（`PRE_PAD_X`）はいまは 0 で足していない（以前は 40）。
-   クワイエットゾーンは枠内に写っているラベルの余白だけが頼りになる。
+6. `PRE_OUT_ROWS` = 100 行の画像に起こす（全行が同じ内容）。
+   白の余白はこの段では足さない（以前の `PRE_PAD_X`。足すなら余白の段を入れる。下の注意を参照）。
 
 **5 は 3 とセットで、片方だけでは効かない。** 集約で得られるのは「エッジが x と x+1 の
 どこにあるか」というサブピクセルの情報で、そのまま出すと run length が整数に丸められて
@@ -608,27 +642,20 @@ ZXing-C++ で n=90）での実測は次のとおり。**荒れていないラベ
 - **1D 平滑化を入れない**（`smooth` の既定は false）。縦の集約でノイズは
   既に落ちていて、横に鈍らせると細バーの縁まで鈍る。
 
-#### コントラスト正規化（contrastNormalize。検証中）
+#### コントラスト調整の段（contrast。検証中）
 
-`configure({ contrastNormalize })` で、灰色にした直後（傾きの測定・集約より前）に
-コントラストを整える。`'off'`（既定）/ `'stretch'` / `'clahe'`。このページは `app.js` の
-`setupPreprocess()` で `'stretch'` を渡している。検出画像ダイアログの波形の下に、
-何をしたか（`stretch（17〜222 → 0〜255）` など）が出る。
-**この設定が効くのは集約するモード（mean / median / trimmed）だけ。**
+入力の灰色の画像にコントラストを整える（`contrastStage()`）。方式は `'stretch'`（既定）/ `'clahe'`。
+以前は「集約するモードに付ける設定（`contrastNormalize`）」と「コントラスト正規化だけのモード
+（`'contrast-stretch'` / `'contrast-clahe'`）」の 2 通りがあったが、どちらもこの段 1 つになった
+（縦集約と一緒に入れれば前者、単独で入れれば後者と同じ）。
 
-**コントラスト正規化だけを掛けるモード**も別にある（`mode` の `'contrast-stretch'` /
-`'contrast-clahe'`。ボタンでは `コントラスト（stretch）` / `コントラスト（CLAHE）`）。
-縦の集約をせず、素通しの画像（`frame.plain()`。余白・回転込みの 2 次元の画像）を
-`contrastOutput` に写してから正規化を掛けて渡す（`captureContrastOnly()`）。方式はモードで
-決まり、`contrastNormalize` には左右されない。集約とコントラスト正規化のどちらが
-効いているかを切り分けるためのもの。
+- CLAHE の縦の区画数は、入力が縦に潰した取り込み（32 段）なら `PRE_CLAHE_TILES_Y` = 1、
+  それ以外（素通しの画像・領域検出の切り出し）なら `CLAHE_TILES_Y_2D` = 4。横はどちらも 8。
+- 伸ばす幅が無い（`stretch` で `PRE_MIN_CONTRAST` 未満）ときは触らない（この段を見送る）。
+- 波形は縦集約の段が無いと出ないので、検出画像ダイアログには何をしたか（`stretch（17〜222 → 0〜255）` など）だけが出る。
 
-- CLAHE は 2 次元の画像なので縦にも分ける（`CONTRAST_ONLY_TILES_Y` = 4。横は同じ 8）。
-- 伸ばす幅が無い（`stretch` で `PRE_MIN_CONTRAST` 未満）ときは素通しの画像をそのまま渡す。
-- `plain()` は呼ぶたびに回転（ZXing 経路の `rotateNext`）を入れ替えるので、1 フレームに 1 回だけ呼ぶ。
-- 波形は無いので、検出画像ダイアログには何をしたかだけが出る。
-- `'ab'` で比べられるのは今のところ `median` と素通しだけ。コントラストのみのモードの
-  検出率は、モードを切り替えて見比べるしかない（持ち方や明るさが揃わない点に注意）。
+以下の実測は段にまとめる前のもの（「コントラスト（stretch）」はいまの「コントラスト調整（stretch）だけ」、
+2 つ目の表の off / stretch / clahe の列はいまの「縦集約」「コントラスト調整 + 縦集約」にあたる）。
 
 同じ合成画像（下の表と同じ条件）で、12 秒のうちに読めたかどうか。「素通し」は下の表の `素`。
 
@@ -670,7 +697,7 @@ ZXing-C++、`'ab'`、出力は実寸）での実測。「照明むら」はラ�
   ZXing-C++ の行ごとのヒストグラムの山の割り方が変わったため、と推測している（確かめていない）。
 - **`'clahe'` は照明むらのうち 2 場面で、前処理なしでも読めないものを読めるようにした。**
   一方で照明むら 50% は読めなくした。
-- 合成画像は決まった絵を流すので結果は 0% か 100% に振れる。実機では必ず `'ab'` で比べること。
+- 合成画像は決まった絵を流すので結果は 0% か 100% に振れる。実機では必ず A/B 比較で比べること。
 
 #### 試して外したもの: 集約前・集約後の二値化
 
@@ -692,11 +719,12 @@ ZXing-C++、`'ab'`、出力は実寸）での実測。「照明むら」はラ�
 **0% になったのは、出力の左右に白の余白（`PRE_PAD_X` = 40）を足していた頃だけ**で、
 余白をやめたら二値化なしでも読めた。灰色そのものより「真っ白な余白の隣に灰色が来る」
 組み合わせが効いていたらしい（ヒストグラムの山の割り方が変わるため、と推測。
-確かめてはいない）。**`PRE_PAD_X` を戻すなら、背景が暗い灰色のときに読めなくなることを疑うこと。**
+確かめてはいない）。**縦集約と余白の段を一緒に入れるなら、背景が暗い灰色のときに読めなくなることを
+疑うこと。** 領域検出も入れれば台紙や背景を切り落としてから白を足すので、この組み合わせにはならない。
 
 **縦に潰すので、バーが縦に並んでいることが前提になる。** 振幅が `PRE_MIN_CONTRAST`
-未満のとき（枠内にバーコードが無い・バーが横向き）は前処理を諦め、その場で素通しの
-経路に落ちる。ZXing-C++ の `tryRotate` 任せの縦向き読み取りはそちらで従来どおり動く。
+未満のとき（枠内にバーコードが無い・バーが横向き）は縦集約の段を見送り、素通しの画像で
+残りの段を通す。ZXing-C++ の `tryRotate` 任せの縦向き読み取りはそちらで従来どおり動く。
 
 **module width（最細バーが何 px あるか）が足りないとどうにもならない。** 同じ荒れ方で
 module を 2px にすると、前処理あり・なしのどれも 0% になった。実測値は「検出画像」
@@ -711,16 +739,17 @@ module を 2px にすると、前処理あり・なしのどれも 0% になっ�
 呼ばれると前処理に回さず素通しの画像を返すので、そちらだけでは前処理の出力を見られない
 ことがあるため。写しを作るのは呼ばれたときだけで、毎フレームの負担は無い。
 `capturePreview()` が前処理の画像を作り直してしまうので、**app.js は必ずその前に呼ぶ**。
-振幅不足で見送ったフレームでは作り直さないので、古い画像のことがある（`time` で分かる）。
+どの段も効かなかったフレームでは作り直さないので、古い画像のことがある（`time` で分かる）。
+返すのは `{ canvas, width, height, stages, pad, time, preview }`（`stages` は実際に効いた段）。
 `debug` が false なら `null` を返す。
 
-#### 領域の検出と切り出し（locate。検証中）
+#### 領域検出の段（locate。検証中）
 
-`mode` の `'locate'`（ボタンでは `領域検出＋余白`）。検出枠の中から**バーコードが写っている範囲だけを
-探して切り出し、傾きを直して白の余白を足してから**解析に渡す（`captureLocated()`）。
+検出枠の中から**バーコードが写っている範囲だけを探し、傾きを直して切り出す**（`locateStage()`）。
 OpenCV でよくやる「勾配 → 塊 → 回転矩形 → 切り出し」を手で書いたもので、ライブラリは使っていない。
-集約もコントラスト正規化もしない。狙いは、枠いっぱいに写したときや、台紙の灰色・ラベルの縁が
-バーのすぐ隣に来るときに、**クワイエットゾーンを白で作り直す**こと。
+白の余白は足さない（余白の段の仕事）。狙いは、余白の段と組み合わせて、枠いっぱいに写したときや、
+台紙の灰色・ラベルの縁がバーのすぐ隣に来るときに、**クワイエットゾーンを白で作り直す**こと。
+以前の `'locate'` モード（`領域検出＋余白`）は、いまの「領域検出 + 余白」の 2 段にあたる。
 
 1. 検出枠を `LOC_MAX_SIDE`（640）まで縮めて取り込み、Sobel で勾配を取る。
    320 まで落とすと実機の細バーが 1px を切って勾配が出なくなる。
@@ -740,11 +769,11 @@ OpenCV でよくやる「勾配 → 塊 → 回転矩形 → 切り出し」を�
    最初のエッジは明→暗、最後は暗→明になる。余白が 1 モジュールしか無いと、ラベルの縁
    （暗い背景 → 白いラベル）が同じ区切りに入ってくるので、向きの合わない端のエッジを削る。
    これを入れる前は、暗い背景の細い帯ごと切り出して読めなかった。
-6. 行ごとの横の段差の量で上下も詰め（`trimRows()`）、左右に `LOC_PAD_X`（40px。エッジ間隔の
-   中央値の `LOC_PAD_GAPS` 倍のほうが広ければそちら）、上下に `LOC_PAD_Y`（8px）の白を足す。
+6. 行ごとの横の段差の量で上下も詰める（`trimRows()`）。5 で測ったエッジの間隔の中央値（`gap`）を
+   出力に付けておき、余白の段が余白の幅を決めるのに使う。
 
 - 見つからない（区画が無い・塊が小さい・エッジが `LOC_MIN_EDGES` 本に満たない）ときは
-  素通しの画像（`frame.plain()`）に落ちる。
+  この段を見送り、素通しの画像（縦集約が有効なら縦に潰した取り込み）を入力にして残りの段を通す。
 - 傾きを 4 で直すので、出力は常にバーが縦に立っている。ZXing（zxing-js）経路の
   1 フレームおきの 90 度回転（`rotateNext`）は、見つかったフレームでは通らない。
 - 映像を読むのは 1 と 4 の 2 回で、どちらも `crop` の範囲だけ。
@@ -766,16 +795,32 @@ OpenCV でよくやる「勾配 → 塊 → 回転矩形 → 切り出し」を�
 | バーコード無し（文字だけ・無地） | 見つからず（素通しへ） | — |
 
 実際のページ（偽カメラ・余白 1 モジュール・背景 60）でも、`'locate'` は ZXing-C++ / ZXing とも
-0.2 秒ほどで読め、`'off'` は 12 秒のあいだ読めなかった。**実機では `'ab-locate'` で比べること。**
+0.2 秒ほどで読め、`'off'` は 12 秒のあいだ読めなかった（どちらも段にまとめる前の測定で、表の locate は
+いまの「領域検出 + 余白」、素通しは余白 40px を足していた頃のもの）。
+
+段にまとめたあと（2026-09-24）、同じ偽カメラ（余白 1 モジュール・背景 60）で ZXing-C++ に渡した結果は、
+「なし」「余白」だけでは 7 秒のあいだ読めず、「領域検出」「領域検出 + 余白」「領域検出 + コントラスト調整 + 余白」は
+すぐ読めた（ZXing でも「領域検出 + 余白」は読め、「なし」は読めない）。**余白の段だけでは、枠の中に写った
+暗い背景は消えない**（白を足すのは画像の外側だけ）ので、狭い余白には領域検出と組み合わせること。
+**実機では A/B 比較で比べること。**
+
+#### 余白の段（pad）
+
+画像の周りに白を足して、クワイエットゾーンを作り直す（`padStage()`）。左右は `PAD_X`（40px。
+領域検出がエッジの間隔を測っていれば、その `PAD_GAPS`（8）倍のほうが広ければそちら）、上下は `PAD_Y`（8px）。
+以前は barcode.js の `SCAN_PAD_X`（同梱ライブラリの経路だけ）と、領域検出の中（`LOC_PAD_*`）に
+別々にあったものを 1 つの段にまとめた。**どのエンジンにも同じように掛かる**（`BarcodeDetector` にも）。
+縦集約と組み合わせるときの注意は、上の「試して外したもの」を参照。
 
 #### 検出率の比較（A/B）
 
-`'ab'` を選ぶと、**1 フレームおきに前処理あり／なしを入れ替えて**それぞれの検出率を数える
-（`getStats()`、`getState().stats`。`app.js` はバッジを描くたびに読みに行く）。このページでは `#engine` バッジに
-`前 42% / 素 0%` と出る。別々に試すと持ち方や明るさが変わってしまうので、
-**必ず交互に回したこのモードで比べること。** `app.js` はこのとき結果ダイアログを出さず、
-`autoPause` も切る（1 枚読めたところで止まると数が溜まらないため）。
-`'ab'` は `median`、`'ab-locate'` は `locate` を素通しと交互に回す（`AB_CHOICES`）。
+A/B 比較（`compare`。パネルの「A/B 比較」）を入れると、**1 フレームおきに前処理あり（有効な段を全部通したもの）と
+素通しを入れ替えて**それぞれの検出率を数える（`getStats()`、`getState().stats`。`app.js` はバッジを描くたびに
+読みに行く）。このページでは `#engine` バッジに `前 42% / 素 0%` と出て、「前処理」ボタンのラベルに `（A/B）` が付く。
+別々に試すと持ち方や明るさが変わってしまうので、**必ず交互に回したこのモードで比べること。**
+`app.js` はこのとき結果ダイアログを出さず、`autoPause` も切る（1 枚読めたところで止まると数が溜まらないため）。
+どの段も効かなかったフレームは素通しとして数える。以前の `'ab'` は「コントラスト調整（stretch）+ 縦集約 + A/B」
+（app.js が `contrastNormalize: 'stretch'` を渡していたため）、`'ab-locate'` は「領域検出 + 余白 + A/B」にあたる。
 
 ### photo.js
 
@@ -847,6 +892,12 @@ DOM も CSS のクラス名も知らない（唯一の例外が camera.js の `m
   スライダー（`#brightnessPanel`）は `#controls` の中に幅いっぱい（`flex: 0 0 100%`）で
   置いてあり、ボタンが何行に折り返しても常にその上の行に出る。
   `#controls` は `pointer-events: none` なので、触る箱（`#brightnessControl`）だけ戻している。
+- 「前処理」ボタン（`#preprocessBtn`）も同じ扱いで、`renderPreprocess()` が
+  `前処理: 領域+余白` / `前処理: なし` / A/B 比較中は末尾に `（A/B）` を書く。押すとパネル
+  （`#preprocessPanel`）を開閉し、段ごとのチェックボックスと方式の `<select>` は
+  `buildPreprocessPanel()` が作る（HTML には入れ物の `#preprocessStages` しか無い）。
+  明るさのスライダーと同じ場所に出るので、片方を開くともう片方は畳む。
+  触る箱（`#preprocessControl`）だけ `pointer-events` を戻しているのも同じ。
 
 ## vendor/
 

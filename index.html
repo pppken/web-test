@@ -313,6 +313,78 @@
       color: rgba(255, 255, 255, 0.75);
     }
 
+    /* --- 前処理 --- */
+
+    /* 「前処理」ボタンで開閉する段のチェックボックス。明るさのスライダーと同じく
+       #controls の中で幅いっぱいを取り、ボタンの上の行に出す */
+    #preprocessPanel {
+      flex: 0 0 100%;
+      display: flex;
+      justify-content: center;
+    }
+
+    #preprocessPanel[hidden] {
+      display: none;
+    }
+
+    #preprocessControl {
+      width: min(420px, 100%);
+      margin: 0;
+      padding: 12px 18px;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 16px;
+      background: rgba(20, 20, 20, 0.7);
+      backdrop-filter: blur(8px);
+      font-size: 14px;
+      /* #controls は pointer-events: none なので、触る箱だけ戻す */
+      pointer-events: auto;
+    }
+
+    #preprocessControl legend {
+      padding: 0 4px;
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      color: rgba(255, 255, 255, 0.75);
+    }
+
+    .preprocess-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 36px;
+    }
+
+    .preprocess-row label {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+    }
+
+    .preprocess-row input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      margin: 0;
+      accent-color: rgba(45, 127, 249, 1);
+    }
+
+    .preprocess-row select {
+      padding: 4px 8px;
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 8px;
+      background: rgba(40, 40, 40, 0.9);
+      color: #fff;
+      font-size: 13px;
+    }
+
+    /* 段と A/B 比較の間の区切り */
+    .preprocess-row.compare {
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px solid rgba(255, 255, 255, 0.15);
+    }
+
     /* --- 撮影 --- */
 
     /* シャッターを切ったときにプレビューを一瞬白く光らせる */
@@ -506,11 +578,13 @@
       border-radius: 10px;
     }
 
+    /* 前処理の段ごとの結果。1 段 1 行で出す（app.js が改行で区切る） */
     #scanWaveInfo {
       margin: 8px 0 0;
       font-size: 11px;
       line-height: 1.7;
       text-align: center;
+      white-space: pre-line;
       color: rgba(255, 255, 255, 0.55);
     }
 
@@ -558,13 +632,22 @@
           </div>
         </div>
 
+        <!-- 「前処理」ボタンで開閉する。中身（段ごとのチェックボックス）は app.js の setupPreprocess() が作る -->
+        <div id="preprocessPanel" hidden>
+          <fieldset id="preprocessControl">
+            <legend>前処理（上から順に掛ける。全部外すと前処理なし）</legend>
+            <div id="preprocessStages"></div>
+          </fieldset>
+        </div>
+
         <button id="startBtn">カメラを起動</button>
         <button id="shutterBtn" disabled>撮影</button>
         <button id="scanPreviewBtn" disabled>検出画像</button>
         <!-- ラベルは app.js が現在の選択で上書きする -->
         <button id="engineBtn">エンジン: 自動</button>
-        <!-- 前処理（検討中）。app.js の setupPreprocess() が表示し、ラベルも現在の選択で上書きする -->
-        <button id="preprocessBtn" hidden>前処理: なし</button>
+        <!-- 前処理（検討中）。app.js の setupPreprocess() が表示し、ラベルも現在の選択で上書きする。
+             押すと #preprocessPanel を開閉する -->
+        <button id="preprocessBtn" type="button" aria-controls="preprocessPanel" aria-expanded="false" hidden>前処理: なし</button>
         <!-- ラベルは app.js が現在の倍率で上書きする -->
         <button id="zoomBtn" disabled>ズーム</button>
         <!-- ラベルは app.js が現在の明るさで上書きする -->

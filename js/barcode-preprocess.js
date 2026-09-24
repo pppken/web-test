@@ -1,26 +1,37 @@
 (() => {
   'use strict';
 
-  // バーコードの前処理（縦方向の集約）。**検討中の機能**なので barcode.js から切り出してある。
+  // バーコードの前処理。**検討中の機能**なので barcode.js から切り出してある。
   // barcode.js 側にあるのは frameFilter という差し込み口 1 つだけで、そこに
   // BarcodePreprocess.filter を渡したときだけ動く。渡さなければ（またはこのファイルを
-  // 読み込まなければ）barcode.js は従来どおり素通しの画像を解析する。
+  // 読み込まなければ）barcode.js は素通しの画像をそのまま解析する。
+  //
+  // 前処理は段（stage）を並べたパイプラインで、段ごとに有効・無効を切り替えられる。
+  // 掛ける順は決まっていて（STAGES）、有効な段だけを上から順に通す。
+  // **全部の段を無効にしたものが「前処理なし」**（素通しの画像をそのまま解析する）。
+  //
+  //   入力      領域検出が有効で見つかればその切り出し、縦集約だけが有効なら縦に潰した取り込み、
+  //             それ以外は素通しの画像（frame.plain()）
+  //   locate    領域検出。枠の中からバーコードの範囲を探し、傾きを直して切り出す
+  //   contrast  コントラスト調整。'stretch'（線形に伸ばす）| 'clahe'（区画ごとに平坦化）
+  //   aggregate 縦集約。高さ方向を 1 本の波形にまとめて画像を作り直す。'median' | 'mean' | 'trimmed'
+  //   pad       余白。左右（と上下）に白を足して、クワイエットゾーンを作り直す
   //
   //   BarcodePreprocess.configure({
-  //     mode,          // 'off' | 'mean' | 'median' | 'trimmed' | 'contrast-stretch' | 'contrast-clahe'
-  //                    // | 'locate' | 'ab' | 'ab-locate'
-  //                    // （既定は保存値。無ければ 'median'。'contrast-*' は集約せずコントラスト正規化だけ。
-  //                    // 'locate' はバーコードの領域を探して切り出し、白の余白を足す）
-  //     contrastNormalize, // 灰色にした直後のコントラスト正規化。'off'（既定）| 'stretch' | 'clahe'
-  //     threshold,     // 集約後の二値化。'none'（既定）| 'otsu' | 'adaptive'
-  //     smooth,        // 集約後に 3 タップの平滑化を掛ける（既定 false）
-  //     shear,         // 傾き（シアー）の補正を入れる（既定 true）
+  //     stages,        // 有効にする段の名前の配列（例: ['locate', 'pad']）。既定は保存値。無ければ [] ＝ 前処理なし
+  //     contrast,      // コントラスト調整の方式。'stretch'（既定）| 'clahe'
+  //     aggregate,     // 縦集約の方式。'median'（既定）| 'mean' | 'trimmed'
+  //     compare,       // A/B 比較。1 フレームおきに素通しと入れ替えて検出率を数える（既定 false）
+  //     threshold,     // 縦集約のあとの二値化。'none'（既定）| 'otsu' | 'adaptive'
+  //     smooth,        // 縦集約のあとに 3 タップの平滑化を掛ける（既定 false）
+  //     shear,         // 縦集約の傾き（シアー）の補正を入れる（既定 true）
   //     debug,         // 波形などの検証用データを残す（既定 true。本番は false）
-  //     storageKey,    // 選択の保存先。null で保存しない
+  //     storageKey,    // 選択（stages / contrast / aggregate / compare）の保存先。null で保存しない
   //     onChange(state)
   //   });
   //   BarcodeScanner.configure({ frameFilter: BarcodePreprocess.filter });  // 有効にするのはこの 1 行
-  //   BarcodePreprocess.setMode(choice) / nextMode() / getState() / getStats() / resetStats()
+  //   BarcodePreprocess.setStage(name, enabled) / setMethod(stage, method) / setCompare(enabled)
+  //   BarcodePreprocess.getState() / getStages() / getMethods(stage) / getStats() / resetStats()
   //   BarcodePreprocess.getLastOutput()   // 最後に作った出力画像の写し（検証用。debug のときだけ）
   //
   // frameFilter の約束ごと（受け取る frame の中身）は barcode.js の「差し込みの前処理」を参照。
@@ -47,7 +58,7 @@
                                   // （1280x32 = 4 万画素 < 640x267 = 17 万画素）
   const PRE_ROWS = 32;            // 集約の材料にする段数。<video> から縦だけ縮めて作るので、
                                   // 1 段が既に元の十数ライン分の平均になっている
-  const PRE_OUT_WIDTH = null;     // 出力画像の横幅（左右の余白 PRE_PAD_X があればそれ込み）。
+  const PRE_OUT_WIDTH = null;     // 縦集約の出力画像の横幅（余白の段で足す白は含まない）。
                                   // **null なら実寸**（＝検出枠を元映像の px で取り込んだ幅。
                                   // PRE_MAX_WIDTH を超える枠だけはそこまで縮まっている）で、伸び縮みしない。
                                   // 数値を入れると、波形をその幅に合わせて伸び縮みさせる（resample()）。
@@ -65,28 +76,35 @@
                                   //     （いまの ZXING_CPP_OPTIONS は false なので効かない）
                                   //   - 2 行なら tryRotate の走査も width<3 で即座に打ち切られる。
                                   //     100 行だと回転側でも走査するぶん、1 回の解析が重くなる
-  const PRE_PAD_X = 0;            // 出力画像の左右に足す白の幅（出力側の px）。以前は 40。
-                                  // いまは足さない（検証中）。クワイエットゾーンは ROI に写っている
-                                  // ラベルの余白だけが頼りになるので、枠いっぱいにバーコードを
-                                  // 写すと読めない
   const PRE_MAX_SHEAR = 24;       // 傾き補正で許す上下のずれ（入力側の px）。
                                   // ROI の高さが 500px なら約 2.7 度ぶん
   const PRE_TRIM = 0.25;          // trimmed mean で上下から捨てる割合
   const PRE_ADAPTIVE_WINDOW = 48; // adaptive しきい値の窓幅（集約後・伸び縮み前の px）
-  const PRE_MIN_CONTRAST = 16;    // 集約した波形の振幅がこれ未満なら前処理を諦めて
-                                  // 素通しの経路に落ちる（枠内にバーコードが無い・
-                                  // バーが横向きで縦集約に耐えない、のいずれか）
-  const PRE_STRETCH_CLIP = 0.01;  // コントラスト正規化 'stretch' で、暗い側・明るい側それぞれ
+  const PRE_MIN_CONTRAST = 16;    // 集約した波形の振幅がこれ未満なら縦集約の段を見送る
+                                  // （枠内にバーコードが無い・バーが横向きで縦集約に耐えない、のいずれか）。
+                                  // コントラスト調整の stretch も、伸ばす幅がこれ未満なら見送る
+  const PRE_STRETCH_CLIP = 0.01;  // コントラスト調整 'stretch' で、暗い側・明るい側それぞれ
                                   // 捨てる割合。反射や枠の端の影 1 点に伸ばし幅を引っ張られないため
   const PRE_CLAHE_TILES_X = 8;    // CLAHE の横の区画数。区画の幅（1280px 幅なら 160px）に
                                   // バーとスペースが両方入る程度に粗くしておく
-  const PRE_CLAHE_TILES_Y = 1;    // CLAHE の縦の区画数。取り込みが 32 段しかなく、1 段が既に
-                                  // 元の十数ラインの平均なので縦には分けない
+  const PRE_CLAHE_TILES_Y = 1;    // CLAHE の縦の区画数（縦集約のために縦に潰した取り込みのとき）。
+                                  // 取り込みが 32 段しかなく、1 段が既に元の十数ラインの平均なので縦には分けない
   const PRE_CLAHE_CLIP = 2.0;     // CLAHE のクリップ上限（1 階調あたりの平均画素数の何倍まで
                                   // 許すか）。上げるほど区画ごとの伸ばし方が強くなり、
                                   // 無地の場所のノイズも持ち上がる
-  const CONTRAST_ONLY_TILES_Y = 4;// 'contrast-clahe' モード（集約しない）の CLAHE の縦の区画数。
-                                  // こちらは切り出した画像そのもの（640x570 程度）なので縦にも分ける
+  const CLAHE_TILES_Y_2D = 4;     // CLAHE の縦の区画数（それ以外。素通しの画像や領域検出の切り出しのとき）。
+                                  // こちらは切り出した画像そのもの（640x150 程度）なので縦にも分ける
+
+  // 余白の段（pad）。バーコードの左右に白を足して、クワイエットゾーンを作り直す。
+  // 検出枠いっぱいにバーコードが写っていると、開始/終了記号の外側に必要な
+  // 静止領域まで切り落とされて読めないため。以前は barcode.js の SCAN_PAD_X（ZXing / Quagga2 の
+  // 経路だけ）と、領域検出の中（LOC_PAD_*）にそれぞれあったものを、ここに 1 つにまとめた
+  const PAD_X = 40;               // 左右に足す白の最小幅（px）
+  const PAD_GAPS = 8;             // 領域検出で測ったエッジの間隔の中央値の何倍を左右の余白にするか（PAD_X より
+                                  // 広ければこちら）。間隔の中央値がおよそ 1.5〜2 モジュールなので、12〜16 モジュールぶん。
+                                  // 領域検出が見つからなかったときは PAD_X だけになる
+  const PAD_Y = 8;                // 上下に足す白（px）。1D の読み取りには要らないが、
+                                  // 切り口のすぐ上下に文字や台紙が来ないようにしておく
 
   // 'locate'（領域の検出と切り出し）。流れは「領域の検出と切り出し」の節を参照
   const LOC_MAX_SIDE = 640;       // 領域を探すときに取り込む大きさ（長辺）。barcode.js の MAX_SCAN_SIDE と同じ。
@@ -114,16 +132,17 @@
                                   // 規格の余白は 7〜10 モジュール、要素の最大幅は 4 モジュール（CODE128 / JAN）で、
                                   // 間隔の中央値はおよそ 1.5〜2 モジュール
   const LOC_MIN_EDGES = 20;       // バーコードとみなすエッジの本数の下限。最短の CODE39 / CODE128 でも 25 本以上ある
-  const LOC_PAD_X = 40;           // 左右に足す白の余白の最小幅（出力側の px）。barcode.js の SCAN_PAD_X と同じ
-  const LOC_PAD_GAPS = 8;         // 左右の余白を、エッジの間隔の中央値の何倍にするか（LOC_PAD_X より広ければこちら）。
-                                  // 間隔の中央値がおよそ 1.5〜2 モジュールなので、12〜16 モジュールぶんになる
-  const LOC_PAD_Y = 8;            // 上下に足す白の余白（出力側の px）。1D の読み取りには要らないが、
-                                  // 切り口のすぐ上下に文字や台紙が来ないようにしておく
 
-  // 集約の仕方。'off' は前処理なし、'ab' / 'ab-locate' は 1 フレームおきに off と
-  // AB_CHOICES の前処理を入れ替えて検出率を比べる計測用。
-  //
-  // **mean ではなく median を既定にしてある。** 荒れた印字を合成して測ったところ
+  // 前処理の段。**並びがそのまま掛ける順**で、有効な段だけを上から順に通す。
+  // 順番を入れ替えられるようにはしていない（どれも前の段の出力を前提にしている）:
+  //   locate     一番先。映像から直接切り出すので、他の段の出力は使えない。
+  //              出力はバーが縦に立った画像になる（縦集約の前提もこれで満たせる）
+  //   contrast   縦集約の前。影やむらを均したほうが、縦集約の傾きの測定で上下の帯を突き合わせやすい
+  //   aggregate  余白の前。白の余白まで縦に潰しても意味が無い
+  //   pad        一番最後。前の段が切り詰めたぶんも含めて、解析に渡す直前に白を足す
+  const STAGES = ['locate', 'contrast', 'aggregate', 'pad'];
+
+  // 縦集約の方式。**mean ではなく median を既定にしてある。** 荒れた印字を合成して測ったところ
   // （module 3px・傾き 1.2 度・縁のゆらぎ ±1px・ドット抜けあり、ZXing-C++ で n=90）、
   //
   //   前処理なし        0%
@@ -137,29 +156,38 @@
   // 黒白の面積比に引きずられ、run length が systematic にずれる。
   // median は「エッジ位置の中央値」に段を立て直すので、縁の鋭さが戻る。
   // trimmed mean はほぼ median と同じ（差は測定誤差の範囲）
+  const AGGREGATE_METHODS = ['median', 'mean', 'trimmed'];
+
+  // コントラスト調整の方式。
+  //   'stretch'  輝度の上下 PRE_STRETCH_CLIP を捨て、残りを 0〜255 に線形に伸ばす
+  //   'clahe'    画像を区画に分け、区画ごとにクリップ付きのヒストグラム平坦化を掛けて、
+  //              区画の間は線形補間でつなぐ
   //
-  // 'contrast-stretch' / 'contrast-clahe' は縦の集約をせず、素通しの画像（frame.plain()）に
-  // コントラスト正規化だけを掛けて渡す。方式はモードごとに決まっていて、
-  // contrastNormalize の設定（集約するモード用）には左右されない。
-  // 集約とコントラスト正規化のどちらが効いているかを切り分けるためのもの
+  // 'stretch' は全体に同じ直線を掛けるだけなので、明るさの順番は変わらない。
+  // 中央値の集約とは入れ替えても結果が同じで、集約後の normalize()（最小〜最大を
+  // 0〜255 に伸ばす）との違いは「上下の外れ値に引っ張られない」ことだけになる。
   //
-  // 'locate' は集約もコントラスト正規化もせず、検出枠の中からバーコードの領域だけを探して
-  // 切り出し、傾きを直して白の余白を足してから渡す（下の「領域の検出と切り出し」を参照）
-  const CHOICES = [
-    'off', 'mean', 'median', 'trimmed', 'contrast-stretch', 'contrast-clahe', 'locate', 'ab', 'ab-locate'
-  ];
-  const CONTRAST_ONLY_MODES = {    // モード -> コントラスト正規化の方式
-    'contrast-stretch': 'stretch',
-    'contrast-clahe': 'clahe'
+  // 'clahe' は場所ごとに伸ばし方を変えるので、影や照明のむらで左右の明るさが
+  // 違うときに効く。その代わり階調の写し方が直線でなくなるので、ぼけた縁の
+  // 「中間の濃さ」の位置がずれ、バーの太さが偏りうる（読み比べて決めること）
+  const CONTRAST_METHODS = ['stretch', 'clahe'];
+
+  // 段ごとに選べる方式（方式の無い段は持たない）
+  const METHODS = {
+    contrast: CONTRAST_METHODS,
+    aggregate: AGGREGATE_METHODS
   };
-  const DEFAULT_CHOICE = 'median';
-  const AB_CHOICES = {             // A/B の選択値 -> 素通しと交互に回す前処理
-    ab: 'median',
-    'ab-locate': 'locate'
+
+  // 保存値が無いときの選択。**既定は全部の段が無効（＝前処理なし）**
+  const DEFAULT_SETTINGS = {
+    stages: [],
+    contrast: 'stretch',
+    aggregate: 'median',
+    compare: false
   };
   const DEFAULT_STORAGE_KEY = 'barcodePreprocess';
 
-  // 伸び縮みさせたあとの二値化。**既定は 'none'（＝ 生の輝度をそのまま渡す）。**
+  // 伸び縮みさせたあとの二値化（縦集約の段）。**既定は 'none'（＝ 生の輝度をそのまま渡す）。**
   // ZXing-C++ 側は 1 行ごとにヒストグラムでしきい値を決め、さらに
   // (-p[-1] + 4*p[0] - p[1]) / 2 という鋭化を掛けてから run length を取る
   // （GlobalHistogramBinarizer.cpp の ThresholdSharpened）。この鋭化は
@@ -172,24 +200,8 @@
   // 黒に倒れる）。読み比べ用に残してあるだけで、既定にはしないこと
   const THRESHOLD_MODES = ['none', 'otsu', 'adaptive'];
 
-  // 灰色にした直後（傾きの測定・集約より前）に掛けるコントラスト正規化。
-  //   'off'      何もしない（集約後の normalize() だけ）
-  //   'stretch'  ROI の輝度の上下 PRE_STRETCH_CLIP を捨て、残りを 0〜255 に線形に伸ばす
-  //   'clahe'    ROI を横に PRE_CLAHE_TILES_X 区画に分け、区画ごとにクリップ付きの
-  //              ヒストグラム平坦化を掛けて、区画の間は線形補間でつなぐ
-  //
-  // 'stretch' は全体に同じ直線を掛けるだけなので、明るさの順番は変わらない。
-  // 中央値の集約とは入れ替えても結果が同じで、集約後の normalize()（最小〜最大を
-  // 0〜255 に伸ばす）との違いは「上下の外れ値に引っ張られない」ことだけになる。
-  //
-  // 'clahe' は場所ごとに伸ばし方を変えるので、影や照明のむらで ROI の左右の明るさが
-  // 違うときに効く。その代わり階調の写し方が直線でなくなるので、ぼけた縁の
-  // 「中間の濃さ」の位置がずれ、バーの太さが偏りうる（読み比べて決めること）
-  const CONTRAST_MODES = ['off', 'stretch', 'clahe'];
-
+  // 段の選択（stages / contrast / aggregate / compare）はここではなく settings で持つ
   const config = {
-    mode: null,
-    contrastNormalize: 'off',
     threshold: 'none',
     smooth: false,
     shear: true,
@@ -200,56 +212,50 @@
 
   let configured = false;
 
-  // 検出枠のぶんを、横は実寸のまま・縦だけ PRE_ROWS 段に潰して取り込む先。
+  // 縦集約だけが有効なときの入力。検出枠のぶんを、横は実寸のまま・縦だけ PRE_ROWS 段に潰して取り込む。
   // barcode.js の frameBuffer とは別に持つ（寸法がまるで違うので、共用すると
-  // 'ab' のときに 1 フレームおきに canvas の再確保が走る）
-  const frameBuffer = {
+  // A/B 比較のときに 1 フレームおきに canvas の再確保が走る）
+  const rowsBuffer = {
     canvas: document.createElement('canvas'),
-    ctx: null,
-    width: 0,
-    height: 0,
-    scaleX: 1,
-    crop: null
+    ctx: null
   };
   // 縦に大きく縮めるので、素直に平均されるよう平滑化を効かせておく
   // （ここが最近傍になると、集約の材料が「数ラインおきの生ライン」になってしまう）
-  frameBuffer.ctx = frameBuffer.canvas.getContext('2d');
-  frameBuffer.ctx.imageSmoothingEnabled = true;
-  frameBuffer.ctx.imageSmoothingQuality = 'high';
+  rowsBuffer.ctx = rowsBuffer.canvas.getContext('2d', { willReadFrequently: true });
+  rowsBuffer.ctx.imageSmoothingEnabled = true;
+  rowsBuffer.ctx.imageSmoothingQuality = 'high';
 
-  // 集約した波形から作る、解析に渡す画像。こちらは getImageData される側
+  // 素通しの画像を読むための写し。素通しの画像は barcode.js の作業用 canvas なので、
+  // 書き換えずにこちらへ写してから読む（BarcodeDetector の経路では willReadFrequently の無い
+  // canvas が来るので、直接 getImageData すると GPU からの読み戻しになる）
+  const plainCopy = {
+    canvas: document.createElement('canvas'),
+    ctx: null
+  };
+  plainCopy.ctx = plainCopy.canvas.getContext('2d', { willReadFrequently: true });
+
+  // パイプラインの出力（解析に渡す画像）。どの段を通っても最後にここへ書く
   const output = {
     canvas: document.createElement('canvas'),
     ctx: null
   };
   output.ctx = output.canvas.getContext('2d', { willReadFrequently: true });
 
-  // 'contrast-*' モードで、素通しの画像にコントラスト正規化を掛けた画像。
-  // 素通しの画像は barcode.js の作業用 canvas なので、書き換えずにこちらへ写してから触る
-  const contrastOutput = {
-    canvas: document.createElement('canvas'),
-    ctx: null
-  };
-  contrastOutput.ctx = contrastOutput.canvas.getContext('2d', { willReadFrequently: true });
-
-  // 'locate' の作業用。どれも getImageData される側
+  // 領域検出の作業用。どれも getImageData される側
   //   locateInput    検出枠のぶんを LOC_MAX_SIDE まで縮めて取り込んだもの（領域を探す材料）
   //   locateExtract  見つけた領域を、元映像から傾きを直して切り出したもの（余白なし）
-  //   locateOutput   左右の端を詰めて白の余白を足したもの（解析に渡す画像）
   const locateInput = { canvas: document.createElement('canvas'), ctx: null };
   const locateExtract = { canvas: document.createElement('canvas'), ctx: null };
-  const locateOutput = { canvas: document.createElement('canvas'), ctx: null };
-  for (const target of [locateInput, locateExtract, locateOutput]) {
+  for (const target of [locateInput, locateExtract]) {
     target.ctx = target.canvas.getContext('2d', { willReadFrequently: true });
   }
 
-  let choice = null;       // 選択値。初めて要るときに保存値から復元する
-  let useNext = true;      // 'ab' のとき、次のフレームで前処理を使うか
-  let debugInfo = null;    // 検証用（波形・しきい値・最細バーの実測）
+  let settings = null;     // 選択（DEFAULT_SETTINGS と同じ形）。初めて要るときに保存値から復元する
+  let useNext = true;      // A/B 比較のとき、次のフレームで前処理を使うか
+  let debugInfo = null;    // 検証用（段ごとの結果・波形・領域検出の重ね描き）
   let lastOutput = null;   // 検証用。最後に作った画像の素性（getLastOutput）
-  let lastOutputCanvas = null; // その画像が入っている canvas（output / contrastOutput / locateOutput）
 
-  // 前処理あり／なしの検出率。'ab' のときに突き合わせる
+  // 前処理あり／なしの検出率。A/B 比較のときに突き合わせる
   const stats = {
     plain: { tries: 0, hits: 0 },
     pre: { tries: 0, hits: 0 }
@@ -268,70 +274,108 @@
   }
 
   // --- 選択 -------------------------------------------------------------
+  //
+  // 選択は { stages, contrast, aggregate, compare } の 1 つのオブジェクトで持ち、
+  // JSON にして保存する。以前の 1 つの選択値（'median' / 'ab' など）が残っていても、
+  // JSON として読めないので既定（前処理なし）に戻る
+
+  // 知らない値は既定に置き換える。stages は STAGES の並び（＝掛ける順）に揃える
+  function sanitize(value) {
+    const source = value && typeof value === 'object' ? value : {};
+    return {
+      stages: Array.isArray(source.stages)
+        ? STAGES.filter((name) => source.stages.includes(name))
+        : DEFAULT_SETTINGS.stages.slice(),
+      contrast: CONTRAST_METHODS.includes(source.contrast) ? source.contrast : DEFAULT_SETTINGS.contrast,
+      aggregate: AGGREGATE_METHODS.includes(source.aggregate) ? source.aggregate : DEFAULT_SETTINGS.aggregate,
+      compare: typeof source.compare === 'boolean' ? source.compare : DEFAULT_SETTINGS.compare
+    };
+  }
 
   // camera.js / barcode.js と同じ理由で、localStorage は読み書きとも握りつぶす
-  function loadChoice() {
-    if (!config.storageKey) return DEFAULT_CHOICE;
+  function loadSettings() {
+    if (!config.storageKey) return sanitize(null);
 
     try {
       const saved = localStorage.getItem(config.storageKey);
-      if (CHOICES.includes(saved)) return saved;
+      if (saved) return sanitize(JSON.parse(saved));
     } catch (err) {
       console.warn('前処理設定の読み込みに失敗しました', err);
     }
-    return DEFAULT_CHOICE;
+    return sanitize(null);
   }
 
-  function saveChoice(value) {
+  function saveSettings() {
     if (!config.storageKey) return;
 
     try {
-      localStorage.setItem(config.storageKey, value);
+      localStorage.setItem(config.storageKey, JSON.stringify(settings));
     } catch (err) {
       console.warn('前処理設定の保存に失敗しました', err);
     }
   }
 
-  function currentChoice() {
-    if (choice === null) choice = loadChoice();
-    return choice;
+  function currentSettings() {
+    if (settings === null) settings = loadSettings();
+    return settings;
   }
 
-  // このフレームを前処理経路で解析するか。'ab' / 'ab-locate' は 1 フレームおきに入れ替える
-  function modeForFrame() {
-    const current = currentChoice();
-    if (current === 'off') return null;
-    const ab = AB_CHOICES[current];
-    if (!ab) return current;
-    return useNext ? ab : null;
+  // configure() で渡された選択を、保存値に上書きする（渡されなかったものは保存値のまま）
+  function overrideSettings(options) {
+    const next = {};
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+      if (options[key] !== undefined && options[key] !== null) next[key] = options[key];
+    }
+    if (Object.keys(next).length) settings = sanitize({ ...currentSettings(), ...next });
   }
 
-  // 停止中でも切り替えられる。次のフレームから効く
-  function setMode(value) {
-    if (!CHOICES.includes(value) || value === currentChoice()) return;
-
-    choice = value;
-    saveChoice(value);
+  // 停止中でも切り替えられる。次のフレームから効く。
+  // 選択が変わったら A/B の集計も検証用のデータも捨てる（前の選択のものと混ざらないように）
+  function updateSettings(next) {
+    settings = sanitize({ ...currentSettings(), ...next });
+    saveSettings();
     useNext = true;
     debugInfo = null;
     lastOutput = null;
     resetStats();   // 中で onChange を出す
   }
 
-  function nextMode() {
-    const index = CHOICES.indexOf(currentChoice());
-    setMode(CHOICES[(index + 1) % CHOICES.length]);
+  function setStage(name, enabled) {
+    if (!STAGES.includes(name)) return;
+
+    const current = currentSettings().stages;
+    if (current.includes(name) === Boolean(enabled)) return;
+
+    updateSettings({
+      stages: enabled ? current.concat(name) : current.filter((stage) => stage !== name)
+    });
+  }
+
+  // 方式を選べる段（METHODS）の方式を切り替える。段の有効・無効とは別に覚えておく
+  function setMethod(stage, method) {
+    const methods = METHODS[stage];
+    if (!methods || !methods.includes(method) || currentSettings()[stage] === method) return;
+
+    updateSettings({ [stage]: method });
+  }
+
+  function setCompare(enabled) {
+    if (currentSettings().compare === Boolean(enabled)) return;
+
+    updateSettings({ compare: Boolean(enabled) });
   }
 
   function getState() {
-    const current = currentChoice();
+    const current = currentSettings();
     return {
-      choice: current,
-      mode: AB_CHOICES[current] || current,
-      contrastNormalize: contrastMode(),
+      stages: current.stages.slice(),   // 有効な段（掛ける順）。空なら前処理なし
+      active: current.stages.length > 0,
+      contrast: current.contrast,
+      aggregate: current.aggregate,
+      compare: current.compare,
       threshold: config.threshold,
-      smooth: !!config.smooth,
-      shear: !!config.shear,
+      smooth: Boolean(config.smooth),
+      shear: Boolean(config.shear),
       debug: debugInfo,
       stats: getStats()
     };
@@ -344,25 +388,26 @@
   // 画像を返すうえ、前処理に回ったときは output.canvas を作り直してしまう。
   // 最後に解析へ渡した画像を見たいなら、**capturePreview() より先に**呼ぶこと。
   //
-  // 返すのは { canvas, width, height, pad, mode, time, preview } | null。
+  // 返すのは { canvas, width, height, stages, pad, time, preview } | null。
+  // stages は実際に効いた段（掛けた順）、pad は余白の段で足した左右の幅（足していなければ 0）。
   // preview が true なら、前回の検出画像の表示用に作ったもので、解析には渡していない。
-  // time は performance.now() の時刻。前処理を見送ったフレーム（振幅不足）では
-  // 作り直さないので、古い画像のことがある（time で見分ける）
+  // time は performance.now() の時刻。どの段も効かなかったフレーム（領域が見つからない・
+  // 振幅不足など）では作り直さないので、古い画像のことがある（time で見分ける）
   function getLastOutput() {
-    if (!config.debug || !lastOutput || !lastOutputCanvas) return null;
+    if (!config.debug || !lastOutput) return null;
 
-    const source = lastOutputCanvas;
+    const source = output.canvas;
     const canvas = document.createElement('canvas');
     canvas.width = source.width;
     canvas.height = source.height;
     canvas.getContext('2d').drawImage(source, 0, 0);
 
-    return { canvas, ...lastOutput };
+    return { canvas, ...lastOutput, stages: lastOutput.stages.slice() };
   }
 
   // --- 検出率の集計 -----------------------------------------------------
   //
-  // 'ab' のときだけ意味がある。同じラベルを同じ端末・同じ持ち方で写しながら、
+  // A/B 比較（compare）のときだけ意味がある。同じラベルを同じ端末・同じ持ち方で写しながら、
   // 前処理ありと無しを 1 フレームおきに交互に走らせて当たった割合を比べる。
   // 別々に試すと持ち方や明るさが変わってしまうので、必ず交互に回す
 
@@ -388,47 +433,11 @@
     };
   }
 
-  // --- 画像づくり -------------------------------------------------------
+  // --- 画像の受け渡し ---------------------------------------------------
   //
-  // barcode.js の素通しの経路が「映像をそのまま切り出す」のに対し、こちらは
-  // バーコードの高さ方向を 1 本の波形に潰してから、その波形だけで画像を作り直す。
-  //
-  //   元画像                    集約後
-  //   █ █▓█ █  ██
-  //   █ ███ █░ ██      →      ████    ██████    ███    █████
-  //   █ ██▓ █  ██
-  //
-  // 印字のかすれ・黒点・縁のがたつきは高さ方向に相関が無いので、段を重ねて
-  // 平均（または中央値）を取ると消える。残るのはバーの位置だけになる。
-  //
-  // 縦に潰すので、**バーが縦に並んでいること**が前提になる。振幅が出ない
-  // （PRE_MIN_CONTRAST 未満）ときは前処理を諦めて素通しの経路に落ちる。
-
-  // 検出枠のぶんを、横は実寸のまま・縦だけ PRE_ROWS 段に潰して取り込む。
-  // 縦の縮小は drawImage（＝ブラウザ側のフィルタ）に任せる。1 段が元の
-  // 十数ライン分の平均になるので、この時点で既に印字ムラはかなり均されている
-  function copyFrame(video, crop) {
-    const { sx, sy, sw, sh } = crop;
-
-    const dw = Math.max(3, Math.min(sw, PRE_MAX_WIDTH));
-    const dh = Math.max(2, Math.min(sh, PRE_ROWS));
-
-    const { canvas, ctx } = frameBuffer;
-    if (canvas.width !== dw || canvas.height !== dh) {
-      canvas.width = dw;
-      canvas.height = dh;
-      // width/height への代入で 2d コンテキストの状態は戻るので、入れ直す
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = 'high';
-    }
-
-    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
-    frameBuffer.width = dw;
-    frameBuffer.height = dh;
-    // 元映像の何分の一の幅で見ているか。最細バーの実測値を元の尺に戻すのに使う
-    frameBuffer.scaleX = dw / sw;
-    frameBuffer.crop = crop;
-  }
+  // 段から段へは灰色の画像 { gray, width, height, ... } で受け渡す（gray は Uint8Array。
+  // 1 画素 1 バイト）。canvas に戻すのは最後の 1 回だけ（writeOutput()）。
+  // 解析側（ZXing / ZXing-C++）も RGBA から同じ係数で輝度を取り直すので、灰色で渡して困ることは無い
 
   // RGBA から輝度へ。係数は barcode-worker.js（と ZXing 本体）と同じ
   function toGray(rgba, count) {
@@ -441,9 +450,7 @@
     return gray;
   }
 
-  function contrastMode() {
-    return CONTRAST_MODES.includes(config.contrastNormalize) ? config.contrastNormalize : 'off';
-  }
+  // --- コントラスト調整の段（contrast）---------------------------------
 
   // ヒストグラムで、暗い方から数えて rank 個目の画素がある階調
   function histogramRank(hist, rank) {
@@ -464,7 +471,7 @@
 
     const lo = histogramRank(hist, gray.length * PRE_STRETCH_CLIP);
     const hi = histogramRank(hist, gray.length * (1 - PRE_STRETCH_CLIP));
-    // 伸ばす幅が無い（枠内が無地）ときは触らない。集約後の normalize() が前処理を見送る
+    // 伸ばす幅が無い（枠内が無地）ときは触らない（この段を見送る）
     if (hi - lo < PRE_MIN_CONTRAST) return { mode: 'stretch', lo, hi, applied: false };
 
     const lut = new Uint8Array(256);
@@ -554,6 +561,36 @@
 
     return { mode: 'clahe', tilesX, tilesY, clip: PRE_CLAHE_CLIP, applied: true };
   }
+
+  // コントラスト調整の段。image.gray をその場で書き換え、掛けられたら true を返す
+  // （'stretch' で伸ばす幅が無いときは触らない）。
+  // 縦に潰した取り込み（squashed）は 32 段しかなく 1 段が既に十数ラインの平均なので、CLAHE を縦には分けない
+  function contrastStage(image, method, trace) {
+    const info = method === 'clahe'
+      ? claheGray(
+        image.gray, image.width, image.height,
+        PRE_CLAHE_TILES_X, image.squashed ? PRE_CLAHE_TILES_Y : CLAHE_TILES_Y_2D
+      )
+      : stretchGray(image.gray);
+
+    if (trace) trace.steps.contrast = info;
+    return info.applied;
+  }
+
+  // --- 縦集約の段（aggregate）-------------------------------------------
+  //
+  // バーコードの高さ方向を 1 本の波形に潰してから、その波形だけで画像を作り直す。
+  //
+  //   元画像                    集約後
+  //   █ █▓█ █  ██
+  //   █ ███ █░ ██      →      ████    ██████    ███    █████
+  //   █ ██▓ █  ██
+  //
+  // 印字のかすれ・黒点・縁のがたつきは高さ方向に相関が無いので、段を重ねて
+  // 平均（または中央値）を取ると消える。残るのはバーの位置だけになる。
+  //
+  // 縦に潰すので、**バーが縦に並んでいること**が前提になる。振幅が出ない
+  // （PRE_MIN_CONTRAST 未満）ときはこの段を見送る（runPipeline() を参照）。
 
   // 上側の帯と下側の帯の平均波形を突き合わせて、上下で何 px ずれているかを測る。
   //
@@ -832,70 +869,64 @@
     };
   }
 
-  // 集約した波形から、解析に渡す画像を組み立てる。
-  // 全行が同じ内容の PRE_OUT_ROWS 行。左右にはクワイエットゾーンぶんの白を足す
-  function buildImage(profile, threshold) {
-    const width = profile.length + PRE_PAD_X * 2;
-    const { canvas, ctx } = output;
+  // 行数を count 段に減らす（段ごとに元の行の平均を取る）。中央値の集約は段数の 2 乗で
+  // 重くなるので、素通しの画像や領域検出の切り出し（最大 LOC_MAX_HEIGHT 行）はここで
+  // PRE_ROWS 段まで減らしてから集約する（縦に潰した取り込みは最初から PRE_ROWS 段）
+  function binRows(gray, width, height, count) {
+    const out = new Uint8Array(width * count);
+    const sums = new Float32Array(width);
 
-    if (canvas.width !== width || canvas.height !== PRE_OUT_ROWS) {
-      canvas.width = width;
-      canvas.height = PRE_OUT_ROWS;
-    }
-
-    const image = ctx.createImageData(width, PRE_OUT_ROWS);
-    const data = image.data;
-
-    for (let x = 0; x < width; x++) {
-      const i = x - PRE_PAD_X;
-      let v;
-      if (i < 0 || i >= profile.length) {
-        v = 255;                       // 左右の余白は白
-      } else if (threshold === null) {
-        v = profile[i];                // 生の輝度をそのまま渡す（既定）
-      } else {
-        v = profile[i] <= (threshold.length ? threshold[i] : threshold) ? 0 : 255;
+    for (let r = 0; r < count; r++) {
+      const y0 = Math.floor((r * height) / count);
+      const y1 = Math.max(y0 + 1, Math.floor(((r + 1) * height) / count));
+      sums.fill(0);
+      for (let y = y0; y < y1; y++) {
+        const row = y * width;
+        for (let x = 0; x < width; x++) sums[x] += gray[row + x];
       }
 
-      const c = v < 0 ? 0 : v > 255 ? 255 : v | 0;
-      for (let y = 0; y < PRE_OUT_ROWS; y++) {
-        const p = (y * width + x) * 4;
-        data[p] = c;
-        data[p + 1] = c;
-        data[p + 2] = c;
-        data[p + 3] = 255;
-      }
+      const n = y1 - y0;
+      const base = r * width;
+      for (let x = 0; x < width; x++) out[base + x] = Math.round(sums[x] / n);
     }
 
-    ctx.putImageData(image, 0, 0);
-    return canvas;
+    return out;
   }
 
-  // 前処理した 1 枚を作る。作れなければ null（呼び出し側は素通しの経路に落ちる）
-  function capture(video, crop, mode) {
-    copyFrame(video, crop);
+  // 集約した波形から、全行が同じ内容の PRE_OUT_ROWS 行の画像を組み立てる。
+  // threshold が null なら生の輝度をそのまま渡し（既定）、そうでなければ黒白に割る
+  function buildRows(profile, threshold) {
+    const width = profile.length;
+    const gray = new Uint8Array(width * PRE_OUT_ROWS);
 
-    const width = frameBuffer.width;
-    const height = frameBuffer.height;
-    const rgba = frameBuffer.ctx.getImageData(0, 0, width, height).data;
-    const gray = toGray(rgba, width * height);
+    for (let x = 0; x < width; x++) {
+      const v = threshold === null
+        ? profile[x]
+        : profile[x] <= (threshold.length ? threshold[x] : threshold) ? 0 : 255;
+      gray[x] = v < 0 ? 0 : v > 255 ? 255 : v | 0;
+    }
+    for (let y = 1; y < PRE_OUT_ROWS; y++) gray.copyWithin(y * width, 0, width);
 
-    // コントラスト正規化は傾きの測定より先。影やむらを均したほうが上下の帯を突き合わせやすい
-    const contrastModeNow = contrastMode();
-    const contrastNormalize =
-      contrastModeNow === 'stretch' ? stretchGray(gray)
-        : contrastModeNow === 'clahe' ? claheGray(gray, width, height, PRE_CLAHE_TILES_X, PRE_CLAHE_TILES_Y)
-          : { mode: 'off', applied: false };
+    return gray;
+  }
+
+  // 縦集約の段。作り直した画像を返す。振幅が足りなければ null（この段を見送る）
+  function aggregateStage(image, method, trace) {
+    const width = image.width;
+    let gray = image.gray;
+    let height = image.height;
+    if (height > PRE_ROWS) {
+      gray = binRows(gray, width, height, PRE_ROWS);
+      height = PRE_ROWS;
+    }
 
     const shear = config.shear ? estimateShear(gray, width, height) : 0;
-    let profile = aggregate(gray, width, height, mode, shear);
+    let profile = aggregate(gray, width, height, method, shear);
 
     const contrast = normalize(profile);
     if (!contrast.ok) {
       // 枠内にバーコードが無いか、バーが横向きで縦の集約に耐えない
-      if (config.debug) {
-        debugInfo = { mode, contrastNormalize, width, height, shear, contrast, skipped: true };
-      }
+      if (trace) trace.steps.aggregate = { applied: false, method, width, height, shear, contrast };
       return null;
     }
 
@@ -905,122 +936,58 @@
     const threshold = thresholdCurve(profile, thresholdMode);
 
     // 伸び縮みは二値化より後ではなく先。二値化を先にすると、集約で得た
-    // サブピクセルのエッジ位置をそこで捨ててしまう
+    // サブピクセルのエッジ位置をそこで捨ててしまう。
     // PRE_OUT_WIDTH が null（実寸）なら伸び縮みさせずにそのまま使う
-    const outWidth = PRE_OUT_WIDTH ? PRE_OUT_WIDTH - PRE_PAD_X * 2 : width;
+    const outWidth = PRE_OUT_WIDTH || width;
     const fit = (values) => (outWidth === width ? values : resample(values, outWidth));
-    const scaled = fit(profile);
     const scaledThreshold = threshold.curve ? fit(threshold.curve) : threshold.value;
+    const out = buildRows(fit(profile), thresholdMode === 'none' ? null : scaledThreshold);
+    // 集約画像 → 出力画像の横の倍率（1 未満なら縮めている）
+    const scale = outWidth / width;
 
-    const canvas = buildImage(scaled, thresholdMode === 'none' ? null : scaledThreshold);
-
-    if (config.debug) {
-      lastOutputCanvas = canvas;
-      lastOutput = {
-        width: canvas.width,
-        height: canvas.height,
-        pad: PRE_PAD_X,
-        mode,
-        contrastNormalize: contrastModeNow,
-        time: performance.now()
-      };
-
+    if (trace) {
       // 最細バーの実測は元の尺（＝引き伸ばす前）で出す。
       // otsu / adaptive を選んでいなければ、測るためだけに otsu を 1 本引く
       const hasThreshold = !!threshold.curve || threshold.value !== null;
       const measureAt = hasThreshold ? threshold : thresholdCurve(profile, 'otsu');
-      const runs = measureRuns(profile, measureAt.curve || measureAt.value);
 
-      debugInfo = {
-        mode,
-        contrastNormalize,
-        thresholdMode,
+      trace.steps.aggregate = {
+        applied: true,
+        method,
         width,
         height,
         shear,
         contrast,
+        thresholdMode,
+        runs: measureRuns(profile, measureAt.curve || measureAt.value),
+        scale,
+        // 集約画像の 1px が元映像の何 px ぶんか（の逆数）。実機の module width はこれで割り戻す
+        srcScale: image.srcScale || null,
+        out: { width: outWidth, height: PRE_OUT_ROWS }
+      };
+      trace.wave = {
         profile,
         threshold: measureAt.curve || measureAt.value,
+        thresholdMode,
         // threshold が「実際に渡した画像を作るのに使ったもの」か、
         // 最細バーを測るためだけに引いたものか（thresholdMode が 'none' のとき）
-        thresholdIsMeasureOnly: !hasThreshold,
-        runs,
-        // 集約画像 → 出力画像の横の倍率（1 未満なら縮めている）
-        scale: outWidth / width,
-        // 集約画像の 1px が元映像の何 px にあたるか。実機の module width はこれを掛ける
-        srcScale: frameBuffer.scaleX,
-        crop: frameBuffer.crop,
-        out: { width: canvas.width, height: canvas.height },
-        pad: PRE_PAD_X,
-        skipped: false
+        thresholdIsMeasureOnly: !hasThreshold
       };
     }
 
-    return canvas;
+    return {
+      gray: out,
+      width: outWidth,
+      height: PRE_OUT_ROWS,
+      srcScale: image.srcScale ? image.srcScale * scale : null,
+      gap: image.gap ? image.gap * scale : null
+    };
   }
 
-  // 'contrast-*' モード。素通しの画像（余白・回転込み。2 次元のまま）にコントラスト正規化だけを
-  // 掛けて返す。方式はモードで決まる（CONTRAST_ONLY_MODES）。
-  // 掛けられなかった（伸ばす幅が無い）ときは null（呼び出し側は素通しの画像をそのまま使う）
-  function captureContrastOnly(source, mode) {
-    const width = source.width;
-    const height = source.height;
-    const { canvas, ctx } = contrastOutput;
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
-    }
-    ctx.drawImage(source, 0, 0);
-
-    const image = ctx.getImageData(0, 0, width, height);
-    const data = image.data;
-    const gray = toGray(data, width * height);
-
-    const method = CONTRAST_ONLY_MODES[mode];
-    const info = method === 'clahe'
-      ? claheGray(gray, width, height, PRE_CLAHE_TILES_X, CONTRAST_ONLY_TILES_Y)
-      : stretchGray(gray);
-
-    if (config.debug) {
-      debugInfo = {
-        mode,
-        contrastOnly: true,
-        contrastNormalize: info,
-        width,
-        height,
-        skipped: !info.applied
-      };
-    }
-    if (!info.applied) return null;
-
-    // 解析側（ZXing / ZXing-C++）は RGBA から同じ係数で輝度を取り直すので、灰色で書き戻す
-    for (let i = 0, j = 0; j < gray.length; i += 4, j++) {
-      data[i] = gray[j];
-      data[i + 1] = gray[j];
-      data[i + 2] = gray[j];
-      data[i + 3] = 255;
-    }
-    ctx.putImageData(image, 0, 0);
-
-    if (config.debug) {
-      lastOutputCanvas = canvas;
-      lastOutput = {
-        width,
-        height,
-        pad: null,   // 素通しの画像の余白は barcode.js が決めるので、ここでは分からない
-        mode,
-        contrastNormalize: method,
-        time: performance.now()
-      };
-    }
-
-    return canvas;
-  }
-
-  // --- 領域の検出と切り出し（'locate'）---------------------------------
+  // --- 領域検出の段（locate）--------------------------------------------
   //
-  // 検出枠の中からバーコードが写っている範囲だけを探して切り出し、白の余白を足してから
-  // 解析に渡す。OpenCV でよくやる「勾配 → 塊 → 回転矩形 → 切り出し」を手で書いたもの。
+  // 検出枠の中からバーコードが写っている範囲だけを探し、傾きを直して切り出す。
+  // OpenCV でよくやる「勾配 → 塊 → 回転矩形 → 切り出し」を手で書いたもの。
   //
   //   1. 検出枠を LOC_MAX_SIDE まで縮めて取り込み、Sobel で勾配を取る
   //   2. LOC_CELL 四方の区画ごとに勾配の構造テンソルを集計し、「勾配が強い」かつ
@@ -1031,12 +998,14 @@
   //   5. 列ごとの輝度からエッジを拾い、間隔が詰まって並んでいる所（＝バーコード本体）の
   //      最初と最後のエッジで左右を詰める。クワイエットゾーンを越えた先にある
   //      ラベルの縁・台紙・文字はここで落ちる
-  //   6. 行ごとのエッジの量で上下も詰め、周りに白の余白を足す
+  //   6. 行ごとのエッジの量で上下も詰める
   //
+  // 白の余白はこの段では足さない（余白の段の仕事）。5 で測ったエッジの間隔（gap）を
+  // 出力に付けておき、余白の段はそれで余白の幅を決める。
   // 枠いっぱいにバーコードを写したときや、台紙の灰色・ラベルの縁がバーのすぐ隣に
-  // 来るときに、クワイエットゾーンを白で作り直せるのが狙い。
+  // 来るときに、余白の段と組み合わせてクワイエットゾーンを白で作り直せるのが狙い。
   // 傾きは 4 で直すので、ZXing（zxing-js）の 1 フレームおきの 90 度回転も要らない。
-  // 見つからなければ null を返し、呼び出し側は素通しの経路に落ちる。
+  // 見つからなければ null を返し、パイプラインは素通しの画像を入力にして残りの段を通す。
   //
   // 映像を読むのは 1 と 4 の 2 回で、どちらも検出枠（crop）の範囲だけ
 
@@ -1410,8 +1379,9 @@
     return { top: best.top, bottom: best.bottom };
   }
 
-  // 'locate' の 1 枚を作る。見つからなければ null（呼び出し側は素通しの経路に落ちる）
-  function captureLocated(video, crop) {
+  // 領域検出の段。見つかれば切り出した画像（余白なし・バーが縦に立っている）を返す。
+  // 見つからなければ null（パイプラインは素通しの画像を入力にする）
+  function locateStage(video, crop, trace) {
     const input = copyForLocate(video, crop);
     const region = findRegion(input.gray, input.width, input.height);
 
@@ -1420,9 +1390,7 @@
     // （app.js は capturePreview() の直後に読むので、同じフレームのものが見える）
     const cellsOf = (list, cols) =>
       list.map((c) => ({ x: (c % cols) * LOC_CELL, y: ((c / cols) | 0) * LOC_CELL }));
-    const base = {
-      mode: 'locate',
-      locate: true,
+    const view = {
       view: locateInput.canvas,
       width: input.width,
       height: input.height,
@@ -1430,16 +1398,19 @@
     };
 
     if (!region.found) {
-      if (config.debug) debugInfo = { ...base, skipped: true, reason: region.reason, cells: [] };
+      if (trace) {
+        trace.steps.locate = { applied: false, reason: region.reason };
+        trace.locate = { ...view, cells: [] };
+      }
       return null;
     }
 
-    const cells = config.debug ? cellsOf(region.cells, region.cols) : null;
+    const cells = trace ? cellsOf(region.cells, region.cols) : null;
 
     // 区画から測った向きは、取り込みで 2px 前後まで細ったバーの階段状のギザギザに
     // 引っ張られて水平・垂直寄りに出る（合成画像で 12° が 10.2° になった。高さ 110px の
     // バーなら上下で 3.5px、1 モジュールを超えてずれる）。
-    // そこで一度切り出してから、上下の帯のずれ（前処理の estimateShear と同じもの）で
+    // そこで一度切り出してから、上下の帯のずれ（縦集約の estimateShear と同じもの）で
     // 残った傾きを測り、向きを直して切り出し直す
     let extract = extractRegion(video, crop, region, input.scale);
     const shear = estimateShear(extract.gray, extract.width, extract.height);
@@ -1460,14 +1431,13 @@
       extract.toInput(x0, y0), extract.toInput(x1, y0),
       extract.toInput(x1, y1), extract.toInput(x0, y1)
     ];
-    const searchBox = config.debug ? corners(0, 0, extract.width, extract.height) : null;
+    const searchBox = trace ? corners(0, 0, extract.width, extract.height) : null;
 
     const columns = trimColumns(extract.gray, extract.width, extract.height);
     if (!columns.found) {
-      if (config.debug) {
-        debugInfo = {
-          ...base, skipped: true, reason: 'edges', cells, searchBox, angle, edges: columns.edges
-        };
+      if (trace) {
+        trace.steps.locate = { applied: false, reason: 'edges', angle, edges: columns.edges };
+        trace.locate = { ...view, cells, searchBox };
       }
       return null;
     }
@@ -1476,88 +1446,254 @@
       extract.gray, extract.width, extract.height, columns.left, columns.right
     );
 
-    const w = columns.right - columns.left + 1;
-    const h = bottom - top + 1;
-    const pad = Math.max(LOC_PAD_X, Math.round(columns.gap * LOC_PAD_GAPS));
-    const { canvas, ctx } = locateOutput;
-    const outWidth = w + pad * 2;
-    const outHeight = h + LOC_PAD_Y * 2;
-    if (canvas.width !== outWidth || canvas.height !== outHeight) {
-      canvas.width = outWidth;
-      canvas.height = outHeight;
+    const width = columns.right - columns.left + 1;
+    const height = bottom - top + 1;
+    const gray = new Uint8Array(width * height);
+    for (let y = 0; y < height; y++) {
+      const from = (top + y) * extract.width + columns.left;
+      gray.set(extract.gray.subarray(from, from + width), y * width);
     }
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, outWidth, outHeight);
-    ctx.drawImage(locateExtract.canvas, columns.left, top, w, h, pad, LOC_PAD_Y, w, h);
 
-    if (config.debug) {
-      lastOutputCanvas = canvas;
-      lastOutput = {
-        width: outWidth,
-        height: outHeight,
-        pad,
-        mode: 'locate',
-        time: performance.now()
-      };
-      debugInfo = {
-        ...base,
-        skipped: false,
-        cells,
-        searchBox,
-        box: corners(columns.left, top, columns.right + 1, bottom + 1),
+    if (trace) {
+      trace.steps.locate = {
+        applied: true,
         angle,
         edges: columns.edges,
         gap: columns.gap,
         // 切り出した画像の横 1px が元映像の何 px にあたるか（1 なら実寸）
         srcScale: extract.su,
-        cut: { width: w, height: h },
-        pad,
-        padY: LOC_PAD_Y,
-        out: { width: outWidth, height: outHeight }
+        cut: { width, height }
+      };
+      trace.locate = {
+        ...view,
+        cells,
+        searchBox,
+        box: corners(columns.left, top, columns.right + 1, bottom + 1)
       };
     }
 
+    return { gray, width, height, srcScale: extract.su, gap: columns.gap };
+  }
+
+  // --- 余白の段（pad）----------------------------------------------------
+  //
+  // 画像の周りに白を足して、クワイエットゾーンを作り直す。左右は PAD_X（領域検出が
+  // エッジの間隔を測っていれば、その PAD_GAPS 倍のほうが広ければそちら）、上下は PAD_Y。
+  // 以前は barcode.js（SCAN_PAD_X。同梱ライブラリの経路だけ）と領域検出の中にあったものを、
+  // どのエンジンに渡すときでも同じように掛かる 1 つの段にまとめた。
+  //
+  // 縦集約と組み合わせるときは注意。以前、縦集約の出力に白の余白（40px）を足していた頃は、
+  // 背景が暗い灰色だと読めなくなった（「真っ白な余白の隣に灰色が来る」組み合わせで、
+  // ZXing-C++ のヒストグラムの山の割り方が変わったためと推測。確かめてはいない）。
+  // 領域検出と組み合わせれば、台紙や背景を切り落としてから白を足すのでこの問題は起きない
+  function padStage(image, trace) {
+    const padX = Math.max(PAD_X, image.gap ? Math.round(image.gap * PAD_GAPS) : 0);
+    const padY = PAD_Y;
+    const width = image.width + padX * 2;
+    const height = image.height + padY * 2;
+
+    const gray = new Uint8Array(width * height).fill(255);
+    for (let y = 0; y < image.height; y++) {
+      const from = y * image.width;
+      gray.set(image.gray.subarray(from, from + image.width), (y + padY) * width + padX);
+    }
+
+    if (trace) trace.steps.pad = { applied: true, padX, padY, out: { width, height } };
+    return { gray, width, height, srcScale: image.srcScale, gap: image.gap, pad: padX };
+  }
+
+  // --- パイプライン -----------------------------------------------------
+
+  // 縦集約が有効で、領域検出が無効（または見つからなかった）ときの入力。
+  // 検出枠のぶんを、横は実寸のまま・縦だけ PRE_ROWS 段に潰して取り込む。
+  // 縦の縮小は drawImage（＝ブラウザ側のフィルタ）に任せる。1 段が元の
+  // 十数ライン分の平均になるので、この時点で既に印字ムラはかなり均されている。
+  // 素通しの画像（barcode.js が MAX_SCAN_SIDE = 640 まで縮めてある）を使わないのは、
+  // 細バーの太さが横の解像度でしか決まらないため
+  function captureRows(video, crop) {
+    const { sx, sy, sw, sh } = crop;
+
+    const dw = Math.max(3, Math.min(sw, PRE_MAX_WIDTH));
+    const dh = Math.max(2, Math.min(sh, PRE_ROWS));
+
+    const { canvas, ctx } = rowsBuffer;
+    if (canvas.width !== dw || canvas.height !== dh) {
+      canvas.width = dw;
+      canvas.height = dh;
+      // width/height への代入で 2d コンテキストの状態は戻るので、入れ直す
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+    }
+
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+    const rgba = ctx.getImageData(0, 0, dw, dh).data;
+
+    return {
+      gray: toGray(rgba, dw * dh),
+      width: dw,
+      height: dh,
+      squashed: true,
+      // 元映像の何分の一の幅で見ているか。最細バーの実測値を元の尺に戻すのに使う
+      srcScale: dw / sw
+    };
+  }
+
+  // 素通しの画像（frame.plain()。回転込み・余白なし）を灰色にする。
+  // canvas には素通しの画像そのものを残しておき、どの段も効かなかったときはそれを解析に渡す。
+  // plain() は ZXing 経路で呼ぶたびに回転を入れ替えるので、1 フレームに 1 回しか呼ばないこと
+  function plainImage(frame) {
+    const plain = frame.plain();
+    if (!plain || !plain.width || !plain.height) return null;
+
+    const width = plain.width;
+    const height = plain.height;
+    const { canvas, ctx } = plainCopy;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    ctx.drawImage(plain, 0, 0);
+    const rgba = ctx.getImageData(0, 0, width, height).data;
+
+    return {
+      gray: toGray(rgba, width * height),
+      width,
+      height,
+      canvas: plain,
+      // barcode.js は縦横同じ比率で縮めている（回転していても比率は同じ）
+      srcScale: Math.max(width, height) / Math.max(frame.crop.sw, frame.crop.sh)
+    };
+  }
+
+  // 灰色の画像を output.canvas に書き戻す。解析に渡すのはこの canvas
+  function writeOutput(image) {
+    const { width, height, gray } = image;
+    const { canvas, ctx } = output;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+
+    const data = ctx.createImageData(width, height);
+    const rgba = data.data;
+    for (let i = 0, j = 0; j < gray.length; i += 4, j++) {
+      rgba[i] = gray[j];
+      rgba[i + 1] = gray[j];
+      rgba[i + 2] = gray[j];
+      rgba[i + 3] = 255;
+    }
+    ctx.putImageData(data, 0, 0);
+
     return canvas;
+  }
+
+  // 有効な段を STAGES の順に通して、解析に渡す画像を作る。
+  // 返すのは { canvas, applied } | null（素通しの画像も作れないときだけ null）。
+  // applied は実際に効いた段（掛けた順）。見送った段は入らない:
+  //   locate     見つからなければ見送り、素通しの画像（縦集約が有効なら縦に潰した取り込み）を入力にする
+  //   contrast   stretch で伸ばす幅が無ければ見送り
+  //   aggregate  振幅が足りなければ見送り。入力が縦に潰した取り込みだったときは、それでは解析に
+  //              使えないので、素通しの画像から組み直してコントラスト調整を掛け直す
+  //   pad        常に効く
+  // applied が空なら、canvas は素通しの画像そのもの（書き戻しを省く）
+  function runPipeline(frame, current, trace) {
+    const on = (name) => current.stages.includes(name);
+    const applied = [];
+    let image = null;
+    let input = 'plain';
+
+    const record = () => {
+      if (trace) trace.input = { kind: input, width: image.width, height: image.height };
+    };
+
+    if (on('locate')) {
+      image = locateStage(frame.video, frame.crop, trace);
+      if (image) {
+        input = 'locate';
+        applied.push('locate');
+      }
+    }
+    if (!image) {
+      input = on('aggregate') ? 'rows' : 'plain';
+      image = input === 'rows' ? captureRows(frame.video, frame.crop) : plainImage(frame);
+      if (!image) return null;
+    }
+    record();
+
+    if (on('contrast') && contrastStage(image, current.contrast, trace)) applied.push('contrast');
+
+    if (on('aggregate')) {
+      const aggregated = aggregateStage(image, current.aggregate, trace);
+      if (aggregated) {
+        image = aggregated;
+        applied.push('aggregate');
+      } else if (input === 'rows') {
+        // ここまでに効いたのは縦に潰した取り込みへのコントラスト調整だけなので、数え直す
+        applied.length = 0;
+        input = 'plain';
+        image = plainImage(frame);
+        if (!image) return null;
+        record();
+        if (on('contrast') && contrastStage(image, current.contrast, trace)) applied.push('contrast');
+      }
+    }
+
+    if (on('pad')) {
+      image = padStage(image, trace);
+      applied.push('pad');
+    }
+
+    if (!applied.length) return { canvas: image.canvas, applied };
+
+    const canvas = writeOutput(image);
+    if (config.debug) {
+      lastOutput = {
+        width: canvas.width,
+        height: canvas.height,
+        stages: applied.slice(),
+        pad: image.pad || 0,
+        time: performance.now(),
+        // 検出画像の表示用に作ったもの（解析には渡していない）かどうか
+        preview: Boolean(frame.preview)
+      };
+    }
+
+    return { canvas, applied };
   }
 
   // --- barcode.js への差し込み口 ----------------------------------------
 
   // BarcodeScanner.configure({ frameFilter }) に渡す関数。1 フレームぶんの画像を作り、
   // 解析の呼び出し（frame.analyze）までを引き受ける。前処理を使わないフレーム
-  // （'off'・'ab' の素通し側・振幅が足りないとき）は frame.plain() で素通しの画像を
-  // もらって解析に回す。
+  // （全部の段が無効・A/B 比較の素通し側）は frame.plain() の素通しの画像をそのまま解析に回す。
   //
-  // frame.preview が true（検出画像の表示）のときは数えず、'ab' の入れ替えもしない。
-  // 'ab' / 'ab-locate' でも見るときは必ず前処理ありのほうを出す
+  // frame.preview が true（検出画像の表示）のときは数えず、A/B の入れ替えもしない。
+  // A/B 比較でも見るときは必ず前処理ありのほうを出す
   async function filter(frame) {
-    const current = currentChoice();
-    const mode = frame.preview && AB_CHOICES[current] ? AB_CHOICES[current] : modeForFrame();
+    const current = currentSettings();
+    const usePipeline =
+      current.stages.length > 0 && (frame.preview || !current.compare || useNext);
 
     let canvas = null;
-    let source = null;
-    if (CONTRAST_ONLY_MODES[mode]) {
-      // plain() は呼ぶたびに回転の向きを入れ替えるので、1 フレームにつき 1 回だけ呼ぶ
-      const plain = frame.plain();
-      canvas = plain ? captureContrastOnly(plain, mode) : null;
-      source = canvas || plain;
-    } else if (mode === 'locate') {
-      canvas = captureLocated(frame.video, frame.crop);
-      source = canvas || frame.plain();
+    let applied = [];
+    if (usePipeline) {
+      const trace = config.debug ? { steps: {}, input: null, locate: null, wave: null } : null;
+      const built = runPipeline(frame, current, trace);
+      if (built) ({ canvas, applied } = built);
+      if (trace) debugInfo = { ...trace, stages: current.stages.slice(), applied: applied.slice() };
     } else {
-      canvas = mode ? capture(frame.video, frame.crop, mode) : null;
-      source = canvas || frame.plain();
+      canvas = frame.plain();
     }
-    // 検出画像の表示用に作ったもの（解析には渡していない）かどうか。getLastOutput で見分ける
-    if (canvas && lastOutput) lastOutput.preview = !!frame.preview;
-    if (!source) return null;
+    if (!canvas) return null;
 
-    const result = await frame.analyze(source);
+    const result = await frame.analyze(canvas);
 
     if (!frame.preview) {
-      recordAttempt(!!canvas, !!result);
-      // 'ab' の入れ替えは解析が終わってから。途中で入れ替えると、
+      // どの段も効かなかったフレームは、素通しの画像を解析したものとして数える
+      recordAttempt(applied.length > 0, !!result);
+      // A/B の入れ替えは解析が終わってから。途中で入れ替えると、
       // 落ちた（＝素通しに回った）フレームのぶんだけ偏る
-      if (AB_CHOICES[current]) useNext = !useNext;
+      if (current.compare) useNext = !useNext;
     }
 
     return result;
@@ -1566,11 +1702,15 @@
   // --- ライフサイクル ---------------------------------------------------
 
   function configure(options = {}) {
-    Object.assign(config, options);
+    // 選択（stages / contrast / aggregate / compare）は config には入れず、settings で持つ
+    const rest = { ...options };
+    for (const key of Object.keys(DEFAULT_SETTINGS)) delete rest[key];
+    Object.assign(config, rest);
 
-    // 選択の復元は初回だけ（barcode.js の configure と同じ理由）
-    if (options.mode && CHOICES.includes(options.mode)) choice = options.mode;
-    else if (!configured) choice = loadChoice();
+    // 保存値の復元は初回だけ（barcode.js の configure と同じ理由）。
+    // 渡された選択はその上に重ねる（保存はしない。保存するのは画面から切り替えたときだけ）
+    if (!configured) settings = loadSettings();
+    overrideSettings(options);
 
     configured = true;
 
@@ -1581,10 +1721,12 @@
   window.BarcodePreprocess = {
     configure,
     filter,
-    setMode,
-    nextMode,
+    setStage,
+    setMethod,
+    setCompare,
     getState,
-    getChoices: () => CHOICES.slice(),
+    getStages: () => STAGES.slice(),
+    getMethods: (stage) => (METHODS[stage] || []).slice(),
     getStats,
     resetStats,
     getLastOutput

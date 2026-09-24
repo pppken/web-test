@@ -251,6 +251,8 @@
   function showBrightnessPanel(open) {
     brightnessPanel.hidden = !open;
     brightnessBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    // 前処理のパネルと同じ場所（ボタンの上の行）に出るので、開くときは向こうを畳む
+    if (open && preprocessEnabled) showPreprocessPanel(false);
   }
 
   function handleBrightnessChange(state) {
@@ -342,16 +344,17 @@
 
     // 前処理が作った画像なら、余白の幅は前処理側の検証用データに入っている
     const debug = preprocessDebug();
-    const pad = preview.pad !== null ? preview.pad : debug && debug.pad;
+    const pad = preview.filtered && debug && debug.steps.pad ? debug.steps.pad.padX : 0;
 
-    previewInfo.textContent = pad
-      ? `${preview.width} × ${preview.height}（うち左右 ${pad}px は白の余白）`
-      : `${preview.width} × ${preview.height}`;
+    previewInfo.textContent =
+      `${preview.width} × ${preview.height}` +
+      (preview.filtered ? '（前処理の出力）' : '') +
+      (pad ? `（うち左右 ${pad}px は白の余白）` : '');
     // 解析に渡すのと同じ画素をそのまま見たいので、非可逆な形式にはしない
     previewImage.src = preview.canvas.toDataURL('image/png');
 
     renderPreprocessOutput(output);
-    renderWave(debug);
+    renderPreprocessDebug(debug);
 
     openDialog(previewDialog);
   }
@@ -371,29 +374,50 @@
   // 前処理にまつわるページ側の配線はこの節にまとめてある。有効にするのは
   // 「組み立て」の setupPreprocess() の 1 行で、それを消せば前処理は一切動かない
   // （ボタンも出ない）。完全に外すときは、この節と setupPreprocess() の行、
-  // index.html の #preprocessBtn / #scanOutput / #scanWave / #scanWaveInfo / #scanLocate と
+  // showBrightnessPanel() の中の showPreprocessPanel() の呼び出し、
+  // index.html の #preprocessBtn / #preprocessPanel / #scanOutput / #scanWave / #scanWaveInfo / #scanLocate と
   // ローダの 1 行、js/barcode-preprocess.js を消す。
   //
-  // 'ab' / 'ab-locate' は前処理ありと無しを 1 フレームおきに交互に回して検出率を比べる
-  // 計測用で、このときだけ結果ダイアログを出さない（止まると数が溜まらない）
+  // 前処理は段を並べたパイプラインで、「前処理」ボタンで開くパネルのチェックボックスで
+  // 段ごとに有効・無効を切り替える（全部外すと前処理なし）。
+  // A/B 比較は前処理ありと無しを 1 フレームおきに交互に回して検出率を比べる計測用で、
+  // このときだけ結果ダイアログを出さない（止まると数が溜まらない）
 
-  // 選択値 -> ボタンに出す表示
-  const PREPROCESS_LABELS = {
-    off: 'なし',
-    mean: '平均',
-    median: '中央値',
-    trimmed: 'トリム平均',
-    'contrast-stretch': 'コントラスト（stretch）',
-    'contrast-clahe': 'コントラスト（CLAHE）',
-    locate: '領域検出＋余白',
-    ab: 'A/B 比較',
-    'ab-locate': 'A/B 比較（領域検出）'
+  // 段 -> パネルに出す名前
+  const PREPROCESS_STAGE_LABELS = {
+    locate: '領域検出',
+    contrast: 'コントラスト調整',
+    aggregate: '縦集約',
+    pad: '余白'
   };
 
-  // A/B 比較の選択値（前処理あり／なしを交互に回すもの）
-  const PREPROCESS_BENCHMARKS = ['ab', 'ab-locate'];
+  // 段 -> ボタンのラベルに並べる短い名前
+  const PREPROCESS_STAGE_SHORT = {
+    locate: '領域',
+    contrast: 'コントラスト',
+    aggregate: '集約',
+    pad: '余白'
+  };
+
+  // 段の方式 -> 表示
+  const PREPROCESS_METHOD_LABELS = {
+    stretch: 'stretch',
+    clahe: 'CLAHE',
+    median: '中央値',
+    mean: '平均',
+    trimmed: 'トリム平均'
+  };
+
+  // パイプラインの入力 -> 表示
+  const PREPROCESS_INPUT_LABELS = {
+    plain: '素通しの画像',
+    rows: '縦に潰した取り込み',
+    locate: '領域検出の切り出し'
+  };
 
   const preprocessBtn = $('preprocessBtn');
+  const preprocessPanel = $('preprocessPanel');
+  const preprocessStages = $('preprocessStages');
   const previewOutput = $('scanOutput');
   const previewOutputImage = $('scanOutputImage');
   const previewOutputInfo = $('scanOutputInfo');
@@ -402,29 +426,30 @@
   const previewLocate = $('scanLocate');
 
   const preprocess = window.BarcodePreprocess || {
-    configure() {}, filter: null, nextMode() {},
-    getState: () => ({ choice: 'off', debug: null, stats: null }),
-    getLastOutput: () => null
+    configure() {}, filter: null, setStage() {}, setMethod() {}, setCompare() {},
+    getState: () => ({ stages: [], active: false, compare: false, debug: null, stats: null }),
+    getStages: () => [], getMethods: () => [], getLastOutput: () => null
   };
 
   let preprocessEnabled = false;
+
+  // パネルの入力欄。段 -> { checkbox, select }（select は方式を選べる段だけ）
+  const preprocessInputs = new Map();
+  let preprocessCompareInput = null;
 
   function setupPreprocess() {
     if (!window.BarcodePreprocess) return;
     preprocessEnabled = true;
 
+    // 表示の onChange より先にパネルを作っておく（configure() が初期状態を流してくる）
+    buildPreprocessPanel();
+
     preprocess.configure({
-      // 灰色にした直後のコントラスト正規化（検証中）。集約するモード（平均・中央値・
-      // トリム平均）にだけ効く。コントラスト正規化だけを試すなら「前処理」ボタンで
-      // コントラスト（stretch）/ コントラスト（CLAHE）を選ぶ（こちらの設定には左右されない）。
-      // 'off' | 'stretch'（上下 1% を捨てて 0〜255 に伸ばす）| 'clahe'（区画ごとに平坦化）
-      contrastNormalize: 'stretch',
       onChange: (state) => {
-        // 「前処理」ボタンも常に選択を表す。エンジンと同じくカメラの状態に依らず押せる
-        preprocessBtn.textContent = `前処理: ${PREPROCESS_LABELS[state.choice] || state.choice}`;
+        renderPreprocess(state);
         // A/B 比較の間は結果ダイアログを出さない。1 枚読めたところで止まってしまうと
         // 検出率が溜まらないため、autoPause ごと切る
-        camera.configure({ autoPause: !PREPROCESS_BENCHMARKS.includes(state.choice) });
+        camera.configure({ autoPause: !state.compare });
         renderEngineBadge(scanner.getEngineState());
       }
     });
@@ -433,25 +458,97 @@
     scanner.configure({ frameFilter: preprocess.filter });
 
     preprocessBtn.hidden = false;
-    preprocessBtn.addEventListener('click', () => preprocess.nextMode());
+    // 押すたびにパネルを開閉する。エンジンと同じくカメラの状態に依らず押せる
+    preprocessBtn.addEventListener('click', () => showPreprocessPanel(preprocessPanel.hidden));
+  }
+
+  function createCheckboxRow(text) {
+    const row = document.createElement('div');
+    row.className = 'preprocess-row';
+
+    const label = document.createElement('label');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    label.append(checkbox, text);
+    row.append(label);
+
+    return { row, checkbox };
+  }
+
+  // 段ごとのチェックボックス（と方式の選択）を、前処理が返す段の並び（＝掛ける順）で作る
+  function buildPreprocessPanel() {
+    for (const stage of preprocess.getStages()) {
+      const text = PREPROCESS_STAGE_LABELS[stage] || stage;
+      const { row, checkbox } = createCheckboxRow(text);
+      checkbox.addEventListener('change', () => preprocess.setStage(stage, checkbox.checked));
+
+      let select = null;
+      const methods = preprocess.getMethods(stage);
+      if (methods.length) {
+        select = document.createElement('select');
+        select.setAttribute('aria-label', `${text}の方式`);
+        for (const method of methods) {
+          const option = document.createElement('option');
+          option.value = method;
+          option.textContent = PREPROCESS_METHOD_LABELS[method] || method;
+          select.append(option);
+        }
+        select.addEventListener('change', () => preprocess.setMethod(stage, select.value));
+        row.append(select);
+      }
+
+      preprocessStages.append(row);
+      preprocessInputs.set(stage, { checkbox, select });
+    }
+
+    const { row, checkbox } = createCheckboxRow('A/B 比較（素通しと 1 フレームおきに交互）');
+    row.classList.add('compare');
+    checkbox.addEventListener('change', () => preprocess.setCompare(checkbox.checked));
+    preprocessStages.append(row);
+    preprocessCompareInput = checkbox;
+  }
+
+  // パネルの入力欄と「前処理」ボタンのラベルを、いまの選択に合わせる。
+  // ボタンのラベルは常にその時の選択を表す（エンジンと同じく setLabel() は通さない）
+  function renderPreprocess(state) {
+    for (const [stage, { checkbox, select }] of preprocessInputs) {
+      checkbox.checked = state.stages.includes(stage);
+      if (select) select.value = state[stage];
+    }
+    if (preprocessCompareInput) preprocessCompareInput.checked = state.compare;
+
+    const names = state.stages.map((stage) => PREPROCESS_STAGE_SHORT[stage] || stage);
+    preprocessBtn.textContent =
+      `前処理: ${names.length ? names.join('+') : 'なし'}${state.compare ? '（A/B）' : ''}`;
+  }
+
+  // 明るさのスライダーと同じ場所（ボタンの上の行）に出るので、開くときは向こうを畳む
+  function showPreprocessPanel(open) {
+    preprocessPanel.hidden = !open;
+    preprocessBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) showBrightnessPanel(false);
   }
 
   function isBenchmarking() {
-    return preprocessEnabled && PREPROCESS_BENCHMARKS.includes(preprocess.getState().choice);
+    return preprocessEnabled && preprocess.getState().compare;
   }
 
   function preprocessDebug() {
     if (!preprocessEnabled) return null;
     const state = preprocess.getState();
-    return state.choice === 'off' ? null : state.debug;
+    return state.active ? state.debug : null;
   }
 
   // 前処理が最後に解析へ渡した画像（の写し）。barcode.js を通さず前処理から直接もらう。
   // 検出画像のボタンを押したときに解析の途中だと、capturePreview() は前処理に回さず
   // 素通しの画像を返すので、そちらだけでは前処理の出力が見られないことがある
   function preprocessOutput() {
-    if (!preprocessEnabled || preprocess.getState().choice === 'off') return null;
+    if (!preprocessEnabled || !preprocess.getState().active) return null;
     return preprocess.getLastOutput();
+  }
+
+  function stageNames(stages) {
+    return stages.map((stage) => PREPROCESS_STAGE_LABELS[stage] || stage).join(' → ');
   }
 
   function renderPreprocessOutput(output) {
@@ -469,10 +566,9 @@
     const age = ((performance.now() - output.time) / 1000).toFixed(1);
     const what = output.preview ? '前回の表示用に作った画像' : '解析へ渡した画像';
     previewOutputInfo.textContent =
-      `前処理の出力（${PREPROCESS_LABELS[output.mode] || output.mode}・${age} 秒前に${what}）` +
+      `前処理の出力（${stageNames(output.stages)}・${age} 秒前に${what}）` +
       `　${output.width} × ${output.height}` +
-      // pad が null（コントラスト正規化のみのモード。余白は素通しの画像のまま）のときは書かない
-      (output.pad === null ? '' : output.pad ? `（うち左右 ${output.pad}px は白の余白）` : '（余白なし）') +
+      (output.pad ? `（うち左右 ${output.pad}px は白の余白）` : '（余白なし）') +
       '　等倍表示。はみ出すときは横にスクロールできます';
   }
 
@@ -485,38 +581,26 @@
     return `前 ${pct(stats.pre)} / 素 ${pct(stats.plain)}`;
   }
 
-  // 集約した 1 次元波形の表示（前処理の検証用）。
+  // 前処理の検証用データを、検出画像ダイアログに出す。
+  // 領域検出の重ね描き・縦集約の波形（それぞれの段を通ったときだけ）と、段ごとの結果を 1 行ずつ
+  function renderPreprocessDebug(debug) {
+    renderLocate(debug && debug.locate);
+    renderWave(debug && debug.wave);
+    previewWaveInfo.textContent = debug ? describePipeline(debug) : '';
+  }
+
+  // 縦集約した 1 次元波形の表示（前処理の検証用）。
   // X 座標・輝度・しきい値・黒白の判定を 1 枚に重ねて出す。
-  // 前処理が実際にどう効いているかは、この波形を見るのが一番早い
-  function renderWave(debug) {
-    // 領域検出（locate）は集約しないので波形は無い。代わりに見つけた範囲を重ねた画像を出す
-    renderLocate(debug && debug.locate ? debug : null);
-    if (debug && debug.locate) {
+  // 縦集約が実際にどう効いているかは、この波形を見るのが一番早い
+  function renderWave(wave) {
+    if (!wave || !wave.profile) {
       previewWave.hidden = true;
-      previewWaveInfo.textContent = describeLocate(debug);
-      return;
-    }
-
-    // コントラスト正規化のみのモード（contrast-*）は集約しないので波形は無い。何をしたかだけ出す
-    if (debug && debug.contrastOnly) {
-      previewWave.hidden = true;
-      previewWaveInfo.textContent =
-        `${PREPROCESS_LABELS[debug.mode] || debug.mode}（集約なし・${debug.width} × ${debug.height}）` +
-        `　コントラスト正規化: ${describeContrastNormalize(debug.contrastNormalize)}`;
-      return;
-    }
-
-    if (!debug || !debug.profile) {
-      previewWave.hidden = true;
-      previewWaveInfo.textContent = debug && debug.skipped
-        ? '波形の振幅が足りないので前処理を見送りました（枠内にバーコードが無いか、バーが横向き）'
-        : '';
       return;
     }
 
     previewWave.hidden = false;
 
-    const profile = debug.profile;
+    const profile = wave.profile;
     const width = profile.length;
     const height = 140;
     if (previewWave.width !== width || previewWave.height !== height) {
@@ -528,7 +612,7 @@
     ctx.fillStyle = '#fff';
     ctx.fillRect(0, 0, width, height);
 
-    const at = (i) => (typeof debug.threshold === 'number' ? debug.threshold : debug.threshold[i]);
+    const at = (i) => (typeof wave.threshold === 'number' ? wave.threshold : wave.threshold[i]);
     const y = (v) => height - 1 - (v / 255) * (height - 1);
 
     // 黒と判定された区間を先に塗る（波形の下敷きにする）
@@ -557,32 +641,29 @@
       else ctx.lineTo(i, py);
     }
     ctx.stroke();
-
-    previewWaveInfo.textContent = describeWave(debug);
   }
 
-
-  // 領域検出（'locate'）の結果。検出枠を取り込んだ画像の上に、
+  // 領域検出の段の結果。検出枠を取り込んだ画像の上に、
   // バーコードらしいとして拾った区画（青）と、最終的に切り出した矩形（赤）を重ねる。
   // 左右を詰める前の探索範囲は黄色の破線で出す
-  function renderLocate(debug) {
-    if (!debug || !debug.view) {
+  function renderLocate(locate) {
+    if (!locate || !locate.view) {
       previewLocate.hidden = true;
       return;
     }
 
     previewLocate.hidden = false;
-    if (previewLocate.width !== debug.width || previewLocate.height !== debug.height) {
-      previewLocate.width = debug.width;
-      previewLocate.height = debug.height;
+    if (previewLocate.width !== locate.width || previewLocate.height !== locate.height) {
+      previewLocate.width = locate.width;
+      previewLocate.height = locate.height;
     }
 
     const ctx = previewLocate.getContext('2d');
-    ctx.drawImage(debug.view, 0, 0);
+    ctx.drawImage(locate.view, 0, 0);
 
     ctx.fillStyle = 'rgba(45, 127, 249, 0.28)';
-    for (const cell of debug.cells || []) {
-      ctx.fillRect(cell.x, cell.y, debug.cellSize, debug.cellSize);
+    for (const cell of locate.cells || []) {
+      ctx.fillRect(cell.x, cell.y, locate.cellSize, locate.cellSize);
     }
 
     const polygon = (points) => {
@@ -592,17 +673,17 @@
       ctx.stroke();
     };
 
-    const line = Math.max(2, Math.round(debug.width / 200));
+    const line = Math.max(2, Math.round(locate.width / 200));
     ctx.lineWidth = line;
-    if (debug.searchBox) {
+    if (locate.searchBox) {
       ctx.strokeStyle = 'rgba(255, 200, 0, 0.9)';
       ctx.setLineDash([line * 3, line * 2]);
-      polygon(debug.searchBox);
+      polygon(locate.searchBox);
       ctx.setLineDash([]);
     }
-    if (debug.box) {
+    if (locate.box) {
       ctx.strokeStyle = '#e33';
-      polygon(debug.box);
+      polygon(locate.box);
     }
   }
 
@@ -612,58 +693,92 @@
     edges: '切り出した範囲にバーのエッジが足りません'
   };
 
-  function describeLocate(debug) {
-    if (debug.skipped) {
-      return `領域検出: 見つからず（${LOCATE_REASONS[debug.reason] || debug.reason}` +
-        (debug.edges !== undefined ? `・エッジ ${debug.edges} 本` : '') +
-        '）。素通しの画像で解析しました';
+  // 段ごとの結果を 1 行ずつ。有効にした段は、見送ったものも含めて全部出す
+  function describePipeline(debug) {
+    const lines = [];
+
+    if (debug.input) {
+      lines.push(
+        `入力: ${PREPROCESS_INPUT_LABELS[debug.input.kind] || debug.input.kind}` +
+        `（${debug.input.width} × ${debug.input.height}）`
+      );
+    }
+
+    for (const stage of debug.stages) {
+      const step = debug.steps[stage];
+      const name = PREPROCESS_STAGE_LABELS[stage] || stage;
+      lines.push(`${name}: ${step ? describeStep(stage, step) : '通らず'}`);
+    }
+
+    if (debug.locate) lines.push('青: 拾った区画　黄: 探索範囲　赤: 切り出した範囲');
+
+    return lines.join('\n');
+  }
+
+  function describeStep(stage, step) {
+    if (stage === 'locate') return describeLocate(step);
+    if (stage === 'contrast') return describeContrast(step);
+    if (stage === 'aggregate') return describeAggregate(step);
+    if (stage === 'pad') {
+      return `左右 ${step.padX}px・上下 ${step.padY}px → ${step.out.width} × ${step.out.height}`;
+    }
+    return step.applied ? '適用' : '見送り';
+  }
+
+  function describeLocate(step) {
+    if (!step.applied) {
+      return `見つからず（${LOCATE_REASONS[step.reason] || step.reason}` +
+        (step.edges !== undefined ? `・エッジ ${step.edges} 本` : '') +
+        '）。素通しの画像を入力にしました';
     }
 
     return [
-      `領域検出: 傾き ${debug.angle.toFixed(1)}°`,
-      `エッジ ${debug.edges} 本（間隔の中央値 ${debug.gap}px）`,
-      `切り出し ${debug.cut.width} × ${debug.cut.height}（横 ${debug.srcScale.toFixed(2)}x）`,
-      `余白 左右 ${debug.pad}px・上下 ${debug.padY}px → ${debug.out.width} × ${debug.out.height}`,
-      '青: 拾った区画　黄: 探索範囲　赤: 切り出した範囲'
-    ].join('　');
+      `傾き ${step.angle.toFixed(1)}°`,
+      `エッジ ${step.edges} 本（間隔の中央値 ${step.gap}px）`,
+      `切り出し ${step.cut.width} × ${step.cut.height}（横 ${step.srcScale.toFixed(2)}x）`
+    ].join('・');
   }
 
-  // 灰色にした直後のコントラスト正規化で、何をしたか
-  function describeContrastNormalize(info) {
-    if (!info || info.mode === 'off') return 'なし';
-    if (info.mode === 'stretch') {
-      return info.applied
-        ? `stretch（${info.lo}〜${info.hi} → 0〜255）`
-        : `stretch（${info.lo}〜${info.hi}。幅が足りず見送り）`;
+  // コントラスト調整で何をしたか
+  function describeContrast(step) {
+    if (step.mode === 'stretch') {
+      return step.applied
+        ? `stretch（${step.lo}〜${step.hi} → 0〜255）`
+        : `stretch（${step.lo}〜${step.hi}。幅が足りず見送り）`;
     }
-    return `CLAHE（${info.tilesX} × ${info.tilesY} 区画・クリップ ${info.clip}）`;
+    return `CLAHE（${step.tilesX} × ${step.tilesY} 区画・クリップ ${step.clip}）`;
   }
 
   // 最細バー／最細スペースは、実際の module width が何 px あるかの答えそのもの。
   // 集約画像の尺と、元映像の尺（srcScale で割り戻したもの）と、解析に渡す出力画像の尺
   // （scale を掛けたもの。出力を縮めているときはここが一番細い）を出す
-  function describeWave(debug) {
-    const parts = [`集約: ${PREPROCESS_LABELS[debug.mode] || debug.mode}（${debug.width} × ${debug.height} 段）`];
-
-    if (debug.runs) {
-      const other = (px) =>
-        (debug.srcScale ? ` / 元映像 ${(px / debug.srcScale).toFixed(1)}px` : '') +
-        ` / 出力 ${(px * debug.scale).toFixed(1)}px`;
-      parts.push(`最細バー: ${debug.runs.minBar}px${other(debug.runs.minBar)}`);
-      parts.push(`最細スペース: ${debug.runs.minSpace}px${other(debug.runs.minSpace)}`);
-      parts.push(`本数: ${debug.runs.bars}`);
+  function describeAggregate(step) {
+    const method = PREPROCESS_METHOD_LABELS[step.method] || step.method;
+    if (!step.applied) {
+      return `${method}。波形の振幅が足りないので見送りました` +
+        `（${Math.round(step.contrast.range)}/255。枠内にバーコードが無いか、バーが横向き）`;
     }
 
-    parts.push(`コントラスト正規化: ${describeContrastNormalize(debug.contrastNormalize)}`);
-    parts.push(`傾き補正: ${debug.shear}px`);
-    parts.push(`振幅: ${Math.round(debug.contrast.range)}/255`);
+    const parts = [`${method}（${step.width} × ${step.height} 段）`];
+
+    if (step.runs) {
+      const other = (px) =>
+        (step.srcScale ? ` / 元映像 ${(px / step.srcScale).toFixed(1)}px` : '') +
+        ` / 出力 ${(px * step.scale).toFixed(1)}px`;
+      parts.push(`最細バー: ${step.runs.minBar}px${other(step.runs.minBar)}`);
+      parts.push(`最細スペース: ${step.runs.minSpace}px${other(step.runs.minSpace)}`);
+      parts.push(`本数: ${step.runs.bars}`);
+    }
+
+    parts.push(`傾き補正: ${step.shear}px`);
+    parts.push(`振幅: ${Math.round(step.contrast.range)}/255`);
     // 'none' のときは二値化せずに渡しているので、波形の黒白は実測用の目安でしかない
     parts.push(
-      debug.thresholdIsMeasureOnly
-        ? `しきい値: ${debug.thresholdMode}（波形の黒白は実測用の目安）`
-        : `しきい値: ${debug.thresholdMode}`
+      step.thresholdMode === 'none'
+        ? `しきい値: ${step.thresholdMode}（波形の黒白は実測用の目安）`
+        : `しきい値: ${step.thresholdMode}`
     );
-    parts.push(`横の倍率: ${debug.scale.toFixed(2)}x → ${debug.out.width} × ${debug.out.height}`);
+    parts.push(`横の倍率: ${step.scale.toFixed(2)}x → ${step.out.width} × ${step.out.height}`);
 
     return parts.join('　');
   }
