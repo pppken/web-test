@@ -7,7 +7,8 @@
   // 読み込まなければ）barcode.js は従来どおり素通しの画像を解析する。
   //
   //   BarcodePreprocess.configure({
-  //     mode,          // 'off' | 'mean' | 'median' | 'trimmed' | 'ab'（既定は保存値。無ければ 'median'）
+  //     mode,          // 'off' | 'mean' | 'median' | 'trimmed' | 'contrast-stretch' | 'contrast-clahe' | 'ab'
+  //                    // （既定は保存値。無ければ 'median'。'contrast-*' は集約せずコントラスト正規化だけ）
   //     contrastNormalize, // 灰色にした直後のコントラスト正規化。'off'（既定）| 'stretch' | 'clahe'
   //     threshold,     // 集約後の二値化。'none'（既定）| 'otsu' | 'adaptive'
   //     smooth,        // 集約後に 3 タップの平滑化を掛ける（既定 false）
@@ -82,6 +83,8 @@
   const PRE_CLAHE_CLIP = 2.0;     // CLAHE のクリップ上限（1 階調あたりの平均画素数の何倍まで
                                   // 許すか）。上げるほど区画ごとの伸ばし方が強くなり、
                                   // 無地の場所のノイズも持ち上がる
+  const CONTRAST_ONLY_TILES_Y = 4;// 'contrast-clahe' モード（集約しない）の CLAHE の縦の区画数。
+                                  // こちらは切り出した画像そのもの（640x570 程度）なので縦にも分ける
 
   // 集約の仕方。'off' は前処理なし、'ab' は 1 フレームおきに off と
   // AB_MODE を入れ替えて検出率を比べる計測用。
@@ -100,7 +103,16 @@
   // 黒白の面積比に引きずられ、run length が systematic にずれる。
   // median は「エッジ位置の中央値」に段を立て直すので、縁の鋭さが戻る。
   // trimmed mean はほぼ median と同じ（差は測定誤差の範囲）
-  const CHOICES = ['off', 'mean', 'median', 'trimmed', 'ab'];
+  //
+  // 'contrast-stretch' / 'contrast-clahe' は縦の集約をせず、素通しの画像（frame.plain()）に
+  // コントラスト正規化だけを掛けて渡す。方式はモードごとに決まっていて、
+  // contrastNormalize の設定（集約するモード用）には左右されない。
+  // 集約とコントラスト正規化のどちらが効いているかを切り分けるためのもの
+  const CHOICES = ['off', 'mean', 'median', 'trimmed', 'contrast-stretch', 'contrast-clahe', 'ab'];
+  const CONTRAST_ONLY_MODES = {    // モード -> コントラスト正規化の方式
+    'contrast-stretch': 'stretch',
+    'contrast-clahe': 'clahe'
+  };
   const DEFAULT_CHOICE = 'median';
   const AB_MODE = 'median';
   const DEFAULT_STORAGE_KEY = 'barcodePreprocess';
@@ -170,10 +182,19 @@
   };
   output.ctx = output.canvas.getContext('2d', { willReadFrequently: true });
 
+  // 'contrast-*' モードで、素通しの画像にコントラスト正規化を掛けた画像。
+  // 素通しの画像は barcode.js の作業用 canvas なので、書き換えずにこちらへ写してから触る
+  const contrastOutput = {
+    canvas: document.createElement('canvas'),
+    ctx: null
+  };
+  contrastOutput.ctx = contrastOutput.canvas.getContext('2d', { willReadFrequently: true });
+
   let choice = null;       // 選択値。初めて要るときに保存値から復元する
   let useNext = true;      // 'ab' のとき、次のフレームで前処理を使うか
   let debugInfo = null;    // 検証用（波形・しきい値・最細バーの実測）
-  let lastOutput = null;   // 検証用。output.canvas にいま入っている画像の素性（getLastOutput）
+  let lastOutput = null;   // 検証用。最後に作った画像の素性（getLastOutput）
+  let lastOutputCanvas = null; // その画像が入っている canvas（output か contrastOutput）
 
   // 前処理あり／なしの検出率。'ab' のときに突き合わせる
   const stats = {
@@ -274,9 +295,9 @@
   // time は performance.now() の時刻。前処理を見送ったフレーム（振幅不足）では
   // 作り直さないので、古い画像のことがある（time で見分ける）
   function getLastOutput() {
-    if (!config.debug || !lastOutput) return null;
+    if (!config.debug || !lastOutput || !lastOutputCanvas) return null;
 
-    const source = output.canvas;
+    const source = lastOutputCanvas;
     const canvas = document.createElement('canvas');
     canvas.width = source.width;
     canvas.height = source.height;
@@ -410,10 +431,10 @@
   //   2. 累積分布を階調の対応表にする（ヒストグラム平坦化）
   // を作り、各画素は周りの区画の中心からの距離で対応表を線形補間する
   // （区画の境目で明るさが段になるのを防ぐ）。gray をその場で書き換える
-  function claheGray(gray, width, height) {
+  function claheGray(gray, width, height, maxTilesX, maxTilesY) {
     // 区画が細すぎる・低すぎると 1 区画にバーとスペースが両方入らないので、減らす
-    const tilesX = Math.max(1, Math.min(PRE_CLAHE_TILES_X, Math.floor(width / 32)));
-    const tilesY = Math.max(1, Math.min(PRE_CLAHE_TILES_Y, Math.floor(height / 8)));
+    const tilesX = Math.max(1, Math.min(maxTilesX, Math.floor(width / 32)));
+    const tilesY = Math.max(1, Math.min(maxTilesY, Math.floor(height / 8)));
     const tileW = width / tilesX;
     const tileH = height / tilesY;
 
@@ -809,7 +830,7 @@
     const contrastModeNow = contrastMode();
     const contrastNormalize =
       contrastModeNow === 'stretch' ? stretchGray(gray)
-        : contrastModeNow === 'clahe' ? claheGray(gray, width, height)
+        : contrastModeNow === 'clahe' ? claheGray(gray, width, height, PRE_CLAHE_TILES_X, PRE_CLAHE_TILES_Y)
           : { mode: 'off', applied: false };
 
     const shear = config.shear ? estimateShear(gray, width, height) : 0;
@@ -840,6 +861,7 @@
     const canvas = buildImage(scaled, thresholdMode === 'none' ? null : scaledThreshold);
 
     if (config.debug) {
+      lastOutputCanvas = canvas;
       lastOutput = {
         width: canvas.width,
         height: canvas.height,
@@ -883,6 +905,64 @@
     return canvas;
   }
 
+  // 'contrast-*' モード。素通しの画像（余白・回転込み。2 次元のまま）にコントラスト正規化だけを
+  // 掛けて返す。方式はモードで決まる（CONTRAST_ONLY_MODES）。
+  // 掛けられなかった（伸ばす幅が無い）ときは null（呼び出し側は素通しの画像をそのまま使う）
+  function captureContrastOnly(source, mode) {
+    const width = source.width;
+    const height = source.height;
+    const { canvas, ctx } = contrastOutput;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    ctx.drawImage(source, 0, 0);
+
+    const image = ctx.getImageData(0, 0, width, height);
+    const data = image.data;
+    const gray = toGray(data, width * height);
+
+    const method = CONTRAST_ONLY_MODES[mode];
+    const info = method === 'clahe'
+      ? claheGray(gray, width, height, PRE_CLAHE_TILES_X, CONTRAST_ONLY_TILES_Y)
+      : stretchGray(gray);
+
+    if (config.debug) {
+      debugInfo = {
+        mode,
+        contrastOnly: true,
+        contrastNormalize: info,
+        width,
+        height,
+        skipped: !info.applied
+      };
+    }
+    if (!info.applied) return null;
+
+    // 解析側（ZXing / ZXing-C++）は RGBA から同じ係数で輝度を取り直すので、灰色で書き戻す
+    for (let i = 0, j = 0; j < gray.length; i += 4, j++) {
+      data[i] = gray[j];
+      data[i + 1] = gray[j];
+      data[i + 2] = gray[j];
+      data[i + 3] = 255;
+    }
+    ctx.putImageData(image, 0, 0);
+
+    if (config.debug) {
+      lastOutputCanvas = canvas;
+      lastOutput = {
+        width,
+        height,
+        pad: null,   // 素通しの画像の余白は barcode.js が決めるので、ここでは分からない
+        mode,
+        contrastNormalize: method,
+        time: performance.now()
+      };
+    }
+
+    return canvas;
+  }
+
   // --- barcode.js への差し込み口 ----------------------------------------
 
   // BarcodeScanner.configure({ frameFilter }) に渡す関数。1 フレームぶんの画像を作り、
@@ -895,10 +975,20 @@
   async function filter(frame) {
     const current = currentChoice();
     const mode = frame.preview && current === 'ab' ? AB_MODE : modeForFrame();
-    const canvas = mode ? capture(frame.video, frame.crop, mode) : null;
+
+    let canvas = null;
+    let source = null;
+    if (CONTRAST_ONLY_MODES[mode]) {
+      // plain() は呼ぶたびに回転の向きを入れ替えるので、1 フレームにつき 1 回だけ呼ぶ
+      const plain = frame.plain();
+      canvas = plain ? captureContrastOnly(plain, mode) : null;
+      source = canvas || plain;
+    } else {
+      canvas = mode ? capture(frame.video, frame.crop, mode) : null;
+      source = canvas || frame.plain();
+    }
     // 検出画像の表示用に作ったもの（解析には渡していない）かどうか。getLastOutput で見分ける
     if (canvas && lastOutput) lastOutput.preview = !!frame.preview;
-    const source = canvas || frame.plain();
     if (!source) return null;
 
     const result = await frame.analyze(source);

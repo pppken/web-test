@@ -528,8 +528,9 @@ barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけ
 
 バーコードは高さ方向には同じ模様が続くので、**複数ラインを 1 本の波形に集約してから
 画像を作り直す**経路を足してある（`configure({ mode })`、このページでは
-「前処理」ボタン `#preprocessBtn`）。`'off' | 'mean' | 'median' | 'trimmed' | 'ab'` で、
-**既定は `'median'`**。選択は `localStorage['barcodePreprocess']` に保存する。
+「前処理」ボタン `#preprocessBtn`）。`'off' | 'mean' | 'median' | 'trimmed' |
+'contrast-stretch' | 'contrast-clahe' | 'ab'` で、**既定は `'median'`**
+（`'contrast-*'` は集約しないモード。下の「コントラスト正規化」を参照）。選択は `localStorage['barcodePreprocess']` に保存する。
 
 ```
 █ █▓█ █  ██
@@ -613,6 +614,31 @@ ZXing-C++ で n=90）での実測は次のとおり。**荒れていないラベ
 コントラストを整える。`'off'`（既定）/ `'stretch'` / `'clahe'`。このページは `app.js` の
 `setupPreprocess()` で `'stretch'` を渡している。検出画像ダイアログの波形の下に、
 何をしたか（`stretch（17〜222 → 0〜255）` など）が出る。
+**この設定が効くのは集約するモード（mean / median / trimmed）だけ。**
+
+**コントラスト正規化だけを掛けるモード**も別にある（`mode` の `'contrast-stretch'` /
+`'contrast-clahe'`。ボタンでは `コントラスト（stretch）` / `コントラスト（CLAHE）`）。
+縦の集約をせず、素通しの画像（`frame.plain()`。余白・回転込みの 2 次元の画像）を
+`contrastOutput` に写してから正規化を掛けて渡す（`captureContrastOnly()`）。方式はモードで
+決まり、`contrastNormalize` には左右されない。集約とコントラスト正規化のどちらが
+効いているかを切り分けるためのもの。
+
+- CLAHE は 2 次元の画像なので縦にも分ける（`CONTRAST_ONLY_TILES_Y` = 4。横は同じ 8）。
+- 伸ばす幅が無い（`stretch` で `PRE_MIN_CONTRAST` 未満）ときは素通しの画像をそのまま渡す。
+- `plain()` は呼ぶたびに回転（ZXing 経路の `rotateNext`）を入れ替えるので、1 フレームに 1 回だけ呼ぶ。
+- 波形は無いので、検出画像ダイアログには何をしたかだけが出る。
+- `'ab'` で比べられるのは今のところ `median` と素通しだけ。コントラストのみのモードの
+  検出率は、モードを切り替えて見比べるしかない（持ち方や明るさが揃わない点に注意）。
+
+同じ合成画像（下の表と同じ条件）で、12 秒のうちに読めたかどうか。「素通し」は下の表の `素`。
+
+| 場面 | 素通し | コントラスト（stretch） | コントラスト（CLAHE） |
+| --- | --- | --- | --- |
+| 通常 | 読めた | 読めた | 読めた |
+| 低コントラスト | 読めた | 読めた | 読めた |
+| 照明むら 50% | 読めた | **読めない** | 読めた |
+| 照明むら 62% | 読めない | 読めない | 読めない |
+| 低コントラスト + 照明むら 45% | 読めない | 読めない | **読めた** |
 
 - `'stretch'`（`stretchGray()`）: ROI の輝度の上下 `PRE_STRETCH_CLIP`（1%）を捨て、残りを
   0〜255 に線形に伸ばす。伸ばす幅が `PRE_MIN_CONTRAST` 未満なら触らない。

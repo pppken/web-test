@@ -383,6 +383,8 @@
     mean: '平均',
     median: '中央値',
     trimmed: 'トリム平均',
+    'contrast-stretch': 'コントラスト（stretch）',
+    'contrast-clahe': 'コントラスト（CLAHE）',
     ab: 'A/B 比較'
   };
 
@@ -406,7 +408,9 @@
     preprocessEnabled = true;
 
     preprocess.configure({
-      // 灰色にした直後のコントラスト正規化（検証中）。
+      // 灰色にした直後のコントラスト正規化（検証中）。集約するモード（平均・中央値・
+      // トリム平均）にだけ効く。コントラスト正規化だけを試すなら「前処理」ボタンで
+      // コントラスト（stretch）/ コントラスト（CLAHE）を選ぶ（こちらの設定には左右されない）。
       // 'off' | 'stretch'（上下 1% を捨てて 0〜255 に伸ばす）| 'clahe'（区画ごとに平坦化）
       contrastNormalize: 'stretch',
       onChange: (state) => {
@@ -461,7 +465,8 @@
     previewOutputInfo.textContent =
       `前処理の出力（${PREPROCESS_LABELS[output.mode] || output.mode}・${age} 秒前に${what}）` +
       `　${output.width} × ${output.height}` +
-      (output.pad ? `（うち左右 ${output.pad}px は白の余白）` : '（余白なし）') +
+      // pad が null（コントラスト正規化のみのモード。余白は素通しの画像のまま）のときは書かない
+      (output.pad === null ? '' : output.pad ? `（うち左右 ${output.pad}px は白の余白）` : '（余白なし）') +
       '　等倍表示。はみ出すときは横にスクロールできます';
   }
 
@@ -478,6 +483,15 @@
   // X 座標・輝度・しきい値・黒白の判定を 1 枚に重ねて出す。
   // 前処理が実際にどう効いているかは、この波形を見るのが一番早い
   function renderWave(debug) {
+    // コントラスト正規化のみのモード（contrast-*）は集約しないので波形は無い。何をしたかだけ出す
+    if (debug && debug.contrastOnly) {
+      previewWave.hidden = true;
+      previewWaveInfo.textContent =
+        `${PREPROCESS_LABELS[debug.mode] || debug.mode}（集約なし・${debug.width} × ${debug.height}）` +
+        `　コントラスト正規化: ${describeContrastNormalize(debug.contrastNormalize)}`;
+      return;
+    }
+
     if (!debug || !debug.profile) {
       previewWave.hidden = true;
       previewWaveInfo.textContent = debug && debug.skipped
