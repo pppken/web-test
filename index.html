@@ -497,6 +497,15 @@
       background: #fff;
     }
 
+    /* 領域検出（前処理の 'locate'）の結果。検出枠を取り込んだ画像に枠を重ねたもの */
+    #scanLocate {
+      display: block;
+      width: 100%;
+      height: auto;
+      margin-top: 12px;
+      border-radius: 10px;
+    }
+
     #scanWaveInfo {
       margin: 8px 0 0;
       font-size: 11px;
@@ -602,6 +611,7 @@
         <p id="scanOutputInfo"></p>
       </div>
       <!-- 前処理を選んでいるときだけ出す。app.js の renderWave() が描く -->
+      <canvas id="scanLocate" hidden></canvas>
       <canvas id="scanWave" hidden></canvas>
       <p id="scanWaveInfo"></p>
     </div>

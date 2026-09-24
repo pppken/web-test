@@ -7,8 +7,10 @@
   // 読み込まなければ）barcode.js は従来どおり素通しの画像を解析する。
   //
   //   BarcodePreprocess.configure({
-  //     mode,          // 'off' | 'mean' | 'median' | 'trimmed' | 'contrast-stretch' | 'contrast-clahe' | 'ab'
-  //                    // （既定は保存値。無ければ 'median'。'contrast-*' は集約せずコントラスト正規化だけ）
+  //     mode,          // 'off' | 'mean' | 'median' | 'trimmed' | 'contrast-stretch' | 'contrast-clahe'
+  //                    // | 'locate' | 'ab' | 'ab-locate'
+  //                    // （既定は保存値。無ければ 'median'。'contrast-*' は集約せずコントラスト正規化だけ。
+  //                    // 'locate' はバーコードの領域を探して切り出し、白の余白を足す）
   //     contrastNormalize, // 灰色にした直後のコントラスト正規化。'off'（既定）| 'stretch' | 'clahe'
   //     threshold,     // 集約後の二値化。'none'（既定）| 'otsu' | 'adaptive'
   //     smooth,        // 集約後に 3 タップの平滑化を掛ける（既定 false）
@@ -86,8 +88,40 @@
   const CONTRAST_ONLY_TILES_Y = 4;// 'contrast-clahe' モード（集約しない）の CLAHE の縦の区画数。
                                   // こちらは切り出した画像そのもの（640x570 程度）なので縦にも分ける
 
-  // 集約の仕方。'off' は前処理なし、'ab' は 1 フレームおきに off と
-  // AB_MODE を入れ替えて検出率を比べる計測用。
+  // 'locate'（領域の検出と切り出し）。流れは「領域の検出と切り出し」の節を参照
+  const LOC_MAX_SIDE = 640;       // 領域を探すときに取り込む大きさ（長辺）。barcode.js の MAX_SCAN_SIDE と同じ。
+                                  // 320 まで落とすと、実機の細バー（元映像で 3px 前後）が 1px を切って
+                                  // 勾配が出なくなる
+  const LOC_CELL = 16;            // 勾配を集計する区画の一辺（取り込み側の px）。
+                                  // 1 区画にバーとスペースが何本か入る程度にする
+  const LOC_MIN_ENERGY = 100;     // 区画の勾配の 2 乗平均（輝度/px の 2 乗）がこれ未満なら無地とみなす。
+                                  // 10 階調/px 程度。ノイズだけの区画は 1 桁小さい
+  const LOC_MIN_COHERENCE = 0.6;  // 勾配の向きの揃い具合（0〜1）。バーコードは 1 方向に揃うのでほぼ 1、
+                                  // 文字や模様は向きがばらけて下がる
+  const LOC_MAX_ANGLE = 20;       // 隣の区画と同じ塊とみなす勾配の向きの差（度）
+  const LOC_MIN_CELLS = 4;        // 塊がこれより小さければバーコードではないとみなす
+  const LOC_MIN_WIDTH_CELLS = 3;  // 塊のバーと直交する方向の幅（区画数）。ラベルの縁のような
+                                  // 1 本の強いエッジは細長い塊になるので、ここで落とす
+  const LOC_SEARCH_MARGIN = 1;    // 切り出すとき、塊の外側にバーと直交する方向へ何区画ぶん広げるか。
+                                  // 区画の粒度では端のバーを取りこぼすので広めに取り、あとでエッジの並びで詰める
+  const LOC_MAX_WIDTH = 1280;     // 切り出した画像の横幅の上限。細バーの太さは横の解像度でしか
+                                  // 決まらないので、元映像の実寸まではそのまま使う（前処理の PRE_MAX_WIDTH と同じ）
+  const LOC_MAX_HEIGHT = 160;     // 切り出した画像の高さの上限。バーの向きに沿って縮めるだけなので
+                                  // バーは細らない（縦の平均になり、印字ムラが少し均される）
+  const LOC_EDGE_MIN = 8;         // エッジとみなす輝度の段差の下限（2px あたり）
+  const LOC_EDGE_REL = 0.25;      // エッジとみなす段差の下限（段差の大きいほうから 1 割の値に対する割合）
+  const LOC_GAP_FACTOR = 4;       // エッジの間隔の中央値の何倍を超えたら、バーコードの外（クワイエットゾーン）とみなすか。
+                                  // 規格の余白は 7〜10 モジュール、要素の最大幅は 4 モジュール（CODE128 / JAN）で、
+                                  // 間隔の中央値はおよそ 1.5〜2 モジュール
+  const LOC_MIN_EDGES = 20;       // バーコードとみなすエッジの本数の下限。最短の CODE39 / CODE128 でも 25 本以上ある
+  const LOC_PAD_X = 40;           // 左右に足す白の余白の最小幅（出力側の px）。barcode.js の SCAN_PAD_X と同じ
+  const LOC_PAD_GAPS = 8;         // 左右の余白を、エッジの間隔の中央値の何倍にするか（LOC_PAD_X より広ければこちら）。
+                                  // 間隔の中央値がおよそ 1.5〜2 モジュールなので、12〜16 モジュールぶんになる
+  const LOC_PAD_Y = 8;            // 上下に足す白の余白（出力側の px）。1D の読み取りには要らないが、
+                                  // 切り口のすぐ上下に文字や台紙が来ないようにしておく
+
+  // 集約の仕方。'off' は前処理なし、'ab' / 'ab-locate' は 1 フレームおきに off と
+  // AB_CHOICES の前処理を入れ替えて検出率を比べる計測用。
   //
   // **mean ではなく median を既定にしてある。** 荒れた印字を合成して測ったところ
   // （module 3px・傾き 1.2 度・縁のゆらぎ ±1px・ドット抜けあり、ZXing-C++ で n=90）、
@@ -108,13 +142,21 @@
   // コントラスト正規化だけを掛けて渡す。方式はモードごとに決まっていて、
   // contrastNormalize の設定（集約するモード用）には左右されない。
   // 集約とコントラスト正規化のどちらが効いているかを切り分けるためのもの
-  const CHOICES = ['off', 'mean', 'median', 'trimmed', 'contrast-stretch', 'contrast-clahe', 'ab'];
+  //
+  // 'locate' は集約もコントラスト正規化もせず、検出枠の中からバーコードの領域だけを探して
+  // 切り出し、傾きを直して白の余白を足してから渡す（下の「領域の検出と切り出し」を参照）
+  const CHOICES = [
+    'off', 'mean', 'median', 'trimmed', 'contrast-stretch', 'contrast-clahe', 'locate', 'ab', 'ab-locate'
+  ];
   const CONTRAST_ONLY_MODES = {    // モード -> コントラスト正規化の方式
     'contrast-stretch': 'stretch',
     'contrast-clahe': 'clahe'
   };
   const DEFAULT_CHOICE = 'median';
-  const AB_MODE = 'median';
+  const AB_CHOICES = {             // A/B の選択値 -> 素通しと交互に回す前処理
+    ab: 'median',
+    'ab-locate': 'locate'
+  };
   const DEFAULT_STORAGE_KEY = 'barcodePreprocess';
 
   // 伸び縮みさせたあとの二値化。**既定は 'none'（＝ 生の輝度をそのまま渡す）。**
@@ -190,11 +232,22 @@
   };
   contrastOutput.ctx = contrastOutput.canvas.getContext('2d', { willReadFrequently: true });
 
+  // 'locate' の作業用。どれも getImageData される側
+  //   locateInput    検出枠のぶんを LOC_MAX_SIDE まで縮めて取り込んだもの（領域を探す材料）
+  //   locateExtract  見つけた領域を、元映像から傾きを直して切り出したもの（余白なし）
+  //   locateOutput   左右の端を詰めて白の余白を足したもの（解析に渡す画像）
+  const locateInput = { canvas: document.createElement('canvas'), ctx: null };
+  const locateExtract = { canvas: document.createElement('canvas'), ctx: null };
+  const locateOutput = { canvas: document.createElement('canvas'), ctx: null };
+  for (const target of [locateInput, locateExtract, locateOutput]) {
+    target.ctx = target.canvas.getContext('2d', { willReadFrequently: true });
+  }
+
   let choice = null;       // 選択値。初めて要るときに保存値から復元する
   let useNext = true;      // 'ab' のとき、次のフレームで前処理を使うか
   let debugInfo = null;    // 検証用（波形・しきい値・最細バーの実測）
   let lastOutput = null;   // 検証用。最後に作った画像の素性（getLastOutput）
-  let lastOutputCanvas = null; // その画像が入っている canvas（output か contrastOutput）
+  let lastOutputCanvas = null; // その画像が入っている canvas（output / contrastOutput / locateOutput）
 
   // 前処理あり／なしの検出率。'ab' のときに突き合わせる
   const stats = {
@@ -244,12 +297,13 @@
     return choice;
   }
 
-  // このフレームを前処理経路で解析するか。'ab' は 1 フレームおきに入れ替える
+  // このフレームを前処理経路で解析するか。'ab' / 'ab-locate' は 1 フレームおきに入れ替える
   function modeForFrame() {
     const current = currentChoice();
     if (current === 'off') return null;
-    if (current !== 'ab') return current;
-    return useNext ? AB_MODE : null;
+    const ab = AB_CHOICES[current];
+    if (!ab) return current;
+    return useNext ? ab : null;
   }
 
   // 停止中でも切り替えられる。次のフレームから効く
@@ -273,7 +327,7 @@
     const current = currentChoice();
     return {
       choice: current,
-      mode: current === 'ab' ? AB_MODE : current,
+      mode: AB_CHOICES[current] || current,
       contrastNormalize: contrastMode(),
       threshold: config.threshold,
       smooth: !!config.smooth,
@@ -963,6 +1017,509 @@
     return canvas;
   }
 
+  // --- 領域の検出と切り出し（'locate'）---------------------------------
+  //
+  // 検出枠の中からバーコードが写っている範囲だけを探して切り出し、白の余白を足してから
+  // 解析に渡す。OpenCV でよくやる「勾配 → 塊 → 回転矩形 → 切り出し」を手で書いたもの。
+  //
+  //   1. 検出枠を LOC_MAX_SIDE まで縮めて取り込み、Sobel で勾配を取る
+  //   2. LOC_CELL 四方の区画ごとに勾配の構造テンソルを集計し、「勾配が強い」かつ
+  //      「向きが 1 方向に揃っている」区画を拾う（＝バーが並んでいる所）
+  //   3. 向きの近い隣の区画どうしをつないで塊にし、勾配の総量が一番大きい塊を選ぶ
+  //   4. 塊の向き（＝バーと直交する方向）を横軸にした回転矩形を、元映像から
+  //      傾きを直して切り出す（バーが縦に立った画像になる）
+  //   5. 列ごとの輝度からエッジを拾い、間隔が詰まって並んでいる所（＝バーコード本体）の
+  //      最初と最後のエッジで左右を詰める。クワイエットゾーンを越えた先にある
+  //      ラベルの縁・台紙・文字はここで落ちる
+  //   6. 行ごとのエッジの量で上下も詰め、周りに白の余白を足す
+  //
+  // 枠いっぱいにバーコードを写したときや、台紙の灰色・ラベルの縁がバーのすぐ隣に
+  // 来るときに、クワイエットゾーンを白で作り直せるのが狙い。
+  // 傾きは 4 で直すので、ZXing（zxing-js）の 1 フレームおきの 90 度回転も要らない。
+  // 見つからなければ null を返し、呼び出し側は素通しの経路に落ちる。
+  //
+  // 映像を読むのは 1 と 4 の 2 回で、どちらも検出枠（crop）の範囲だけ
+
+  // 1. 検出枠のぶんを縮めて取り込み、灰色にする
+  function copyForLocate(video, crop) {
+    const { sx, sy, sw, sh } = crop;
+    const ratio = Math.min(1, LOC_MAX_SIDE / Math.max(sw, sh));
+    const width = Math.max(1, Math.round(sw * ratio));
+    const height = Math.max(1, Math.round(sh * ratio));
+
+    const { canvas, ctx } = locateInput;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, width, height);
+
+    const rgba = ctx.getImageData(0, 0, width, height).data;
+    // scale は取り込み側の 1px が元映像の何 px にあたるか
+    return { gray: toGray(rgba, width * height), width, height, scale: sw / width };
+  }
+
+  // 2〜3. バーコードらしい区画の塊を探し、その向きと広がりを返す。
+  //
+  // 区画ごとの構造テンソル J = Σ[gx², gxgy; gxgy, gy²] から
+  //   強さ      (Jxx + Jyy) / 画素数               （勾配の 2 乗平均）
+  //   揃い具合  √((Jxx − Jyy)² + 4Jxy²) / (Jxx + Jyy)（1 なら全画素の勾配が同じ向き）
+  //   向き      φ = atan2(2Jxy, Jxx − Jyy)          （勾配の角度の 2 倍。θ と θ+180° を同じに扱う）
+  // を出す。バーコードはどの区画も「強く・揃っていて・同じ向き」になる
+  function findRegion(gray, width, height) {
+    const cell = LOC_CELL;
+    const cols = Math.floor(width / cell);
+    const rows = Math.floor(height / cell);
+    if (cols < 2 || rows < 2) return { found: false, reason: 'small', cells: [] };
+
+    const count = cols * rows;
+    const jxx = new Float32Array(count);
+    const jyy = new Float32Array(count);
+    const jxy = new Float32Array(count);
+
+    const xEnd = Math.min(cols * cell, width - 1);
+    const yEnd = Math.min(rows * cell, height - 1);
+    for (let y = 1; y < yEnd; y++) {
+      const base = ((y / cell) | 0) * cols;
+      const row = y * width;
+      for (let x = 1; x < xEnd; x++) {
+        const i = row + x;
+        const tl = gray[i - width - 1];
+        const tr = gray[i - width + 1];
+        const bl = gray[i + width - 1];
+        const br = gray[i + width + 1];
+        // Sobel を 8 で割って「輝度/px」の尺にしておく（しきい値を読みやすくするため）
+        const gx = (tr + 2 * gray[i + 1] + br - tl - 2 * gray[i - 1] - bl) / 8;
+        const gy = (bl + 2 * gray[i + width] + br - tl - 2 * gray[i - width] - tr) / 8;
+        const c = base + ((x / cell) | 0);
+        jxx[c] += gx * gx;
+        jyy[c] += gy * gy;
+        jxy[c] += gx * gy;
+      }
+    }
+
+    const area = cell * cell;
+    const energy = new Float32Array(count);
+    const phi = new Float32Array(count);
+    const candidate = new Uint8Array(count);
+    for (let c = 0; c < count; c++) {
+      const sum = jxx[c] + jyy[c];
+      energy[c] = sum / area;
+      if (energy[c] < LOC_MIN_ENERGY) continue;
+      const diff = jxx[c] - jyy[c];
+      const coherence = Math.sqrt(diff * diff + 4 * jxy[c] * jxy[c]) / sum;
+      if (coherence < LOC_MIN_COHERENCE) continue;
+      phi[c] = Math.atan2(2 * jxy[c], diff);
+      candidate[c] = 1;
+    }
+
+    // 向きの近い隣（8 近傍）どうしをつなぐ。φ は角度の 2 倍なので、差も 2 倍で比べる
+    const maxDiff = (LOC_MAX_ANGLE * 2 * Math.PI) / 180;
+    const similar = (a, b) => {
+      let d = Math.abs(phi[a] - phi[b]);
+      if (d > Math.PI) d = Math.PI * 2 - d;
+      return d <= maxDiff;
+    };
+
+    const label = new Int32Array(count).fill(-1);
+    const stack = [];
+    let best = null;
+    let anyCandidate = false;
+
+    for (let start = 0; start < count; start++) {
+      if (!candidate[start] || label[start] >= 0) continue;
+      anyCandidate = true;
+
+      const cells = [];
+      let sxx = 0;
+      let syy = 0;
+      let sxy = 0;
+      let total = 0;
+      label[start] = start;
+      stack.push(start);
+      while (stack.length) {
+        const c = stack.pop();
+        cells.push(c);
+        sxx += jxx[c];
+        syy += jyy[c];
+        sxy += jxy[c];
+        total += energy[c];
+
+        const cx = c % cols;
+        const cy = (c / cols) | 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const ny = cy + dy;
+          if (ny < 0 || ny >= rows) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = cx + dx;
+            if ((!dx && !dy) || nx < 0 || nx >= cols) continue;
+            const n = ny * cols + nx;
+            if (!candidate[n] || label[n] >= 0 || !similar(c, n)) continue;
+            label[n] = start;
+            stack.push(n);
+          }
+        }
+      }
+
+      if (cells.length < LOC_MIN_CELLS) continue;
+      if (best && total <= best.total) continue;
+
+      // 塊全体の向き。θ は勾配の向き（＝バーと直交する方向）
+      const theta = Math.atan2(2 * sxy, sxx - syy) / 2;
+      const region = measureRegion(cells, cols, theta);
+      // ラベルの縁のような 1 本の強いエッジは、バーと直交する方向に薄い塊になる
+      if ((region.uMax - region.uMin) / cell < LOC_MIN_WIDTH_CELLS) continue;
+
+      best = { ...region, cells, total, theta };
+    }
+
+    if (!best) {
+      return { found: false, reason: anyCandidate ? 'small' : 'none', cells: [], cols };
+    }
+    return { found: true, cols, ...best };
+  }
+
+  // 塊を、向き theta の回転矩形として測る。
+  // 返すのは取り込み側の座標で、中心 (cx, cy) と、そこからの u（バーと直交）・v（バーに沿う）
+  // 方向の広がり。区画の中心の広がりに、区画そのものの半幅を足してある
+  function measureRegion(cells, cols, theta) {
+    const cell = LOC_CELL;
+    const u = { x: Math.cos(theta), y: Math.sin(theta) };
+    const v = { x: -u.y, y: u.x };
+
+    let cx = 0;
+    let cy = 0;
+    for (const c of cells) {
+      cx += ((c % cols) + 0.5) * cell;
+      cy += (((c / cols) | 0) + 0.5) * cell;
+    }
+    cx /= cells.length;
+    cy /= cells.length;
+
+    let uMin = Infinity;
+    let uMax = -Infinity;
+    let vMin = Infinity;
+    let vMax = -Infinity;
+    for (const c of cells) {
+      const dx = ((c % cols) + 0.5) * cell - cx;
+      const dy = (((c / cols) | 0) + 0.5) * cell - cy;
+      const pu = dx * u.x + dy * u.y;
+      const pv = dx * v.x + dy * v.y;
+      if (pu < uMin) uMin = pu;
+      if (pu > uMax) uMax = pu;
+      if (pv < vMin) vMin = pv;
+      if (pv > vMax) vMax = pv;
+    }
+
+    const half = (cell / 2) * (Math.abs(u.x) + Math.abs(u.y));
+    return {
+      cx,
+      cy,
+      u,
+      v,
+      uMin: uMin - half,
+      uMax: uMax + half,
+      vMin: vMin - half,
+      vMax: vMax + half
+    };
+  }
+
+  // 4. 回転矩形を元映像から切り出す。バーと直交する方向（u）が横になるように置くので、
+  // 出てくる画像はバーが縦に立っている。横（u）は LOC_MAX_WIDTH まで実寸、
+  // 縦（v）は LOC_MAX_HEIGHT まで縮める（バーに沿って縮めるだけなので細らない）。
+  // 左右は LOC_SEARCH_MARGIN 区画ぶん広めに取る（5 で詰める）
+  function extractRegion(video, crop, region, scale) {
+    const margin = LOC_SEARCH_MARGIN * LOC_CELL;
+    const uMin = region.uMin - margin;
+    const uMax = region.uMax + margin;
+    const { u, v } = region;
+
+    // 矩形の中心（元映像の座標）
+    const mu = (uMin + uMax) / 2;
+    const mv = (region.vMin + region.vMax) / 2;
+    const centerX = crop.sx + (region.cx + mu * u.x + mv * v.x) * scale;
+    const centerY = crop.sy + (region.cy + mu * u.y + mv * v.y) * scale;
+
+    const uLen = (uMax - uMin) * scale;
+    const vLen = (region.vMax - region.vMin) * scale;
+    const su = Math.min(1, LOC_MAX_WIDTH / uLen);
+    const sv = Math.min(su, LOC_MAX_HEIGHT / vLen);
+    const width = Math.max(3, Math.round(uLen * su));
+    const height = Math.max(3, Math.round(vLen * sv));
+
+    const { canvas, ctx } = locateExtract;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+
+    // 検出枠の外にはみ出したところは白のままにする（映像は crop の範囲しか読まない）
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, width, height);
+
+    // 元映像の点 P を、出力の (su·(P−C)·u + W/2, sv·(P−C)·v + H/2) に写す
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.setTransform(
+      su * u.x, sv * v.x,
+      su * u.y, sv * v.y,
+      width / 2 - su * (centerX * u.x + centerY * u.y),
+      height / 2 - sv * (centerX * v.x + centerY * v.y)
+    );
+    ctx.drawImage(video, crop.sx, crop.sy, crop.sw, crop.sh, crop.sx, crop.sy, crop.sw, crop.sh);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+    const rgba = ctx.getImageData(0, 0, width, height).data;
+
+    // 切り出した画像の点 (x, y) を取り込み側の座標に戻す（検証用の枠を描くため）
+    const k = scale;
+    const inputCx = region.cx + mu * u.x + mv * v.x;
+    const inputCy = region.cy + mu * u.y + mv * v.y;
+    const toInput = (x, y) => {
+      const du = (x - width / 2) / (su * k);
+      const dv = (y - height / 2) / (sv * k);
+      return { x: inputCx + du * u.x + dv * v.x, y: inputCy + du * u.y + dv * v.y };
+    };
+
+    return { gray: toGray(rgba, width * height), width, height, su, sv, toInput };
+  }
+
+  // 5. 左右を詰める。列ごとの輝度（上下の端を避けて真ん中の半分の平均）の段差から
+  // エッジを拾い、エッジの間隔が LOC_GAP_FACTOR x 中央値を超えたところで区切る。
+  // バーコードの中の間隔は要素の幅（1〜4 モジュール）までだが、外側にはクワイエットゾーン
+  // （7〜10 モジュール以上）があるので、エッジが一番多く詰まっている区切りがバーコード本体になる
+  function trimColumns(gray, width, height) {
+    const y0 = Math.floor(height / 4);
+    const y1 = Math.max(y0 + 1, Math.ceil((height * 3) / 4));
+    const profile = new Float32Array(width);
+    for (let y = y0; y < y1; y++) {
+      const row = y * width;
+      for (let x = 0; x < width; x++) profile[x] += gray[row + x];
+    }
+    for (let x = 0; x < width; x++) profile[x] /= y1 - y0;
+
+    // 2px あたりの段差。しきい値は段差の大きいほうから 1 割の値を基準にする
+    const diff = new Float32Array(width);
+    for (let x = 1; x < width - 1; x++) diff[x] = profile[x + 1] - profile[x - 1];
+    const sorted = Array.from(diff, Math.abs).sort((a, b) => a - b);
+    const threshold = Math.max(LOC_EDGE_MIN, LOC_EDGE_REL * sorted[Math.floor(sorted.length * 0.9)]);
+
+    // しきい値を超えた同じ向きの段差の連なりを 1 本のエッジとし、一番急なところに置く。
+    // 向き（signs）は、左から見て明→暗が -1、暗→明が +1
+    const edges = [];
+    const signs = [];
+    let runSign = 0;
+    let runPeak = 0;
+    let runAt = 0;
+    for (let x = 1; x < width; x++) {
+      const d = x < width - 1 ? diff[x] : 0;
+      const sign = Math.abs(d) >= threshold ? Math.sign(d) : 0;
+      if (sign !== runSign) {
+        if (runSign) {
+          edges.push(runAt);
+          signs.push(runSign);
+        }
+        runSign = sign;
+        runPeak = 0;
+      }
+      if (sign && Math.abs(d) > runPeak) {
+        runPeak = Math.abs(d);
+        runAt = x;
+      }
+    }
+
+    if (edges.length < LOC_MIN_EDGES) return { found: false, edges: edges.length, threshold };
+
+    const gaps = [];
+    for (let i = 1; i < edges.length; i++) gaps.push(edges[i] - edges[i - 1]);
+    const gap = gaps.slice().sort((a, b) => a - b)[gaps.length >> 1];
+    const limit = Math.max(3, gap * LOC_GAP_FACTOR);
+
+    // エッジが一番多く詰まっている区切りを選ぶ
+    let bestFrom = 0;
+    let bestTo = 0;
+    let from = 0;
+    for (let i = 1; i <= edges.length; i++) {
+      if (i < edges.length && edges[i] - edges[i - 1] <= limit) continue;
+      if (i - from > bestTo - bestFrom) {
+        bestFrom = from;
+        bestTo = i;
+      }
+      from = i;
+    }
+
+    // バーコードは必ずバーで始まりバーで終わるので、最初のエッジは明→暗、最後は暗→明になる。
+    // そうでない端のエッジは外側のもの（余白が狭いときの、ラベルの縁と暗い背景の境目など）なので削る。
+    // 削ったエッジがあれば、切る位置はそのエッジとの中点より外へは出さない
+    let first = bestFrom;
+    let last = bestTo - 1;
+    while (first < last && signs[first] > 0) first++;
+    while (last > first && signs[last] < 0) last--;
+
+    const found = last - first + 1;
+    if (found < LOC_MIN_EDGES) return { found: false, edges: found, threshold, gap };
+
+    // 端のバーのぼけた裾を削らないよう、最初と最後のエッジから間隔 1 つぶん外で切る
+    const margin = Math.max(2, Math.round(gap));
+    let left = edges[first] - margin;
+    let right = edges[last] + margin;
+    if (first > bestFrom) left = Math.max(left, Math.ceil((edges[first - 1] + edges[first]) / 2));
+    if (last < bestTo - 1) right = Math.min(right, Math.floor((edges[last] + edges[last + 1]) / 2));
+
+    return {
+      found: true,
+      left: Math.max(0, left),
+      right: Math.min(width - 1, right),
+      edges: found,
+      threshold,
+      gap
+    };
+  }
+
+  // 6. 上下を詰める。left〜right の範囲で行ごとに横の段差の総量を取り、
+  // 多い行（上位 1 割の値の半分以上）が一番長く続いているところを残す。
+  // バーの上下にある文字や台紙はここで落ちる（2 行までの途切れは続いているとみなす）
+  function trimRows(gray, width, height, left, right) {
+    const span = Math.max(1, right - left);
+    const score = new Float32Array(height);
+    for (let y = 0; y < height; y++) {
+      const row = y * width;
+      let sum = 0;
+      for (let x = left; x < right; x++) sum += Math.abs(gray[row + x + 1] - gray[row + x]);
+      score[y] = sum / span;
+    }
+
+    const sorted = Array.from(score).sort((a, b) => a - b);
+    const threshold = sorted[Math.floor(sorted.length * 0.9)] * 0.5;
+
+    let best = { top: 0, bottom: height - 1, length: 0 };
+    let top = -1;
+    let last = -1;
+    for (let y = 0; y <= height; y++) {
+      const hit = y < height && score[y] >= threshold;
+      if (hit) {
+        if (top < 0 || y - last > 3) top = y;
+        last = y;
+        if (last - top + 1 > best.length) best = { top, bottom: last, length: last - top + 1 };
+      }
+    }
+
+    // 残る行が少なすぎるときは詰めない（読み取りには何行かあったほうがよい）
+    if (best.length < 3) return { top: 0, bottom: height - 1 };
+    return { top: best.top, bottom: best.bottom };
+  }
+
+  // 'locate' の 1 枚を作る。見つからなければ null（呼び出し側は素通しの経路に落ちる）
+  function captureLocated(video, crop) {
+    const input = copyForLocate(video, crop);
+    const region = findRegion(input.gray, input.width, input.height);
+
+    // 検証用。取り込んだ画像（view）の上に、拾った区画と切り出した矩形を重ねて見せる。
+    // view は作業用 canvas をそのまま指すので、次のフレームで書き換わる
+    // （app.js は capturePreview() の直後に読むので、同じフレームのものが見える）
+    const cellsOf = (list, cols) =>
+      list.map((c) => ({ x: (c % cols) * LOC_CELL, y: ((c / cols) | 0) * LOC_CELL }));
+    const base = {
+      mode: 'locate',
+      locate: true,
+      view: locateInput.canvas,
+      width: input.width,
+      height: input.height,
+      cellSize: LOC_CELL
+    };
+
+    if (!region.found) {
+      if (config.debug) debugInfo = { ...base, skipped: true, reason: region.reason, cells: [] };
+      return null;
+    }
+
+    const cells = config.debug ? cellsOf(region.cells, region.cols) : null;
+
+    // 区画から測った向きは、取り込みで 2px 前後まで細ったバーの階段状のギザギザに
+    // 引っ張られて水平・垂直寄りに出る（合成画像で 12° が 10.2° になった。高さ 110px の
+    // バーなら上下で 3.5px、1 モジュールを超えてずれる）。
+    // そこで一度切り出してから、上下の帯のずれ（前処理の estimateShear と同じもの）で
+    // 残った傾きを測り、向きを直して切り出し直す
+    let extract = extractRegion(video, crop, region, input.scale);
+    const shear = estimateShear(extract.gray, extract.width, extract.height);
+    if (shear) {
+      // 上下の帯（それぞれ高さの 1/4）の中心どうしの間隔
+      const span = extract.height - (extract.height >> 2);
+      // 下へ行くほどバーが右（+u）へずれているなら、バーの向き v を u 側へ δ だけ倒す ＝ θ から δ を引く
+      const delta = Math.atan2(shear / extract.su, span / extract.sv);
+      const theta = region.theta - delta;
+      const u = { x: Math.cos(theta), y: Math.sin(theta) };
+      region.theta = theta;
+      region.u = u;
+      region.v = { x: -u.y, y: u.x };
+      extract = extractRegion(video, crop, region, input.scale);
+    }
+    const angle = (region.theta * 180) / Math.PI;
+    const corners = (x0, y0, x1, y1) => [
+      extract.toInput(x0, y0), extract.toInput(x1, y0),
+      extract.toInput(x1, y1), extract.toInput(x0, y1)
+    ];
+    const searchBox = config.debug ? corners(0, 0, extract.width, extract.height) : null;
+
+    const columns = trimColumns(extract.gray, extract.width, extract.height);
+    if (!columns.found) {
+      if (config.debug) {
+        debugInfo = {
+          ...base, skipped: true, reason: 'edges', cells, searchBox, angle, edges: columns.edges
+        };
+      }
+      return null;
+    }
+
+    const { top, bottom } = trimRows(
+      extract.gray, extract.width, extract.height, columns.left, columns.right
+    );
+
+    const w = columns.right - columns.left + 1;
+    const h = bottom - top + 1;
+    const pad = Math.max(LOC_PAD_X, Math.round(columns.gap * LOC_PAD_GAPS));
+    const { canvas, ctx } = locateOutput;
+    const outWidth = w + pad * 2;
+    const outHeight = h + LOC_PAD_Y * 2;
+    if (canvas.width !== outWidth || canvas.height !== outHeight) {
+      canvas.width = outWidth;
+      canvas.height = outHeight;
+    }
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, outWidth, outHeight);
+    ctx.drawImage(locateExtract.canvas, columns.left, top, w, h, pad, LOC_PAD_Y, w, h);
+
+    if (config.debug) {
+      lastOutputCanvas = canvas;
+      lastOutput = {
+        width: outWidth,
+        height: outHeight,
+        pad,
+        mode: 'locate',
+        time: performance.now()
+      };
+      debugInfo = {
+        ...base,
+        skipped: false,
+        cells,
+        searchBox,
+        box: corners(columns.left, top, columns.right + 1, bottom + 1),
+        angle,
+        edges: columns.edges,
+        gap: columns.gap,
+        // 切り出した画像の横 1px が元映像の何 px にあたるか（1 なら実寸）
+        srcScale: extract.su,
+        cut: { width: w, height: h },
+        pad,
+        padY: LOC_PAD_Y,
+        out: { width: outWidth, height: outHeight }
+      };
+    }
+
+    return canvas;
+  }
+
   // --- barcode.js への差し込み口 ----------------------------------------
 
   // BarcodeScanner.configure({ frameFilter }) に渡す関数。1 フレームぶんの画像を作り、
@@ -971,10 +1528,10 @@
   // もらって解析に回す。
   //
   // frame.preview が true（検出画像の表示）のときは数えず、'ab' の入れ替えもしない。
-  // 'ab' でも見るときは必ず前処理ありのほうを出す
+  // 'ab' / 'ab-locate' でも見るときは必ず前処理ありのほうを出す
   async function filter(frame) {
     const current = currentChoice();
-    const mode = frame.preview && current === 'ab' ? AB_MODE : modeForFrame();
+    const mode = frame.preview && AB_CHOICES[current] ? AB_CHOICES[current] : modeForFrame();
 
     let canvas = null;
     let source = null;
@@ -983,6 +1540,9 @@
       const plain = frame.plain();
       canvas = plain ? captureContrastOnly(plain, mode) : null;
       source = canvas || plain;
+    } else if (mode === 'locate') {
+      canvas = captureLocated(frame.video, frame.crop);
+      source = canvas || frame.plain();
     } else {
       canvas = mode ? capture(frame.video, frame.crop, mode) : null;
       source = canvas || frame.plain();
@@ -997,7 +1557,7 @@
       recordAttempt(!!canvas, !!result);
       // 'ab' の入れ替えは解析が終わってから。途中で入れ替えると、
       // 落ちた（＝素通しに回った）フレームのぶんだけ偏る
-      if (current === 'ab') useNext = !useNext;
+      if (AB_CHOICES[current]) useNext = !useNext;
     }
 
     return result;

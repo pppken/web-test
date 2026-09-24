@@ -371,11 +371,11 @@
   // 前処理にまつわるページ側の配線はこの節にまとめてある。有効にするのは
   // 「組み立て」の setupPreprocess() の 1 行で、それを消せば前処理は一切動かない
   // （ボタンも出ない）。完全に外すときは、この節と setupPreprocess() の行、
-  // index.html の #preprocessBtn / #scanOutput / #scanWave / #scanWaveInfo とローダの 1 行、
-  // js/barcode-preprocess.js を消す。
+  // index.html の #preprocessBtn / #scanOutput / #scanWave / #scanWaveInfo / #scanLocate と
+  // ローダの 1 行、js/barcode-preprocess.js を消す。
   //
-  // 'ab' は前処理ありと無しを 1 フレームおきに交互に回して検出率を比べる計測用で、
-  // このときだけ結果ダイアログを出さない（止まると数が溜まらない）
+  // 'ab' / 'ab-locate' は前処理ありと無しを 1 フレームおきに交互に回して検出率を比べる
+  // 計測用で、このときだけ結果ダイアログを出さない（止まると数が溜まらない）
 
   // 選択値 -> ボタンに出す表示
   const PREPROCESS_LABELS = {
@@ -385,8 +385,13 @@
     trimmed: 'トリム平均',
     'contrast-stretch': 'コントラスト（stretch）',
     'contrast-clahe': 'コントラスト（CLAHE）',
-    ab: 'A/B 比較'
+    locate: '領域検出＋余白',
+    ab: 'A/B 比較',
+    'ab-locate': 'A/B 比較（領域検出）'
   };
+
+  // A/B 比較の選択値（前処理あり／なしを交互に回すもの）
+  const PREPROCESS_BENCHMARKS = ['ab', 'ab-locate'];
 
   const preprocessBtn = $('preprocessBtn');
   const previewOutput = $('scanOutput');
@@ -394,6 +399,7 @@
   const previewOutputInfo = $('scanOutputInfo');
   const previewWave = $('scanWave');
   const previewWaveInfo = $('scanWaveInfo');
+  const previewLocate = $('scanLocate');
 
   const preprocess = window.BarcodePreprocess || {
     configure() {}, filter: null, nextMode() {},
@@ -418,7 +424,7 @@
         preprocessBtn.textContent = `前処理: ${PREPROCESS_LABELS[state.choice] || state.choice}`;
         // A/B 比較の間は結果ダイアログを出さない。1 枚読めたところで止まってしまうと
         // 検出率が溜まらないため、autoPause ごと切る
-        camera.configure({ autoPause: state.choice !== 'ab' });
+        camera.configure({ autoPause: !PREPROCESS_BENCHMARKS.includes(state.choice) });
         renderEngineBadge(scanner.getEngineState());
       }
     });
@@ -431,7 +437,7 @@
   }
 
   function isBenchmarking() {
-    return preprocessEnabled && preprocess.getState().choice === 'ab';
+    return preprocessEnabled && PREPROCESS_BENCHMARKS.includes(preprocess.getState().choice);
   }
 
   function preprocessDebug() {
@@ -483,6 +489,14 @@
   // X 座標・輝度・しきい値・黒白の判定を 1 枚に重ねて出す。
   // 前処理が実際にどう効いているかは、この波形を見るのが一番早い
   function renderWave(debug) {
+    // 領域検出（locate）は集約しないので波形は無い。代わりに見つけた範囲を重ねた画像を出す
+    renderLocate(debug && debug.locate ? debug : null);
+    if (debug && debug.locate) {
+      previewWave.hidden = true;
+      previewWaveInfo.textContent = describeLocate(debug);
+      return;
+    }
+
     // コントラスト正規化のみのモード（contrast-*）は集約しないので波形は無い。何をしたかだけ出す
     if (debug && debug.contrastOnly) {
       previewWave.hidden = true;
@@ -547,6 +561,72 @@
     previewWaveInfo.textContent = describeWave(debug);
   }
 
+
+  // 領域検出（'locate'）の結果。検出枠を取り込んだ画像の上に、
+  // バーコードらしいとして拾った区画（青）と、最終的に切り出した矩形（赤）を重ねる。
+  // 左右を詰める前の探索範囲は黄色の破線で出す
+  function renderLocate(debug) {
+    if (!debug || !debug.view) {
+      previewLocate.hidden = true;
+      return;
+    }
+
+    previewLocate.hidden = false;
+    if (previewLocate.width !== debug.width || previewLocate.height !== debug.height) {
+      previewLocate.width = debug.width;
+      previewLocate.height = debug.height;
+    }
+
+    const ctx = previewLocate.getContext('2d');
+    ctx.drawImage(debug.view, 0, 0);
+
+    ctx.fillStyle = 'rgba(45, 127, 249, 0.28)';
+    for (const cell of debug.cells || []) {
+      ctx.fillRect(cell.x, cell.y, debug.cellSize, debug.cellSize);
+    }
+
+    const polygon = (points) => {
+      ctx.beginPath();
+      points.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+      ctx.closePath();
+      ctx.stroke();
+    };
+
+    const line = Math.max(2, Math.round(debug.width / 200));
+    ctx.lineWidth = line;
+    if (debug.searchBox) {
+      ctx.strokeStyle = 'rgba(255, 200, 0, 0.9)';
+      ctx.setLineDash([line * 3, line * 2]);
+      polygon(debug.searchBox);
+      ctx.setLineDash([]);
+    }
+    if (debug.box) {
+      ctx.strokeStyle = '#e33';
+      polygon(debug.box);
+    }
+  }
+
+  const LOCATE_REASONS = {
+    none: 'バーコードらしい区画がありません',
+    small: 'バーコードらしい区画の塊が小さすぎます',
+    edges: '切り出した範囲にバーのエッジが足りません'
+  };
+
+  function describeLocate(debug) {
+    if (debug.skipped) {
+      return `領域検出: 見つからず（${LOCATE_REASONS[debug.reason] || debug.reason}` +
+        (debug.edges !== undefined ? `・エッジ ${debug.edges} 本` : '') +
+        '）。素通しの画像で解析しました';
+    }
+
+    return [
+      `領域検出: 傾き ${debug.angle.toFixed(1)}°`,
+      `エッジ ${debug.edges} 本（間隔の中央値 ${debug.gap}px）`,
+      `切り出し ${debug.cut.width} × ${debug.cut.height}（横 ${debug.srcScale.toFixed(2)}x）`,
+      `余白 左右 ${debug.pad}px・上下 ${debug.padY}px → ${debug.out.width} × ${debug.out.height}`,
+      '青: 拾った区画　黄: 探索範囲　赤: 切り出した範囲'
+    ].join('　');
+  }
 
   // 灰色にした直後のコントラスト正規化で、何をしたか
   function describeContrastNormalize(info) {
