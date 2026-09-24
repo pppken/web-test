@@ -44,6 +44,17 @@
     EAN_13: 'EAN13'
   };
 
+  // 検出枠（#scanArea）の大きさ。設定画面のスライダーで選ぶ、枠（＝映像の描画サイズ）に対する %。
+  // default は index.html の #scanArea の width / height と揃えること。既定のままのときは
+  // CSS の px の上限・下限が効くので、実際の % はカメラの起動中に測った値を出す（scanAreaDefaults()）
+  const SCAN_AREA_SIZE = {
+    width: { label: '幅', min: 20, max: 100, default: 96 },
+    height: { label: '高さ', min: 5, max: 100, default: 20 }
+  };
+
+  // 検出枠の大きさの保存先。ページの見た目の話なのでライブラリではなくこちらが持つ
+  const SCAN_AREA_STORAGE_KEY = 'scanAreaSize';
+
   const $ = (id) => document.getElementById(id);
 
   const frame = $('frame');
@@ -90,6 +101,9 @@
   const settingsFormats = $('settingsFormats');
   const settingsReader = $('settingsReader');
   const settingsCloseBtn = $('settingsCloseBtn');
+  const scanAreaSizeFields = $('scanAreaSize');
+  const scanAreaInfo = $('scanAreaInfo');
+  const scanAreaResetBtn = $('scanAreaResetBtn');
 
   // どれかの js の読み込みに失敗しても、残りは動き続けるようにする。
   // 従来からある方針で、意図的なもの（片方が欠けてもカメラ単体・撮影単体は使える）
@@ -390,7 +404,8 @@
   //
   // 「設定」ボタンで開く。起動時のエンジン・有効フォーマット・ZXing-C++ のオプションは
   // barcode.js の設定で、前処理の段は barcode-preprocess.js の選択（下の「前処理」の節が
-  // #preprocessSection に作る）。どれも選んだ時点で反映・保存され、「閉じる」は閉じるだけ。
+  // #preprocessSection に作る）。検出枠の大きさだけはページの見た目の話なので、このファイルが
+  // 持って保存する（下の「検出枠の大きさ」の節）。どれも選んだ時点で反映・保存され、「閉じる」は閉じるだけ。
   // 入力欄の状態は、ライブラリからの通知（onSettingsChange / onChange）で書き戻す
   // （受け付けられなかった変更、たとえばフォーマットを全部外したときに元へ戻すため）
 
@@ -506,9 +521,135 @@
   }
 
   // エンジンと同じくカメラの状態に依らず押せる
-  settingsBtn.addEventListener('click', () => openDialog(settingsDialog));
+  settingsBtn.addEventListener('click', () => {
+    // 枠の実寸は画面の向きや映像の大きさで変わるので、開くたびに測り直す
+    renderScanAreaSettings();
+    openDialog(settingsDialog);
+  });
   settingsCloseBtn.addEventListener('click', () => settingsDialog.close());
   settingsDialog.addEventListener('close', syncScanning);
+
+  // --- 検出枠の大きさ ---------------------------------------------------
+  //
+  // 大きさは #scanArea の CSS だけで決まる。barcode.js はフレームごとに枠を測り直すので、
+  // ここで変えれば次のフレームからその範囲を解析する（ライブラリには何も知らせない）。
+  // null は既定で、index.html の #scanArea の CSS（px の上限・下限つき）に任せる。
+  // 選んだものは #scanArea.custom と CSS 変数で、px の上限・下限を外した % として当てる
+
+  let scanAreaSize = loadScanAreaSize();   // { width, height }（%）| null
+  const scanAreaInputs = new Map();        // 'width' / 'height' -> { input, output }
+
+  function validScanAreaSize(value) {
+    if (!value || typeof value !== 'object') return null;
+
+    const size = {};
+    for (const [key, range] of Object.entries(SCAN_AREA_SIZE)) {
+      const n = value[key];
+      if (!Number.isInteger(n) || n < range.min || n > range.max) return null;
+      size[key] = n;
+    }
+    return size;
+  }
+
+  function loadScanAreaSize() {
+    try {
+      return validScanAreaSize(JSON.parse(localStorage.getItem(SCAN_AREA_STORAGE_KEY)));
+    } catch (e) {
+      // private mode / file:// では localStorage が例外を投げうる。壊れた値も既定に戻す
+      return null;
+    }
+  }
+
+  function saveScanAreaSize() {
+    try {
+      if (scanAreaSize) localStorage.setItem(SCAN_AREA_STORAGE_KEY, JSON.stringify(scanAreaSize));
+      else localStorage.removeItem(SCAN_AREA_STORAGE_KEY);
+    } catch (e) {
+      // 保存できなくても、開いている間はその大きさで動く
+    }
+  }
+
+  // 既定のままのときの大きさ（%）。カメラの起動中は CSS の上限・下限込みの実寸から測る。
+  // スライダーを初めて動かしたとき、もう片方がここから始まるので、見た目が飛ばない
+  function scanAreaDefaults() {
+    const area = scanArea.getBoundingClientRect();
+    const box = frame.getBoundingClientRect();
+    const measured = { width: area.width / box.width, height: area.height / box.height };
+
+    const size = {};
+    for (const [key, range] of Object.entries(SCAN_AREA_SIZE)) {
+      // 停止中は枠を隠している（幅 0）ので、CSS に書いてある既定の % を出す
+      size[key] = area.width && box.width
+        ? Math.min(range.max, Math.max(range.min, Math.round(measured[key] * 100)))
+        : range.default;
+    }
+    return size;
+  }
+
+  function applyScanAreaSize() {
+    scanArea.classList.toggle('custom', Boolean(scanAreaSize));
+
+    if (scanAreaSize) {
+      scanArea.style.setProperty('--scan-area-width', `${scanAreaSize.width}%`);
+      scanArea.style.setProperty('--scan-area-height', `${scanAreaSize.height}%`);
+    } else {
+      scanArea.style.removeProperty('--scan-area-width');
+      scanArea.style.removeProperty('--scan-area-height');
+    }
+  }
+
+  function renderScanAreaSettings() {
+    const size = scanAreaSize || scanAreaDefaults();
+    for (const [key, { input, output }] of scanAreaInputs) {
+      input.value = String(size[key]);
+      output.value = `${size[key]}%`;
+    }
+
+    const rect = scanArea.getBoundingClientRect();
+    const actual = rect.width
+      ? `画面上 ${Math.round(rect.width)} x ${Math.round(rect.height)} px`
+      : '実寸はカメラの起動中に出ます';
+    scanAreaInfo.textContent = scanAreaSize ? actual : `既定 · ${actual}`;
+    scanAreaResetBtn.disabled = !scanAreaSize;
+  }
+
+  function buildScanAreaSettings() {
+    for (const [key, range] of Object.entries(SCAN_AREA_SIZE)) {
+      const row = document.createElement('div');
+      row.className = 'settings-row range';
+
+      const label = document.createElement('label');
+      label.textContent = range.label;
+
+      const input = document.createElement('input');
+      input.type = 'range';
+      input.min = String(range.min);
+      input.max = String(range.max);
+      input.step = '1';
+      input.setAttribute('aria-label', `検出枠の${range.label}`);
+
+      const output = document.createElement('output');
+
+      // 動かしている間も枠に当てる（ダイアログの背後に枠が透けて見える）。保存は指を離したとき
+      input.addEventListener('input', () => {
+        scanAreaSize = { ...(scanAreaSize || scanAreaDefaults()), [key]: Number(input.value) };
+        applyScanAreaSize();
+        renderScanAreaSettings();
+      });
+      input.addEventListener('change', saveScanAreaSize);
+
+      row.append(label, input, output);
+      scanAreaSizeFields.append(row);
+      scanAreaInputs.set(key, { input, output });
+    }
+
+    scanAreaResetBtn.addEventListener('click', () => {
+      scanAreaSize = null;
+      applyScanAreaSize();
+      saveScanAreaSize();
+      renderScanAreaSettings();
+    });
+  }
 
   // --- 前処理（js/barcode-preprocess.js。検討中）--------------------------
   //
@@ -989,6 +1130,10 @@
 
   // configure() が設定の初期状態を流してくるので、入力欄はその前に作っておく
   buildSettings();
+
+  // 保存してある検出枠の大きさは、カメラが起動する（枠が出る）前に当てておく
+  buildScanAreaSettings();
+  applyScanAreaSize();
 
   scanner.configure({
     scanArea,

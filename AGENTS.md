@@ -927,13 +927,25 @@ DOM も CSS のクラス名も知らない（唯一の例外が camera.js の `m
   置いてあり、ボタンが何行に折り返しても常にその上の行に出る。
   `#controls` は `pointer-events: none` なので、触る箱（`#brightnessControl`）だけ戻している。
 - 「設定」ボタン（`#settingsBtn`）はダイアログ `#settings` を開く（ラベルは固定）。カメラの状態に依らず押せる。
-  中身は起動時のエンジン（`#settingsEngine`）・前処理（`#preprocessSection`。`setupPreprocess()` を
-  通ったときだけ出す）・有効フォーマット（`#settingsFormats`）・ZXing-C++ のオプション（`#settingsReader`）。
-  HTML には入れ物しか無く、入力欄は `buildSettings()` と `buildPreprocessPanel()` が作る。
+  中身は起動時のエンジン（`#settingsEngine`）・検出枠の大きさ（`#scanAreaSize`）・前処理（`#preprocessSection`。
+  `setupPreprocess()` を通ったときだけ出す）・有効フォーマット（`#settingsFormats`）・ZXing-C++ のオプション（`#settingsReader`）。
+  HTML には入れ物しか無く、入力欄は `buildSettings()` / `buildScanAreaSettings()` / `buildPreprocessPanel()` が作る。
   **選んだ時点で反映・保存される**（「閉じる」は閉じるだけ）。入力欄の状態はライブラリからの通知
   （`onSettingsChange` → `renderSettings()`、前処理は `onChange` → `renderPreprocess()`）で書き戻すので、
   受け付けられなかった変更（フォーマットを全部外す・`minLineCount` に 0 など）は元に戻る。
   以前は「前処理」ボタンで `#controls` の中にパネルを開閉していたが、この設定画面に移した。
+- **検出枠（`#scanArea`）の大きさ**は設定画面の幅・高さのスライダーで選ぶ（映像の描画サイズに対する %）。
+  **ページの見た目の話なので、持つのも保存するのも `app.js`**（`localStorage['scanAreaSize']`、
+  JSON `{ width, height }`。「既定に戻す」でキーごと消す）。ライブラリには何も知らせない。
+  barcode.js はフレームごとに枠を `getBoundingClientRect()` で測り直すので、CSS を変えれば次のフレームから効く。
+  - 既定（保存なし）は index.html の `#scanArea` の CSS のまま（幅 96%・最大 624px、高さ 20%・75〜160px）。
+    選んだときは `#scanArea.custom` と CSS 変数（`--scan-area-width` / `--scan-area-height`）で当て、
+    **px の上限・下限は外す**（残すと大きい画面で広げられない）。
+    `app.js` の `SCAN_AREA_SIZE` の `default` は、この CSS と揃えておくこと。
+  - 既定のままスライダーを初めて動かしたとき、もう片方は**いまの実寸を % に直した値**から始める
+    （`scanAreaDefaults()`）。CSS の既定の % から始めると、px の上限で抑えられていたぶん枠が飛ぶ。
+  - 枠を大きくすると `MAX_SCAN_SIDE`（640）の縮小が強く掛かり、細いバーが潰れやすくなる。
+    検出画像ダイアログで縮小後の画像を見ること。
 
 ## vendor/
 
@@ -983,7 +995,8 @@ CameraController.configure({
 - `vendor/` は `js/vendor/` に置けば設定は要らない。このリポジトリのように
   別の場所へ置くなら `configure({ vendorPath })` で指す（`app.js` の実例を参照）。
   `.wasm` を `application/wasm` で返すサーバであることも確認すること。
-- **`localStorage` のキー**（`cameraFacingMode` / `barcodeSettings` / `barcodePreprocess`）はホスト側と
+- **`localStorage` のキー**（`cameraFacingMode` / `barcodeSettings` / `barcodePreprocess`。
+  `scanAreaSize` は app.js のものなので付いてこない）はホスト側と
   ぶつかりうるので、`storageKey` で名前空間を付けるか `null` で保存を切る。
 - **読み取るフォーマットを変えるなら `configure({ formats })`。** 1 件につき
   `{ native, zxing, zxingCpp, quagga }` の 4 つとも書くこと（理由は `FORMATS` の項）。

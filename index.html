@@ -100,6 +100,17 @@
       pointer-events: none;
     }
 
+    /* 設定画面で大きさを選んだとき（app.js の applyScanAreaSize()）。
+       値は枠（＝映像の描画サイズ）に対する % で、上の既定の px の上限・下限は外す。
+       上限を残すと、大きいスマートフォンやタブレットで広げられないため */
+    #scanArea.custom {
+      width: var(--scan-area-width);
+      max-width: none;
+      height: var(--scan-area-height);
+      min-height: 0;
+      max-height: none;
+    }
+
     /* 停止中はプレビューが無いので枠も隠す */
     #frame.idle #scanArea {
       display: none;
@@ -315,8 +326,8 @@
 
     /* --- 設定 --- */
 
-    /* 「設定」ボタンで開くダイアログ。起動時のエンジン・前処理・有効フォーマット・
-       ZXing-C++ のオプションをまとめて選ぶ。中身の入力欄は app.js が作る */
+    /* 「設定」ボタンで開くダイアログ。起動時のエンジン・検出枠の大きさ・前処理・
+       有効フォーマット・ZXing-C++ のオプションをまとめて選ぶ。中身の入力欄は app.js が作る */
     #settings {
       width: 100%;
       max-width: min(440px, calc(100vw - 32px));
@@ -402,6 +413,38 @@
 
     .settings-row input[type="number"] {
       width: 5em;
+    }
+
+    /* 検出枠の大きさのスライダー。名前は詰めて、スライダーに幅を回す */
+    .settings-row.range label {
+      flex: 0 0 auto;
+      min-width: 3em;
+      cursor: default;
+    }
+
+    .settings-row input[type="range"] {
+      flex: 1;
+      min-width: 0;
+      accent-color: rgba(45, 127, 249, 1);
+    }
+
+    .settings-row output {
+      min-width: 4ch;
+      font-size: 13px;
+      text-align: right;
+      color: rgba(255, 255, 255, 0.75);
+    }
+
+    /* 検出枠の実寸の読み値と「既定に戻す」 */
+    #scanAreaInfo {
+      flex: 1;
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.75);
+    }
+
+    .settings-row button {
+      padding: 5px 12px;
+      font-size: 13px;
     }
 
     /* 前処理の段と A/B 比較の間の区切り */
@@ -684,7 +727,7 @@
         <button id="scanPreviewBtn" disabled>検出画像</button>
         <!-- ラベルは app.js が現在の選択で上書きする -->
         <button id="engineBtn">エンジン: 自動</button>
-        <!-- 押すと #settings（起動時のエンジン・前処理・有効フォーマット・ZXing-C++ のオプション）を開く -->
+        <!-- 押すと #settings（起動時のエンジン・検出枠の大きさ・前処理・有効フォーマット・ZXing-C++ のオプション）を開く -->
         <button id="settingsBtn" type="button" aria-controls="settings">設定</button>
         <!-- ラベルは app.js が現在の倍率で上書きする -->
         <button id="zoomBtn" disabled>ズーム</button>
@@ -733,6 +776,17 @@
           <select id="settingsEngine" aria-label="起動時のエンジン"></select>
         </div>
         <p class="settings-note">選ぶとすぐに切り替わり、次に開いたときもこのエンジンで始まります。「エンジン」ボタンでの切り替えはその場限りです。</p>
+      </fieldset>
+
+      <!-- 検出枠（#scanArea）の大きさ。スライダーは app.js の buildScanAreaSettings() が作る -->
+      <fieldset class="settings-group">
+        <legend>検出枠の大きさ（映像に対する %）</legend>
+        <div id="scanAreaSize"></div>
+        <div class="settings-row">
+          <span id="scanAreaInfo"></span>
+          <button id="scanAreaResetBtn" type="button">既定に戻す</button>
+        </div>
+        <p class="settings-note">既定は幅 96%（最大 624px）・高さ 20%（75〜160px）です。動かすと px の上限・下限は外れます。枠を大きくすると、解析の前に長辺 640px まで縮めるぶん細いバーが潰れやすくなります。</p>
       </fieldset>
 
       <!-- 前処理（検討中）。app.js の setupPreprocess() が通ったときだけ出す -->
