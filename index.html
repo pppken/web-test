@@ -459,6 +459,33 @@
       color: rgba(255, 255, 255, 0.55);
     }
 
+    /* 前処理の出力画像（検証用）。横に 2600px 前後と長いので、縮めずに等倍で出して
+       横スクロールで見る。幅に合わせて縮めると、細バーが間引かれて本当の姿が分からない */
+    #scanOutput {
+      margin-top: 12px;
+    }
+
+    #scanOutputBox {
+      overflow-x: auto;
+      border-radius: 10px;
+      background:
+        repeating-conic-gradient(rgba(255, 255, 255, 0.12) 0% 25%, transparent 0% 50%) 0 0 / 16px 16px;
+    }
+
+    #scanOutputImage {
+      display: block;
+      max-width: none;
+      image-rendering: pixelated;
+    }
+
+    #scanOutputInfo {
+      margin: 8px 0 0;
+      font-size: 11px;
+      line-height: 1.7;
+      text-align: center;
+      color: rgba(255, 255, 255, 0.55);
+    }
+
     /* 集約した 1 次元の輝度波形（前処理の検証用）。
        横に長いので、そのまま幅いっぱいに潰して見る */
     #scanWave {
@@ -569,6 +596,11 @@
     <div id="scanPreviewBody">
       <img id="scanPreviewImage" alt="">
       <p id="scanPreviewInfo"></p>
+      <!-- 前処理が最後に解析へ渡した画像。前処理を選んでいるときだけ出す。app.js の renderPreprocessOutput() が入れる -->
+      <div id="scanOutput" hidden>
+        <div id="scanOutputBox"><img id="scanOutputImage" alt=""></div>
+        <p id="scanOutputInfo"></p>
+      </div>
       <!-- 前処理を選んでいるときだけ出す。app.js の renderWave() が描く -->
       <canvas id="scanWave" hidden></canvas>
       <p id="scanWaveInfo"></p>

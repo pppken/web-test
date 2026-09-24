@@ -332,6 +332,8 @@
   // 解析に渡しているのと同じ画像を、そのままダイアログに出す。
   // 枠のズレや余白の付き方、縮小後にバーが潰れていないかをその場で確認する
   async function showPreview() {
+    // 前処理の出力は capturePreview() より先に取る（あちらが前処理の画像を作り直すため）
+    const output = preprocessOutput();
     const preview = await scanner.capturePreview();
     if (!preview) {
       setLabel(previewBtn, '取得できません');
@@ -348,6 +350,7 @@
     // 解析に渡すのと同じ画素をそのまま見たいので、非可逆な形式にはしない
     previewImage.src = preview.canvas.toDataURL('image/png');
 
+    renderPreprocessOutput(output);
     renderWave(debug);
 
     openDialog(previewDialog);
@@ -359,6 +362,7 @@
   previewDialog.addEventListener('close', () => {
     // data URL を抱えたままにしない
     previewImage.removeAttribute('src');
+    previewOutputImage.removeAttribute('src');
     syncScanning();
   });
 
@@ -367,7 +371,7 @@
   // 前処理にまつわるページ側の配線はこの節にまとめてある。有効にするのは
   // 「組み立て」の setupPreprocess() の 1 行で、それを消せば前処理は一切動かない
   // （ボタンも出ない）。完全に外すときは、この節と setupPreprocess() の行、
-  // index.html の #preprocessBtn / #scanWave / #scanWaveInfo とローダの 1 行、
+  // index.html の #preprocessBtn / #scanOutput / #scanWave / #scanWaveInfo とローダの 1 行、
   // js/barcode-preprocess.js を消す。
   //
   // 'ab' は前処理ありと無しを 1 フレームおきに交互に回して検出率を比べる計測用で、
@@ -383,12 +387,16 @@
   };
 
   const preprocessBtn = $('preprocessBtn');
+  const previewOutput = $('scanOutput');
+  const previewOutputImage = $('scanOutputImage');
+  const previewOutputInfo = $('scanOutputInfo');
   const previewWave = $('scanWave');
   const previewWaveInfo = $('scanWaveInfo');
 
   const preprocess = window.BarcodePreprocess || {
     configure() {}, filter: null, nextMode() {},
-    getState: () => ({ choice: 'off', debug: null, stats: null })
+    getState: () => ({ choice: 'off', debug: null, stats: null }),
+    getLastOutput: () => null
   };
 
   let preprocessEnabled = false;
@@ -423,6 +431,34 @@
     if (!preprocessEnabled) return null;
     const state = preprocess.getState();
     return state.choice === 'off' ? null : state.debug;
+  }
+
+  // 前処理が最後に解析へ渡した画像（の写し）。barcode.js を通さず前処理から直接もらう。
+  // 検出画像のボタンを押したときに解析の途中だと、capturePreview() は前処理に回さず
+  // 素通しの画像を返すので、そちらだけでは前処理の出力が見られないことがある
+  function preprocessOutput() {
+    if (!preprocessEnabled || preprocess.getState().choice === 'off') return null;
+    return preprocess.getLastOutput();
+  }
+
+  function renderPreprocessOutput(output) {
+    if (!output) {
+      previewOutput.hidden = true;
+      previewOutputImage.removeAttribute('src');
+      previewOutputInfo.textContent = '';
+      return;
+    }
+
+    previewOutput.hidden = false;
+    // 解析に渡したのと同じ画素を見たいので、非可逆な形式にはしない
+    previewOutputImage.src = output.canvas.toDataURL('image/png');
+
+    const age = ((performance.now() - output.time) / 1000).toFixed(1);
+    const what = output.preview ? '前回の表示用に作った画像' : '解析へ渡した画像';
+    previewOutputInfo.textContent =
+      `前処理の出力（${PREPROCESS_LABELS[output.mode] || output.mode}・${age} 秒前に${what}）` +
+      `　${output.width} × ${output.height}（うち左右 ${output.pad}px は白の余白）` +
+      '　等倍表示。横にスクロールできます';
   }
 
   // A/B 比較の途中経過。前処理あり／なしそれぞれの「解析した回数のうち読めた割合」

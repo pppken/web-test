@@ -17,6 +17,7 @@
   //   });
   //   BarcodeScanner.configure({ frameFilter: BarcodePreprocess.filter });  // 有効にするのはこの 1 行
   //   BarcodePreprocess.setMode(choice) / nextMode() / getState() / getStats() / resetStats()
+  //   BarcodePreprocess.getLastOutput()   // 最後に作った出力画像の写し（検証用。debug のときだけ）
   //
   // frameFilter の約束ごと（受け取る frame の中身）は barcode.js の「差し込みの前処理」を参照。
   // このファイルも DOM を探さない。映像と切り出し範囲はフレームごとに barcode.js から受け取る。
@@ -44,14 +45,17 @@
                                   // 1 段が既に元の十数ライン分の平均になっている
   const PRE_SCALE = 2;            // 集約した波形を横に引き伸ばす倍率。
                                   // エッジ位置の分解能が元画像の 1/PRE_SCALE px になる
-  const PRE_OUT_ROWS = 2;         // 出力画像の行数。**2 でなければならない理由がある**:
+  const PRE_OUT_ROWS = 100;       // 出力画像の行数（全行が同じ内容）。
+                                  // 以前は ZXing-C++ に合わせた最小の 2 行にしていたが、
+                                  // 実機の ZXing-C++ で検出しなかったため、高さ不足を疑って 100 に上げて検証中。
+                                  // 2 行にしていた理由は次のとおりで、戻すかどうかはこれを踏まえて決める:
                                   //   - ZXing-C++ の minLineCount は既定 2。1 行では
                                   //     デコードできても最後に捨てられる（ODReader.cpp）
-                                  //   - 3 行以上あると LumImagePyramid が縮小層を作り
-                                  //     （min(w,h) >= downscaleFactor=3）、細バーを潰した
-                                  //     層を毎フレーム無駄に走査する
-                                  //   - 2 行なら tryRotate の走査も width<3 で即座に打ち切られる
-                                  // 全行が同じ内容なので、2 行で minLineCount はちょうど満たされる
+                                  //   - tryDownscale が true だと、3 行以上で LumImagePyramid が縮小層を作り
+                                  //     （min(w,h) >= downscaleFactor=3）、細バーを潰した層まで走査する
+                                  //     （いまの ZXING_CPP_OPTIONS は false なので効かない）
+                                  //   - 2 行なら tryRotate の走査も width<3 で即座に打ち切られる。
+                                  //     100 行だと回転側でも走査するぶん、1 回の解析が重くなる
   const PRE_PAD_X = 40;           // 出力画像の左右に足す白の幅（出力側の px）
   const PRE_MAX_SHEAR = 24;       // 傾き補正で許す上下のずれ（入力側の px）。
                                   // ROI の高さが 500px なら約 2.7 度ぶん
@@ -135,6 +139,7 @@
   let choice = null;       // 選択値。初めて要るときに保存値から復元する
   let useNext = true;      // 'ab' のとき、次のフレームで前処理を使うか
   let debugInfo = null;    // 検証用（波形・しきい値・最細バーの実測）
+  let lastOutput = null;   // 検証用。output.canvas にいま入っている画像の素性（getLastOutput）
 
   // 前処理あり／なしの検出率。'ab' のときに突き合わせる
   const stats = {
@@ -200,6 +205,7 @@
     saveChoice(value);
     useNext = true;
     debugInfo = null;
+    lastOutput = null;
     resetStats();   // 中で onChange を出す
   }
 
@@ -219,6 +225,29 @@
       debug: debugInfo,
       stats: getStats()
     };
+  }
+
+  // 前処理が最後に作った出力画像（＝解析に渡した画像）の写しを返す（検証用）。
+  // 写しを作るのは呼ばれたときだけで、毎フレームは何もしない。
+  //
+  // barcode.js の capturePreview() は、解析の途中に呼ばれると前処理に回さず素通しの
+  // 画像を返すうえ、前処理に回ったときは output.canvas を作り直してしまう。
+  // 最後に解析へ渡した画像を見たいなら、**capturePreview() より先に**呼ぶこと。
+  //
+  // 返すのは { canvas, width, height, pad, mode, time, preview } | null。
+  // preview が true なら、前回の検出画像の表示用に作ったもので、解析には渡していない。
+  // time は performance.now() の時刻。前処理を見送ったフレーム（振幅不足）では
+  // 作り直さないので、古い画像のことがある（time で見分ける）
+  function getLastOutput() {
+    if (!config.debug || !lastOutput) return null;
+
+    const source = output.canvas;
+    const canvas = document.createElement('canvas');
+    canvas.width = source.width;
+    canvas.height = source.height;
+    canvas.getContext('2d').drawImage(source, 0, 0);
+
+    return { canvas, ...lastOutput };
   }
 
   // --- 検出率の集計 -----------------------------------------------------
@@ -631,6 +660,14 @@
     const canvas = buildImage(scaled, thresholdMode === 'none' ? null : scaledThreshold);
 
     if (config.debug) {
+      lastOutput = {
+        width: canvas.width,
+        height: canvas.height,
+        pad: PRE_PAD_X,
+        mode,
+        time: performance.now()
+      };
+
       // 最細バーの実測は元の尺（＝引き伸ばす前）で出す。
       // otsu / adaptive を選んでいなければ、測るためだけに otsu を 1 本引く
       const hasThreshold = !!threshold.curve || threshold.value !== null;
@@ -676,6 +713,8 @@
     const current = currentChoice();
     const mode = frame.preview && current === 'ab' ? AB_MODE : modeForFrame();
     const canvas = mode ? capture(frame.video, frame.crop, mode) : null;
+    // 検出画像の表示用に作ったもの（解析には渡していない）かどうか。getLastOutput で見分ける
+    if (canvas && lastOutput) lastOutput.preview = !!frame.preview;
     const source = canvas || frame.plain();
     if (!source) return null;
 
@@ -714,6 +753,7 @@
     getState,
     getChoices: () => CHOICES.slice(),
     getStats,
-    resetStats
+    resetStats,
+    getLastOutput
   };
 })();

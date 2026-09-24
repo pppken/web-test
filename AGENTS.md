@@ -48,7 +48,7 @@ vendor/      第三者ライブラリ（無改変で同梱）
 | `barcode.js` | `window.BarcodeScanner = { configure, start, stop, detect, setEngine, nextEngine, capturePreview, getEngineState, getEngineChoices, isActive }` |
 | `barcode-worker.js` | Worker として読まれたときは何も生やさない（`onmessage` だけ）。メインスレッドに読まれたときは `window.BarcodeWorkerCore = { createDecoder }` |
 | `barcode-quagga2.js` | `window.BarcodeQuagga2 = { createDecoder }` |
-| `barcode-preprocess.js` | `window.BarcodePreprocess = { configure, filter, setMode, nextMode, getState, getChoices, getStats, resetStats }` |
+| `barcode-preprocess.js` | `window.BarcodePreprocess = { configure, filter, setMode, nextMode, getState, getChoices, getStats, resetStats, getLastOutput }` |
 | `photo.js` | `window.PhotoCapture = { configure, attach, detach, capture, isActive, isBusy }` |
 | `app.js` | なし（上記のライブラリを組み合わせる側） |
 
@@ -509,7 +509,7 @@ barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけ
   `setupPreprocess()` を通ったかを見ている）。
 - **完全に外すなら** 次の 4 か所。barcode.js の `frameFilter` は既定 `null` の口なので残してよい。
   - `js/barcode-preprocess.js`
-  - `index.html` のローダの 1 行と、`#preprocessBtn` / `#scanWave` / `#scanWaveInfo`
+  - `index.html` のローダの 1 行と、`#preprocessBtn` / `#scanOutput` / `#scanWave` / `#scanWaveInfo`
   - `app.js` の「前処理」の節と `setupPreprocess();` の行
   - `app.js` の `isBenchmarking()` / `preprocessDebug()` / `formatStats()` の呼び出し元
     （バッジ・`onDetect`・検出画像ダイアログ。いずれも「前処理」とコメントしてある）
@@ -548,16 +548,19 @@ barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけ
 4. 振幅を 0〜255 に伸ばす（`normalize()`）。ZXing-C++ は 1 行のヒストグラムで
    山を 2 つ探し、間隔が 16 階調未満だとその行を捨てる（`EstimateBlackPoint` が -1）。
 5. **横に `PRE_SCALE` = 2 倍へ線形補間で引き伸ばす**（`upsample()`）。
-6. `PRE_OUT_ROWS` = 2 行の画像に起こして解析へ渡す。
+6. `PRE_OUT_ROWS` = 100 行の画像に起こして解析へ渡す（全行が同じ内容）。
 
 **5 は 3 とセットで、片方だけでは効かない。** 集約で得られるのは「エッジが x と x+1 の
 どこにあるか」というサブピクセルの情報で、そのまま出すと run length が整数に丸められて
 元に戻る。最近傍で伸ばしても同じなので、**必ず線形補間**にすること。
 
-**`PRE_OUT_ROWS` が 2 なのには理由が 3 つある**（増やさないこと）。
-`minLineCount`（既定 2）を満たす最小の行数であり、3 行以上あると `LumImagePyramid` が
-縮小層を作って（`min(w, h) >= downscaleFactor` = 3）細バーを潰した層を毎フレーム
-無駄に走査し、2 行なら `tryRotate` 側の走査も `width < 3` で即座に打ち切られる。
+**`PRE_OUT_ROWS` は検証のため 2 から 100 に上げてある。** 実機の ZXing-C++ で
+前処理ありだと検出しなかったので、高さ不足を疑っている。2 行にしていた理由は次の 3 つで、
+戻すかどうかはこれを踏まえて決めること。
+`minLineCount`（既定 2）を満たす最小の行数であること。`tryDownscale` が true だと、
+3 行以上で `LumImagePyramid` が縮小層を作り（`min(w, h) >= downscaleFactor` = 3）、細バーを
+潰した層まで走査すること（いまの `ZXING_CPP_OPTIONS` は false なので効かない）。2 行なら
+`tryRotate` 側の走査も `width < 3` で即座に打ち切られること（100 行ではそのぶん重くなる）。
 
 合成した荒れ印字（module 3px・傾き 1.2 度・縁のゆらぎ ±1px・ドット抜けあり、
 ZXing-C++ で n=90）での実測は次のとおり。**荒れていないラベルではどれも 100% で、
@@ -603,6 +606,14 @@ module を 2px にすると、前処理あり・なしのどれも 0% になっ�
 
 検証用の表示は `debug`（既定 true）で切る。切ると波形も最細バーの実測も
 出なくなる代わりに、ROI のコピー以外は何も残さない。
+
+**前処理の出力画像は `getLastOutput()` で直接もらう**（「検出画像」ダイアログの
+`#scanOutput`。等倍・横スクロールで出す）。barcode.js の `capturePreview()` は解析の途中に
+呼ばれると前処理に回さず素通しの画像を返すので、そちらだけでは前処理の出力を見られない
+ことがあるため。写しを作るのは呼ばれたときだけで、毎フレームの負担は無い。
+`capturePreview()` が前処理の画像を作り直してしまうので、**app.js は必ずその前に呼ぶ**。
+振幅不足で見送ったフレームでは作り直さないので、古い画像のことがある（`time` で分かる）。
+`debug` が false なら `null` を返す。
 
 #### 検出率の比較（A/B）
 
