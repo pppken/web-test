@@ -966,6 +966,7 @@ wasm の中身の ZXing-C++ 本体は Apache-2.0（全文は `vendor/zxing-LICEN
 
 **`js/` フォルダと `vendor/` をコピーし、`app.js` に相当する配線を呼び出し側で書く。**
 `js/` の中身はこのページに依存しない。`index.html` と `app.js` がその実例になっている。
+カメラ起動とバーコード読み取りだけを持っていく手順とコード例（HTML 込み）は `PORTING.md` にまとめてある。
 
 ```js
 BarcodeScanner.configure({
