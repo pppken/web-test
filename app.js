@@ -406,8 +406,7 @@
     preprocessEnabled = true;
 
     preprocess.configure({
-      // 集約の前に段ごとに二値化する（検証中）。false で従来どおり灰色のまま集約する。
-      // true のときの集約は、「前処理」ボタンの選択に依らず平均になる
+      // 集約・伸び縮みのあとに二値化する（検証中）。false で従来どおり灰色のまま渡す
       binarize: true,
       onChange: (state) => {
         // 「前処理」ボタンも常に選択を表す。エンジンと同じくカメラの状態に依らず押せる
@@ -533,12 +532,10 @@
     previewWaveInfo.textContent = describeWave(debug);
   }
 
-  // 実際に使った集約の仕方。二値化したときは選択に依らず平均になるので、そう書く
+  // 集約の仕方と、そのあとに二値化したかどうか
   function describeAggregate(info) {
-    const label = (mode) => PREPROCESS_LABELS[mode] || mode;
-    return info.binarize
-      ? `二値化 → ${label(info.aggregateMode)}`
-      : label(info.aggregateMode || info.mode);
+    const label = PREPROCESS_LABELS[info.mode] || info.mode;
+    return info.binarize ? `${label} → 二値化` : label;
   }
 
   // 最細バー／最細スペースは、実際の module width が何 px あるかの答えそのもの。
