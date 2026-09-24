@@ -8,6 +8,7 @@
   //
   //   BarcodePreprocess.configure({
   //     mode,          // 'off' | 'mean' | 'median' | 'trimmed' | 'ab'（既定は保存値。無ければ 'median'）
+  //     binarize,      // 集約の前に段ごとに二値化する（既定 false）。true のときの集約は常に平均
   //     threshold,     // 集約後の二値化。'none'（既定）| 'otsu' | 'adaptive'
   //     smooth,        // 集約後に 3 タップの平滑化を掛ける（既定 false）
   //     shear,         // 傾き（シアー）の補正を入れる（既定 true）
@@ -61,6 +62,12 @@
                                   // ROI の高さが 500px なら約 2.7 度ぶん
   const PRE_TRIM = 0.25;          // trimmed mean で上下から捨てる割合
   const PRE_ADAPTIVE_WINDOW = 48; // adaptive しきい値の窓幅（集約後・引き伸ばし前の px）
+  const PRE_BIN_WINDOW = 48;      // 集約前の二値化（binarize）で、しきい値を決める窓の幅（入力側の px）。
+                                  // 太いバー（4 モジュール）が収まり、かつラベルの縁の灰色が
+                                  // バーの暗さに引きずられない程度の幅
+  const PRE_BIN_MIN_RATIO = 0.25; // 集約前の二値化で、窓の中の明暗差がその段全体の明暗差の
+                                  // この割合に満たなければ、黒白を割らずに白とみなす
+                                  // （無地の場所のノイズを黒に拾わないため）
   const PRE_MIN_CONTRAST = 16;    // 集約した波形の振幅がこれ未満なら前処理を諦めて
                                   // 素通しの経路に落ちる（枠内にバーコードが無い・
                                   // バーが横向きで縦集約に耐えない、のいずれか）
@@ -102,6 +109,7 @@
 
   const config = {
     mode: null,
+    binarize: false,
     threshold: 'none',
     smooth: false,
     shear: true,
@@ -219,6 +227,7 @@
     return {
       choice: current,
       mode: current === 'ab' ? AB_MODE : current,
+      binarize: !!config.binarize,
       threshold: config.threshold,
       smooth: !!config.smooth,
       shear: !!config.shear,
@@ -383,6 +392,78 @@
     // 誤差の範囲で動いただけのときに動かさない。はっきり良くなったときだけ採用する
     if (bestScore > zeroScore * 0.8) return 0;
     return best;
+  }
+
+  // 集約の前に、段ごとに黒（0）と白（255）へ割る（binarize が true のとき）。
+  //
+  // 灰色のまま集約して normalize() で伸ばすと、ラベルの縁や台紙の灰色が中途半端な
+  // 暗さのまま残り、ZXing-C++ の行ごとのヒストグラム（GlobalHistogramBinarizer）が
+  // 「黒・灰・白」の 3 つの山のどこで割るか次第で、灰色ごと黒に倒れることがある。
+  // そうなるとクワイエットゾーンが消えて読めない。こちらで先に割っておけば、
+  // しきい値の決め方をライブラリ任せにしなくて済む。
+  //
+  // しきい値は x ごとに、前後 PRE_BIN_WINDOW の窓の中の最小と最大の中点
+  // （平均ではない。黒白の面積比が模様によって偏るため）。窓の中の明暗差が小さい
+  // 場所（無地の余白・台紙の真ん中）は割らずに白とみなす。
+  //
+  // 割ったあとの集約は**平均でなければならない**（capture() が mode に依らず平均にする）。
+  // 0/255 の中央値は多数決になって、エッジの位置が 1px 単位に丸められる。
+  // 平均なら「その x で何割の段が黒か」になり、縁のがたつきがそのまま
+  // サブピクセルのエッジ位置として残る（引き伸ばしで効くのはこの情報）
+  function binarizeRows(gray, width, height) {
+    const out = new Uint8Array(width * height);
+    const lo = new Uint8Array(width);
+    const hi = new Uint8Array(width);
+    const queue = new Int32Array(width);
+    const half = PRE_BIN_WINDOW >> 1;
+
+    for (let y = 0; y < height; y++) {
+      const row = y * width;
+
+      let rowMin = 255;
+      let rowMax = 0;
+      for (let x = 0; x < width; x++) {
+        const v = gray[row + x];
+        if (v < rowMin) rowMin = v;
+        if (v > rowMax) rowMax = v;
+      }
+      const floor = Math.max(PRE_MIN_CONTRAST, (rowMax - rowMin) * PRE_BIN_MIN_RATIO);
+
+      slidingExtreme(gray, row, width, half, lo, queue, false);
+      slidingExtreme(gray, row, width, half, hi, queue, true);
+
+      for (let x = 0; x < width; x++) {
+        const v = gray[row + x];
+        const black = hi[x] - lo[x] >= floor && v * 2 < lo[x] + hi[x];
+        out[row + x] = black ? 0 : 255;
+      }
+    }
+
+    return out;
+  }
+
+  // 1 段ぶんの、窓 [x - half, x + half] の最小（max が true なら最大）。
+  // 単調キューで 1 段あたり O(width)。窓幅ぶん素直に回すと 1 フレームで
+  // 32 段 x 1280 x 49 回になるので、こちらにしてある
+  function slidingExtreme(src, offset, width, half, out, queue, max) {
+    let head = 0;
+    let tail = 0;
+    let next = 0;
+
+    for (let x = 0; x < width; x++) {
+      const right = Math.min(width - 1, x + half);
+      while (next <= right) {
+        const v = src[offset + next];
+        while (tail > head) {
+          const last = src[offset + queue[tail - 1]];
+          if (max ? last > v : last < v) break;
+          tail--;
+        }
+        queue[tail++] = next++;
+      }
+      while (queue[head] < x - half) head++;
+      out[x] = src[offset + queue[head]];
+    }
   }
 
   // 各 x について、高さ方向の輝度を 1 つにまとめる。
@@ -634,14 +715,20 @@
     const rgba = frameBuffer.ctx.getImageData(0, 0, width, height).data;
     const gray = toGray(rgba, width * height);
 
+    // 傾きは二値化の前の灰色で測る（割ってしまうと、段ごとのずれを突き合わせる材料が痩せる）
     const shear = config.shear ? estimateShear(gray, width, height) : 0;
-    let profile = aggregate(gray, width, height, mode, shear);
+    // 二値化したときの集約は常に平均（理由は binarizeRows() を参照）
+    const binarize = !!config.binarize;
+    const aggregateMode = binarize ? 'mean' : mode;
+    let profile = aggregate(
+      binarize ? binarizeRows(gray, width, height) : gray, width, height, aggregateMode, shear
+    );
 
     const contrast = normalize(profile);
     if (!contrast.ok) {
       // 枠内にバーコードが無いか、バーが横向きで縦の集約に耐えない
       if (config.debug) {
-        debugInfo = { mode, width, height, shear, contrast, skipped: true };
+        debugInfo = { mode, aggregateMode, binarize, width, height, shear, contrast, skipped: true };
       }
       return null;
     }
@@ -665,6 +752,8 @@
         height: canvas.height,
         pad: PRE_PAD_X,
         mode,
+        aggregateMode,
+        binarize,
         time: performance.now()
       };
 
@@ -676,6 +765,8 @@
 
       debugInfo = {
         mode,
+        aggregateMode,
+        binarize,
         thresholdMode,
         width,
         height,
