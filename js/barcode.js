@@ -150,16 +150,31 @@
   // binarizer に渡せる値（同梱の js が持つ一覧と同じ並び）
   const ZXING_CPP_BINARIZERS = ['LocalAverage', 'GlobalHistogram', 'FixedThreshold', 'BoolCast'];
 
-  // 解析に回す画像の最大辺。切り出したあとの処理（getImageData →
-  // グレースケール変換 → 二値化 → デコード）はすべて画素数に比例するので、
-  // ここを絞るのが一番素直に効く。
-  //
-  // 900 では大半の端末で切り出しサイズを下回らず、実質的に無効だった
-  // （例: 1080p 縦持ちの iPhone で切り出しは 864x768）。640 まで落としても
-  // JAN（95 モジュール）や短めの CODE128 ならバーの太さは十分残る。
-  // 桁数の多い CODE128（20 桁で 250 モジュール程度）は細バーが 2〜3px まで
-  // 痩せるので、読めないときはここを戻して実機で見ること
+  // 検出枠がこれより横長（幅 / 高さ）なら「横向きのバーコード専用」として扱う。
+  // 縦向きのバーコードは枠の高さに収まらないので、90 度回転は試さない
+  // （ZXing の rotateNext も ZXing-C++ の tryRotate も切る）。そのぶん、縮小も
+  // 横（バーコードを読む方向）を残して縦だけを詰める（MAX_SCAN_WIDTH / MAX_SCAN_HEIGHT）。
+  // 既定の枠（幅 96%・高さ 20%）は縦持ちのスマートフォンで 2.7 前後、横長の画面ではもっと大きい。
+  // 設定画面で正方形に近づけると、これまでどおり回転も試す
+  const WIDE_SCAN_ASPECT = 2;
+
+  // 解析に回す画像の最大辺（検出枠が WIDE_SCAN_ASPECT より横長でないとき）。
+  // 切り出したあとの処理（getImageData → グレースケール変換 → 二値化 → デコード）は
+  // すべて画素数に比例するので、ここを絞るのが一番素直に効く。
+  // 縦向きのバーコードも読むので、縦横は同じ比率で縮める
   const MAX_SCAN_SIDE = 640;
+
+  // 横長の検出枠のときの上限。1D バーコードの細バーの太さは横の解像度でしか決まらないので、
+  // 横は MAX_SCAN_WIDTH まで実寸で残し、縦だけを MAX_SCAN_HEIGHT まで詰める（縦横比は変わる）。
+  //
+  // 以前は横長の枠にも MAX_SCAN_SIDE を長辺に掛けていたので、縮小がちょうど読む方向に効いていた
+  // （1080p 縦持ちで切り出し 1037x383 → 640x237。20 桁の CODE128 で細バーが約 2.8px → 1.8px）。
+  // 画素数は 1037x240 で約 25 万と、以前（約 15 万 + 1 フレームおきの回転）から大きくは増えない。
+  // ZXing / ZXing-C++ は 1 行ずつ読むので、縦を詰めても読み方は変わらない。
+  // BarcodeDetector と Quagga2 は中身が分からない（Quagga2 は位置を探す）ので、縦横比は変えずに
+  // 横の上限だけを掛ける（needsAspect()）
+  const MAX_SCAN_WIDTH = 1280;
+  const MAX_SCAN_HEIGHT = 240;
 
   // 以前はここに、ZXing / Quagga2 に渡す画像の左右に足す白い余白の幅（SCAN_PAD_X）があった。
   // 余白は前処理の 1 段（barcode-preprocess.js の「余白」）に移したので、このファイルは
@@ -340,6 +355,39 @@
   // ZXing-C++（tryRotate）・Quagga2（locator）はバーコードの向きを自前で処理する
   function needsRotation() {
     return Boolean(engine) && engine.base === 'zxing';
+  }
+
+  // 縦横比を変えずに渡すエンジンか。ZXing / ZXing-C++ は 1 行ずつ読むだけなので、
+  // 縦を詰めても差し支えない。BarcodeDetector と Quagga2 は画像からバーコードの位置を
+  // 探すので、形を変えない（MAX_SCAN_HEIGHT を掛けない）
+  function needsAspect() {
+    return !engine || (engine.base !== 'zxing' && engine.base !== 'zxing-cpp');
+  }
+
+  // 検出枠が横長で、縦向きのバーコードは収まらない（＝ 90 度回転を試さない）か
+  function isWideCrop(crop) {
+    return crop.sw >= crop.sh * WIDE_SCAN_ASPECT;
+  }
+
+  // 切り出しを解析用にどこまで縮めるか。横長の枠は横を残して縦を詰め、
+  // それ以外は縦横同じ比率で長辺を MAX_SCAN_SIDE に収める
+  function scanSize(crop) {
+    const { sw, sh } = crop;
+    let rx;
+    let ry;
+
+    if (isWideCrop(crop)) {
+      rx = Math.min(1, MAX_SCAN_WIDTH / sw);
+      // 縦を横より引き伸ばすことはしない（詰めるだけ）
+      ry = needsAspect() ? rx : Math.min(rx, MAX_SCAN_HEIGHT / sh);
+    } else {
+      rx = ry = Math.min(1, MAX_SCAN_SIDE / Math.max(sw, sh));
+    }
+
+    return {
+      width: Math.max(1, Math.round(sw * rx)),
+      height: Math.max(1, Math.round(sh * ry))
+    };
   }
 
   // --- 状態の通知 -------------------------------------------------------
@@ -988,10 +1036,8 @@
 
     const { sx, sy, sw, sh } = crop;
 
-    // 大きすぎる場合は縮小して取り込む
-    const ratio = Math.min(1, MAX_SCAN_SIDE / Math.max(sw, sh));
-    const dw = Math.max(1, Math.round(sw * ratio));
-    const dh = Math.max(1, Math.round(sh * ratio));
+    // 大きすぎる場合は縮小して取り込む（横長の枠は縦だけを詰めることがある。scanSize()）
+    const { width: dw, height: dh } = scanSize(crop);
 
     const { canvas, ctx } = frameBuffer;
     // 大きさが変わったときだけ再確保する（代入はゼロクリアを伴う）
@@ -1062,25 +1108,29 @@
   //     frame.preview         capturePreview() からの呼び出しか（true なら数える類のことはしない）
   //     frame.plain()         素通しの画像（回転込み・余白なし）。作れなければ null。
   //                           ZXing 経路では呼ぶたびに回転を入れ替えるので、1 フレームに 1 回だけ呼ぶ
+  //                           （検出枠が横長なら回転しない。WIDE_SCAN_ASPECT）
   //     frame.analyze(source) source を解析して { text, format } | null を返す。
-  //                           preview のときは解析せず source をそのまま返す
+  //                           preview のときは解析せず source をそのまま返す。
+  //                           検出枠が横長なら ZXing-C++ の tryRotate も切って解析する
   //
   // analyze は 1 回の呼び出しにつき 1 回まで。frameFilter が返るまで次のフレームは来ない。
   // 呼ばれるのは解析中でないときだけなので、差し込む側は自前の作業用 canvas を
   // 気兼ねなく書き換えてよい
 
-  // 解析に渡す形にする。Worker には画素か ImageBitmap を転送で渡す
-  async function toRequest(source, input) {
+  // 解析に渡す形にする。Worker には画素か ImageBitmap を転送で渡す。
+  // rotate は ZXing-C++ に tryRotate を効かせるか（false なら設定に関わらず切る）
+  async function toRequest(source, input, rotate) {
     if (input === 'canvas') return { canvas: source };
     if (input === 'bitmap') return { bitmap: await createImageBitmap(source) };
 
     // 既に 2d コンテキストがあるので、getContext は作成済みのものを返す
     const image = source.getContext('2d').getImageData(0, 0, source.width, source.height);
-    return { width: image.width, height: image.height, buffer: image.data.buffer };
+    return { width: image.width, height: image.height, buffer: image.data.buffer, rotate };
   }
 
-  // 解析を 1 回回す。終わるまではフレームのコピーを止めておく
-  async function analyze(source) {
+  // 解析を 1 回回す。終わるまではフレームのコピーを止めておく。
+  // rotate が false なら 90 度回転は試させない（横長の検出枠。isWideCrop()）
+  async function analyze(source, rotate = true) {
     if (!source || !engine) return null;
 
     const current = engine;
@@ -1088,7 +1138,7 @@
     pendingDetects += 1;
 
     try {
-      const request = await toRequest(source, current.input);
+      const request = await toRequest(source, current.input, rotate);
 
       try {
         return await current.decode(request);
@@ -1122,22 +1172,27 @@
     const crop = measureFrame(frame);
     if (!crop) return null;
 
+    // 横長の枠には縦向きのバーコードは収まらないので、回転は試さない。
+    // ZXing は 1 フレームおきの回転をやめ（横向きの解析回数が倍になる）、
+    // ZXing-C++ は tryRotate の列方向の走査を省く
+    const rotatable = !isWideCrop(crop);
+
     const filterFrame = {
       video: frame.video,
       crop,
       preview: false,
       // ZXing 経路だけ、縦向きバーコード用に 1 フレームおきで 90 度回転させる
       plain: () => {
-        rotateNext = needsRotation() && !rotateNext;
+        rotateNext = needsRotation() && rotatable && !rotateNext;
         return copyPreviewFrame(frame.video, crop) ? captureScanArea(rotateNext) : null;
       },
-      analyze
+      analyze: (source) => analyze(source, rotatable)
     };
 
     try {
       const result = await (config.frameFilter
         ? config.frameFilter(filterFrame)
-        : analyze(filterFrame.plain()));
+        : filterFrame.analyze(filterFrame.plain()));
 
       // 解析を待っている間に止められていたら、結果は捨てる
       return active ? result || null : null;

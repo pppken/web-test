@@ -112,8 +112,9 @@ BarcodeScanner.configure({
   「検出枠の `getBoundingClientRect()`」の差で決まる。
   `object-fit` のレターボックスは差し引かれるが、`object-position` は中央（既定）を前提にしている。
 - 1D バーコード（横長）を想定した作り。検出枠も横長にする。
-- 解析に回す画像は長辺 640px に縮めてから渡す（barcode.js の `MAX_SCAN_SIDE`）。枠を大きくしすぎると
-  細いバーが潰れる。
+- 解析に回す画像の縮め方は検出枠の形で変わる（barcode.js の `scanSize()`）。幅が高さの 2 倍以上の横長の枠なら
+  横は 1280px まで実寸で残し（縦向きのバーコードは読まない）、それより正方形に近い枠は長辺 640px に縮める。
+  正方形に近い大きな枠にすると細いバーが潰れる。
 
 ---
 
@@ -492,7 +493,7 @@ const scanner = window.BarcodeScanner || {
 | `mirrorClass` | `'mirrored'` | フロントのとき `video` に付ける class。`null` で付けない（CSS は呼び出し側） |
 | `zoomFactors` | `[1, 2, 3, 5]` | ズームで巡回する倍率（等倍の何倍か） |
 | `detector` | `null` | `(frame) => Promise<result \| null>`。無ければフレームを取らない |
-| `scanInterval` | `120` | 1 回の解析が終わってから次のフレームを取るまでの ms（約 8 回/秒） |
+| `scanInterval` | `120` | 1 回の解析が終わってから次のフレームを取るまでの ms（約 8 回/秒）。解析が Worker で動くなら詰めてよい（このページの app.js は 30） |
 | `autoPause` | `true` | 検出したら自動で `pauseScan()` する |
 
 | コールバック | 引数 | タイミング |

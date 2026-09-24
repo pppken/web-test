@@ -153,6 +153,14 @@ const scanner = window.BarcodeScanner || { configure() {}, start() {}, stop() {}
 - `SCAN_INTERVAL_MS = 120`（`scanInterval`。約 8 回/秒）。`setTimeout` は**解析完了後に予約**する
   （`setInterval` にするとフレームが溜まる）。`detector` の結果が返るまで次は渡さないので、
   解析が重なることはない。
+  **このページでは、解析が Worker で動くときは `app.js` が 30ms に詰める**
+  （`WORKER_SCAN_INTERVAL_MS`。`onEngineChange` の `kind` が `-worker` で終わるとき。`syncScanInterval()`）。
+  120ms は解析がメインスレッドで動いていた頃に画面を固めないための間隔で、Worker なら待つ間も
+  メインスレッドは空いている。同じフレームを 2 回渡さないことは上の `requestVideoFrameCallback` が保証する。
+  Quagga2 と Worker が使えないとき（メインスレッド実行）は 120ms に戻す。
+  ヘッドレスの偽カメラ（30fps・何も写っていないフレーム）では、ZXing-C++ が 7〜8/s → 24〜26/s、
+  ZXing が 7/s → 20/s になった（下の縮小の変更込み）。**実機は解析そのものが遅いので伸びは小さく、
+  そのぶん CPU は回り続ける。** 発熱が気になるなら値を戻して `#engine` の N/s と見比べること。
 - **`onDetect` を呼ぶ時点でフレームの受け渡しは止まっている**（`autoPause` の既定が true）。
   見せ終わったら `resumeScan()` を呼ぶこと。呼ばない限り読み直さない。
   止めないと、結果を見せている間も 8 回/秒で同じコードを拾い続ける。
@@ -395,8 +403,11 @@ Quagga2 の実力を実機で確かめられない。そこで `setEngine(choice
   `tryDownscale: false` の 3 つ。`tryHarder: true` は既定と同じだが、重いときに最初に外す
   場所として意識しておく。`tryDownscale` を true にすると、ライブラリ側が
   `downscaleThreshold`（500）を超える辺だけを `downscaleFactor`（3）で縮めた層も読むので、
-  `MAX_SCAN_SIDE` = 640 のこの経路では実際に走る。`tryRotate` は既定（true）のまま。
+  この経路の画像（長辺 640、横長の枠なら幅 1280 まで）では実際に走る。`tryRotate` は既定（true）のまま。
 - **`tryRotate` が効くので 90 度回転は渡さない**（`needsRotation()` が false）。
+  **検出枠が横長（`WIDE_SCAN_ASPECT` 以上）のフレームでは `tryRotate` を切って解析する**
+  （解析要求の `rotate: false`。barcode-worker.js が `tryRotate: false` の組を使う）。縦向きのバーコードは
+  枠に収まらないので、列方向の走査を省く。設定で `tryRotate` を切ってあればどちらでも切ったまま。
   左右の白い帯は barcode.js では足さない（前処理の「余白」の段。全エンジン共通）。
 - `readBarcodes()` は `{ data, width, height }` を `ImageData` として受け取るので、
   Quagga2 のように PNG に起こす必要は無い。RGBA → 輝度の変換はライブラリ側で
@@ -441,8 +452,8 @@ barcode.js が持つのはこの口だけ。** 既定の `null` なら従来ど�
 - 受け取る `frame` は `{ video, crop, preview, plain(), analyze(source) }`。
   `crop` は検出枠を映像の実ピクセル座標にしたもの（`measureFrame()` がコピーの直前に決める）。
   `plain()` は素通しの画像（回転込み・余白なし。ZXing 経路では呼ぶたびに回転が入れ替わるので
-  1 フレームに 1 回だけ呼ぶ）、`analyze()` は解析して結果を返す
-  （preview のときは解析せずに画像をそのまま返す）。
+  1 フレームに 1 回だけ呼ぶ。横長の枠では回転しない）、`analyze()` は解析して結果を返す
+  （preview のときは解析せずに画像をそのまま返す。横長の枠では ZXing-C++ の `tryRotate` を切る）。
 - 呼ばれるのは解析中でないときだけ。`analyze()` は 1 回の呼び出しにつき 1 回まで。
 - 中身は下の「barcode-preprocess.js」を参照。
 
@@ -466,14 +477,30 @@ barcode.js が持つのはこの口だけ。** 既定の `null` なら従来ど�
    これまで通り**こちら側で 1 フレームおきに 90 度回転**させて対応する
    （`rotateNext`、ZXing 経路のみ。`BarcodeDetector` / ZXing-C++ / Quagga2 は
    向きを自前で処理するので常に正立で渡す）。
+   ただし**検出枠が横長（幅 / 高さが `WIDE_SCAN_ASPECT` = 2 以上）のときは回転させない**。縦向きの
+   バーコードは枠の高さに収まらないので、回転したフレームは無駄打ちで、横向きの解析回数が半分になっていた。
    外すときは `false` を入れるのではなく `hints.set` ごと消すこと
    （`setHints` はキーの有無で見るため、`false` でも「あり」扱いになる）。
 2. **白黒反転は試さない**（ZXing-C++ の `tryInvert: false`）。試すと通常のバーコードの
    実効回数が半減する（以前の ZXing メインスレッド経路の `HTMLCanvasElementLuminanceSource`
    の第 2 引数を `false` にしていたのと同じ理由）。
-3. **`MAX_SCAN_SIDE = 640`** に縮小してから解析に渡す。グレースケール変換・二値化は
-   画素数に比例するので、ここが効く。900 のときは大半の端末で切り出しサイズ
-   （1080p 縦持ちで 864x768 程度）を下回らず、実質的に働いていなかった。
+3. **縮小は検出枠の形で 2 通り**（`scanSize()`）。グレースケール変換・二値化は画素数に比例するので、ここが効く。
+   - 横長の枠（幅 / 高さが `WIDE_SCAN_ASPECT` = 2 以上。既定の枠はこちら）: 横は `MAX_SCAN_WIDTH` = 1280 まで
+     実寸で残し、ZXing / ZXing-C++ では縦だけを `MAX_SCAN_HEIGHT` = 240 まで詰める（縦横比が変わるが、
+     1 行ずつ読むので差し支えない）。BarcodeDetector / Quagga2 は位置を探すので縦横比は変えない（`needsAspect()`）。
+     **細バーの太さは横の解像度でしか決まらない。** 以前は長辺を 640 に抑えていたので、縮小がちょうど
+     読む方向に掛かっていた（1080p 縦持ちで 1037x383 → 640x237。20 桁の CODE128 で細バーが約 2.8px → 1.8px）。
+     ヘッドレスの偽カメラ（1080x1920・CODE128 22 桁 277 モジュール・ぼかし 0.6px・8 秒）では次のとおり。
+
+     | module | ZXing-C++ 以前 / いま | ZXing 以前 / いま |
+     | --- | --- | --- |
+     | 2.0px | 読めない / 読めた | 読めない / 読めた |
+     | 2.4px | 読めない / 読めた | 読めない / 読めない |
+     | 2.8px | 読めた / 読めた | 読めた / 読めた |
+
+   - それ以外（正方形に近い枠）: 縦向きのバーコードも読むので、縦横同じ比率で長辺を `MAX_SCAN_SIDE` = 640 に収める
+     （以前と同じ）。900 のときは大半の端末で切り出しサイズを下回らず、実質的に働いていなかった。
+     縦向きの CODE128（枠 96% x 60%）は、以前もいまも ZXing-C++ / ZXing とも読めた。
 4. **作業用 canvas は正立用と回転用の 2 枚**（`scanCanvases`）。1 枚を使い回すと
    1 フレームおきに幅と高さが入れ替わり、毎フレーム canvas の再確保が走る。
 
@@ -481,7 +508,7 @@ barcode.js が持つのはこの口だけ。** 既定の `null` なら従来ど�
 
 - ループ（間隔・一時停止・世代の管理）は camera.js 側にある（「フレームの受け渡し」を参照）。
 - **解析はフレームのコピーに対して行う。** `copyPreviewFrame()` が `frame.video` の現在の
-  フレームから検出枠のぶんを `frameBuffer` へ複製し（正立・余白なし・`MAX_SCAN_SIDE` まで
+  フレームから検出枠のぶんを `frameBuffer` へ複製し（正立・余白なし・`scanSize()` まで
   縮小済み）、`captureScanArea()` がそこに経路ごとの味付け（回転）をして解析用の
   画像にする。**barcode.js の中で `<video>` を読むのはこの 1 箇所だけ**
   （`frameFilter` を差し込んだときは、そちらも同じ `crop` の範囲だけを読む）。
@@ -572,7 +599,7 @@ barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけ
 - **順番は固定**（`STAGES`）。領域検出は映像から直接切り出すので先頭、余白は解析の直前に
   白を足すので最後、コントラスト調整は縦集約の傾きの測定を助けるので縦集約の前。
 - **入力**は、領域検出が見つかればその切り出し（バーが縦に立った実寸の画像）、縦集約が有効なら
-  縦に潰した取り込み（下の 1.）、それ以外は素通しの画像（`frame.plain()`。`MAX_SCAN_SIDE` まで縮小・回転込み）。
+  縦に潰した取り込み（下の 1.）、それ以外は素通しの画像（`frame.plain()`。`scanSize()` まで縮小・回転込み）。
 - 段から段へは灰色の画像（`{ gray: Uint8Array, width, height }`）で渡し、canvas に戻すのは最後の
   1 回だけ（`writeOutput()`）。どの段も効かなかったフレームは、素通しの画像をそのまま解析に渡す。
 - **効かなかった段は飛ばして続ける。** 領域検出が見つからない → 素通しの画像を入力にする。
@@ -948,8 +975,10 @@ DOM も CSS のクラス名も知らない（唯一の例外が camera.js の `m
     `app.js` の `SCAN_AREA_SIZE` の `default` は、この CSS と揃えておくこと。
   - 既定のままスライダーを初めて動かしたとき、もう片方は**いまの実寸を % に直した値**から始める
     （`scanAreaDefaults()`）。CSS の既定の % から始めると、px の上限で抑えられていたぶん枠が飛ぶ。
-  - 枠を大きくすると `MAX_SCAN_SIDE`（640）の縮小が強く掛かり、細いバーが潰れやすくなる。
-    検出画像ダイアログで縮小後の画像を見ること。
+  - 枠の形で縮小のしかたが変わる（barcode.js の `scanSize()`）。幅が高さの 2 倍（`WIDE_SCAN_ASPECT`）以上なら
+    横長の扱いで、横は 1280 まで実寸・縦向きのバーコードは読まない。それより正方形に近づけると、
+    縦向きも読む代わりに長辺 640（`MAX_SCAN_SIDE`）に縮めるので、細いバーが潰れやすくなる。
+    検出画像ダイアログで縮小後の画像を見ること（横長の枠の ZXing / ZXing-C++ では縦に潰れて見える）。
 
 ## vendor/
 
@@ -1039,7 +1068,8 @@ CameraController.configure({
   DOM を探すのは `app.js` だけ。UI の都合が出てきたらコールバックを 1 つ足して、
   描画は `app.js` にやらせる。
 - コメントもコミットメッセージも日本語。既存の文体に合わせる。
-- 性能に関わる定数（camera.js の `SCAN_INTERVAL_MS`、barcode.js の `MAX_SCAN_SIDE` /
+- 性能に関わる定数（camera.js の `SCAN_INTERVAL_MS`、app.js の `WORKER_SCAN_INTERVAL_MS`、
+  barcode.js の `WIDE_SCAN_ASPECT` / `MAX_SCAN_SIDE` / `MAX_SCAN_WIDTH` / `MAX_SCAN_HEIGHT` /
   `LIB_TIMEOUT_MS` / `WASM_INIT_TIMEOUT_MS` / `ZXING_CPP_OPTIONS`、barcode-quagga2.js の
   `QUAGGA_DECODE_TIMEOUT_MS`、photo.js の `DEFAULT_QUALITY`）は各ファイル先頭にまとめてある。
   新しい定数も同じ場所に置く。ZXing の `TRY_HARDER` だけは検出処理の中

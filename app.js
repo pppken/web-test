@@ -16,6 +16,14 @@
 
   const LABEL_RESET_MS = 1500;
 
+  // 検出のループの間隔（camera.js の scanInterval。1 回の解析が終わってから次を渡すまで）。
+  // camera.js の既定（120ms）は、解析がメインスレッドで動いていた頃に画面を固めないための間隔。
+  // 解析が Worker で動くときは待っている間もメインスレッドは空いているので、ここまで詰める
+  // （同じフレームを 2 回解析しないことは camera.js が requestVideoFrameCallback で保証する）。
+  // メインスレッドで解析するとき（Quagga2・Worker が使えないとき）は既定に戻す
+  const WORKER_SCAN_INTERVAL_MS = 30;
+  const MAIN_SCAN_INTERVAL_MS = 120;
+
   // エンジンの選択値 -> ボタンに出す表示。barcode.js は値だけを扱い、表示はこちらが持つ
   const ENGINE_LABELS = {
     auto: '自動',
@@ -253,10 +261,25 @@
     engineBtn.disabled = state.busy;
   }
 
+  // いまのエンジンが Worker で動いているかで、ループの間隔を決める。
+  // kind はエンジンが用意できるまでは空（camera.configure() もまだ呼ばれていないことがある）
+  let scanInterval = null;
+
+  function syncScanInterval(state) {
+    if (!state.kind) return;
+
+    const interval = state.kind.endsWith('-worker') ? WORKER_SCAN_INTERVAL_MS : MAIN_SCAN_INTERVAL_MS;
+    if (interval === scanInterval) return;
+
+    scanInterval = interval;
+    camera.configure({ scanInterval });
+  }
+
   function handleEngineChange(state) {
     renderEngineBadge(state);
     renderEngineButton(state);
     previewBtn.disabled = !state.active;
+    syncScanInterval(state);
   }
 
   // --- ズーム -----------------------------------------------------------

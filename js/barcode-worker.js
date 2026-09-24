@@ -14,7 +14,8 @@
 //
 // やり取りは 1 エンジンにつき 1 つの decoder で、どちらの読み込み方でも同じ形:
 //   init   { engine, formats, src?, wasm?, options? }
-//   解析   { width, height, buffer }（zxing / zxing-cpp。RGBA）
+//   解析   { width, height, buffer, rotate }（zxing / zxing-cpp。RGBA。
+//          rotate が false なら ZXing-C++ の tryRotate を切る）
 //          { bitmap }（native。ImageBitmap。使い終わったらこちらで close する）
 //   結果   { text, format } | null
 (() => {
@@ -178,6 +179,9 @@
       ...message.options,
       formats: message.formats.map((format) => format.zxingCpp)
     };
+    // 横長の検出枠（解析要求の rotate が false）では縦向きのバーコードは収まらないので、
+    // tryRotate の列方向の走査を省く。設定で切ってあるときはどちらでも切ったまま
+    const unrotatedOptions = { ...options, tryRotate: false };
 
     if (!zxingCppOverrides.has(message.wasm)) {
       // 既定の locateFile は jsDelivr の URL を返す。同梱した wasm を指すように差し替える
@@ -203,7 +207,7 @@
           width: request.width,
           height: request.height
         },
-        options
+        request.rotate === false ? unrotatedOptions : options
       );
 
       if (!results.length) return null;
