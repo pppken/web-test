@@ -313,48 +313,69 @@
       color: rgba(255, 255, 255, 0.75);
     }
 
-    /* --- 前処理 --- */
+    /* --- 設定 --- */
 
-    /* 「前処理」ボタンで開閉する段のチェックボックス。明るさのスライダーと同じく
-       #controls の中で幅いっぱいを取り、ボタンの上の行に出す */
-    #preprocessPanel {
-      flex: 0 0 100%;
-      display: flex;
-      justify-content: center;
-    }
-
-    #preprocessPanel[hidden] {
-      display: none;
-    }
-
-    #preprocessControl {
-      width: min(420px, 100%);
-      margin: 0;
-      padding: 12px 18px;
-      border: 1px solid rgba(255, 255, 255, 0.25);
+    /* 「設定」ボタンで開くダイアログ。起動時のエンジン・前処理・有効フォーマット・
+       ZXing-C++ のオプションをまとめて選ぶ。中身の入力欄は app.js が作る */
+    #settings {
+      width: 100%;
+      max-width: min(440px, calc(100vw - 32px));
+      margin: auto;
+      padding: 0;
+      border: 1px solid rgba(255, 255, 255, 0.12);
       border-radius: 16px;
-      background: rgba(20, 20, 20, 0.7);
-      backdrop-filter: blur(8px);
-      font-size: 14px;
-      /* #controls は pointer-events: none なので、触る箱だけ戻す */
-      pointer-events: auto;
+      background: rgba(28, 28, 30, 0.97);
+      color: #fff;
     }
 
-    #preprocessControl legend {
+    #settings::backdrop {
+      background: rgba(0, 0, 0, 0.6);
+    }
+
+    /* 項目が多く、スマートフォンでは画面に収まらないので中だけスクロールさせる */
+    #settingsBody {
+      max-height: calc(100vh - 140px);
+      max-height: calc(100dvh - 140px);
+      overflow-y: auto;
+      padding: 20px 20px 0;
+    }
+
+    #settingsTitle {
+      margin: 0 0 12px;
+      font-size: 17px;
+      font-weight: 600;
+    }
+
+    .settings-group {
+      margin: 0 0 14px;
+      padding: 8px 14px 10px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 12px;
+      font-size: 14px;
+    }
+
+    .settings-group legend {
       padding: 0 4px;
       font-size: 12px;
       letter-spacing: 0.04em;
       color: rgba(255, 255, 255, 0.75);
     }
 
-    .preprocess-row {
+    .settings-note {
+      margin: 6px 0 0;
+      font-size: 11px;
+      line-height: 1.6;
+      color: rgba(255, 255, 255, 0.55);
+    }
+
+    .settings-row {
       display: flex;
       align-items: center;
       gap: 10px;
       min-height: 36px;
     }
 
-    .preprocess-row label {
+    .settings-row label {
       flex: 1;
       display: flex;
       align-items: center;
@@ -362,14 +383,15 @@
       cursor: pointer;
     }
 
-    .preprocess-row input[type="checkbox"] {
+    .settings-row input[type="checkbox"] {
       width: 18px;
       height: 18px;
       margin: 0;
       accent-color: rgba(45, 127, 249, 1);
     }
 
-    .preprocess-row select {
+    .settings-row select,
+    .settings-row input[type="number"] {
       padding: 4px 8px;
       border: 1px solid rgba(255, 255, 255, 0.25);
       border-radius: 8px;
@@ -378,11 +400,36 @@
       font-size: 13px;
     }
 
-    /* 段と A/B 比較の間の区切り */
-    .preprocess-row.compare {
+    .settings-row input[type="number"] {
+      width: 5em;
+    }
+
+    /* 前処理の段と A/B 比較の間の区切り */
+    .settings-row.compare {
       margin-top: 6px;
       padding-top: 6px;
       border-top: 1px solid rgba(255, 255, 255, 0.15);
+    }
+
+    #settingsActions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      padding: 12px 20px 20px;
+    }
+
+    #settingsActions > button {
+      padding: 9px 18px;
+      font-size: 14px;
+    }
+
+    #settingsCloseBtn {
+      background: rgba(45, 127, 249, 0.85);
+      border-color: transparent;
+    }
+
+    #settingsCloseBtn:hover:not(:disabled) {
+      background: rgba(45, 127, 249, 1);
     }
 
     /* --- 撮影 --- */
@@ -632,22 +679,13 @@
           </div>
         </div>
 
-        <!-- 「前処理」ボタンで開閉する。中身（段ごとのチェックボックス）は app.js の setupPreprocess() が作る -->
-        <div id="preprocessPanel" hidden>
-          <fieldset id="preprocessControl">
-            <legend>前処理（上から順に掛ける。全部外すと前処理なし）</legend>
-            <div id="preprocessStages"></div>
-          </fieldset>
-        </div>
-
         <button id="startBtn">カメラを起動</button>
         <button id="shutterBtn" disabled>撮影</button>
         <button id="scanPreviewBtn" disabled>検出画像</button>
         <!-- ラベルは app.js が現在の選択で上書きする -->
         <button id="engineBtn">エンジン: 自動</button>
-        <!-- 前処理（検討中）。app.js の setupPreprocess() が表示し、ラベルも現在の選択で上書きする。
-             押すと #preprocessPanel を開閉する -->
-        <button id="preprocessBtn" type="button" aria-controls="preprocessPanel" aria-expanded="false" hidden>前処理: なし</button>
+        <!-- 押すと #settings（起動時のエンジン・前処理・有効フォーマット・ZXing-C++ のオプション）を開く -->
+        <button id="settingsBtn" type="button" aria-controls="settings">設定</button>
         <!-- ラベルは app.js が現在の倍率で上書きする -->
         <button id="zoomBtn" disabled>ズーム</button>
         <!-- ラベルは app.js が現在の明るさで上書きする -->
@@ -681,6 +719,43 @@
       <a id="photoSaveBtn" download>保存</a>
       <button id="photoShareBtn" type="button" hidden>共有</button>
       <button id="photoCloseBtn" type="button" autofocus>閉じる</button>
+    </div>
+  </dialog>
+
+  <!-- 入力欄は app.js の buildSettings() / setupPreprocess() が作る。HTML には入れ物だけを置く -->
+  <dialog id="settings" aria-labelledby="settingsTitle">
+    <div id="settingsBody">
+      <h2 id="settingsTitle">設定</h2>
+
+      <fieldset class="settings-group">
+        <legend>起動時のエンジン</legend>
+        <div class="settings-row">
+          <select id="settingsEngine" aria-label="起動時のエンジン"></select>
+        </div>
+        <p class="settings-note">選ぶとすぐに切り替わり、次に開いたときもこのエンジンで始まります。「エンジン」ボタンでの切り替えはその場限りです。</p>
+      </fieldset>
+
+      <!-- 前処理（検討中）。app.js の setupPreprocess() が通ったときだけ出す -->
+      <fieldset id="preprocessSection" class="settings-group" hidden>
+        <legend>前処理（上から順に掛ける。全部外すと前処理なし）</legend>
+        <div id="preprocessStages"></div>
+      </fieldset>
+
+      <fieldset class="settings-group">
+        <legend>有効フォーマット</legend>
+        <div id="settingsFormats"></div>
+        <p class="settings-note">少なくとも 1 つは残してください。どのエンジンにも効きます。</p>
+      </fieldset>
+
+      <fieldset class="settings-group">
+        <legend>バーコードリーダー（ZXing-C++）</legend>
+        <div id="settingsReader"></div>
+        <p class="settings-note">エンジンが ZXing-C++ のときだけ効きます。tryDenoise と、binarizer の LocalAverage / GlobalHistogram の違いは 2D コード向けで、1D バーコードには効きません。</p>
+      </fieldset>
+    </div>
+
+    <div id="settingsActions">
+      <button id="settingsCloseBtn" type="button" autofocus>閉じる</button>
     </div>
   </dialog>
 

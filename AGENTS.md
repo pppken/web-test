@@ -45,7 +45,7 @@ vendor/      第三者ライブラリ（無改変で同梱）
 | ファイル | 公開するもの |
 | --- | --- |
 | `camera.js` | `window.CameraController = { configure, start, stop, switchCamera, watchPermission, zoomNext, setBrightness, pauseScan, resumeScan, isScanPaused, getZoomState, getBrightnessState, isRunning, getFacingMode, getTrack }` |
-| `barcode.js` | `window.BarcodeScanner = { configure, start, stop, detect, setEngine, nextEngine, capturePreview, getEngineState, getEngineChoices, isActive }` |
+| `barcode.js` | `window.BarcodeScanner = { configure, start, stop, detect, setEngine, nextEngine, capturePreview, getEngineState, getEngineChoices, isActive, setStartupEngine, setFormats, setReaderOption, getSettings, getSettingChoices }` |
 | `barcode-worker.js` | Worker として読まれたときは何も生やさない（`onmessage` だけ）。メインスレッドに読まれたときは `window.BarcodeWorkerCore = { createDecoder }` |
 | `barcode-quagga2.js` | `window.BarcodeQuagga2 = { createDecoder }` |
 | `barcode-preprocess.js` | `window.BarcodePreprocess = { configure, filter, setStage, setMethod, setCompare, getState, getStages, getMethods, getStats, resetStats, getLastOutput }` |
@@ -235,7 +235,8 @@ const scanner = window.BarcodeScanner || { configure() {}, start() {}, stop() {}
 ### barcode.js
 
 `configure({ scanArea, basePath, vendorPath, formats, engine, storageKey, frameFilter, on... })`。
-`scanArea` が必須。状態は `onEngineChange(state)`、失敗は `onError({ code, message, error })` で流す。
+`scanArea` が必須。状態は `onEngineChange(state)`、設定は `onSettingsChange(settings)`（下の「設定」を参照）、
+失敗は `onError({ code, message, error })` で流す。
 **検出の入口は `detect(frame)`**（camera.js の `detector` に渡す）。フレームを切り出して
 （前処理を通して）いまのエンジンに渡し、`Promise<{ text, format } | null>` を返す。
 結果を知らせるのは camera.js（`onDetect`）で、barcode.js は返すだけ。
@@ -260,11 +261,14 @@ Quagga2 以外はさらに **Worker → メインスレッド** の 2 段にな�
 **検出そのものは barcode.js では行わない。** barcode.js は切り出した画像を
 `barcode-worker.js`（Quagga2 だけ `barcode-quagga2.js`）の `decode` に渡すだけ。
 **ZXing-C++ と Quagga2 はこの自動の連鎖には入らない**（下の「エンジンの選択」を参照）。
+ただし**起動時のエンジンの既定は ZXing-C++**（`DEFAULT_ENGINE`）で、自動の連鎖は `'auto'` を選んだときだけ通る。
 いま何で動いているかは `onEngineChange` の `name` に出る（このページでは `#engine` のバッジ）。
 
 - **読み取る種類は `FORMATS` に集約してある。既定は CODE128 と JAN と CODE39**
   （JAN ＝ EAN-13 / EAN-8。13 桁と 8 桁は別フォーマット扱いなので全部で 4 件ある。
-  `configure({ formats })` で差し替えられる）。
+  `configure({ formats })` で差し替えられる）。`configure({ formats })` は**読み取れるものの一覧**で、
+  そのうちどれを有効にするかは `setFormats()`（下の「設定」）で選ぶ。検出器に渡るのは有効なものだけ
+  （`activeFormats()`）。
   `BarcodeDetector` には `code_128` / `ean_13` / `ean_8` / `code_39`、ZXing には `POSSIBLE_FORMATS`
   として `CODE_128` / `EAN_13` / `EAN_8` / `CODE_39`、ZXing-C++ には `formats` として
   `Code128` / `EAN13` / `EAN8` / `Code39`、Quagga2 には `decoder.readers` として
@@ -327,24 +331,53 @@ Quagga2 の実力を実機で確かめられない。そこで `setEngine(choice
 選べる値は `getEngineChoices()` が返す。**日本語のラベルは barcode.js は持たない**
 （`app.js` の `ENGINE_LABELS`）。
 
-- 選択は `localStorage['barcodeEngine']`
-  （`'auto'` / `'zxing'` / `'zxing-cpp'` / `'quagga'`）に保存。
-  既定は `'auto'`。camera.js の向き設定と同じく、読み書きとも try/catch で握りつぶす。
+- **`setEngine()` / `nextEngine()` での選択は保存しない**（その場限り）。開いたときに使うのは
+  **起動時のエンジン**（`setStartupEngine()`。下の「設定」）で、既定は `'zxing-cpp'`（`DEFAULT_ENGINE`）。
+  以前は `localStorage['barcodeEngine']` に「最後に選んだエンジン」を保存していたが、意味が変わったので
+  そのキーは読まない。
 - 読み取り中に呼んだ場合は**カメラを止めずに検出器だけ差し替える**。
   切替に失敗したら選択を元に戻し、直前のエンジンのまま読み取りを続ける
   （camera.js の前後切替と同じ扱い）。停止中に呼んだときは選択を覚えるだけ。
 - 一度作った検出器は `detectorCache`（選択値 → `Promise<エンジン>`）に取っておく。
   行き来のたびにライブラリを読み直したり、ZXing の Worker を作り直したりしないため。
-- 各エンジンは `{ base, kind, worker, name, input, decode }` で、`applyEngine()` が現在値として据える。
+- 各エンジンは `{ base, kind, worker, name, input, decode, dispose, version }` で、`applyEngine()` が現在値として据える。
   `base`（`'native'` / `'zxing'` / `'zxing-cpp'` / `'quagga'`）が切り出し方
   （回転 `needsRotation()`、コピーをそのまま渡せるか `passesBufferAsIs()`）を、`worker` がフォールバック先を決める。
   `kind` は `base` に `-worker` を足したもの（`'zxing-worker'` など）で、状態の通知用。
+  `version` は作ったときの `settingsVersion`、`dispose()` は Worker を畳む（下の「設定」）。
+
+#### 設定（起動時のエンジン・有効フォーマット・ZXing-C++ のオプション）
+
+このページでは「設定」ボタン `#settingsBtn` で開くダイアログ `#settings` から変える。
+**保存は barcode.js の仕事**で、3 つまとめて JSON で `localStorage['barcodeSettings']`（`storageKey`）に入れる
+（`{ engine, formats, zxingCpp }`。`zxingCpp` は既定から変えた項目だけ）。読むときは 1 項目ずつ確かめ、
+壊れているものは既定に戻す。
+
+- `setStartupEngine(choice)`: 起動時のエンジンを保存し、**いまのエンジンもそれに切り替える**（`setEngine()` を呼ぶ）。
+  `configure({ engine })` を渡したときはそちらが優先（保存はしない）。
+- `setFormats(names)`: 有効にするフォーマットを zxing の表記（`CODE_128` など）で選ぶ。
+  **1 つも無いのは受け付けない**（ZXing-C++ は空で全フォーマット、BarcodeDetector は空で使えない、と
+  扱いが割れるため）。受け付けなかったときも `onSettingsChange` を出すので、呼び出し側はそれで
+  チェックボックスを戻す。
+- `setReaderOption(name, value)`: ZXing-C++ のオプションを 1 つ変える。変えられるのは
+  `ZXING_CPP_EDITABLE`（`tryHarder` / `tryRotate` / `tryInvert` / `tryDownscale` / `tryDenoise` /
+  `binarizer` / `minLineCount`）だけで、値は `ZXING_CPP_OPTIONS` に重ねる。`binarizer` は
+  `ZXING_CPP_BINARIZERS` のどれか、`minLineCount` は 1 以上の整数。それ以外は受け付けない。
+  **`tryRotate` を切っても `needsRotation()` は false のまま**なので、縦向きのバーコードは読めなくなる。
+- `getSettings()` がいまの値、`getSettingChoices()` が選べる値の一覧（`{ engines, formats, zxingCpp, binarizers }`）。
+  **表示の文言は持たない**（`app.js` の `ENGINE_LABELS` / `FORMAT_LABELS`。オプションは名前をそのまま出す）。
+- 検出器は init のときの設定で動くので、**フォーマットかオプションが変わったら `reloadEngines()` で
+  作ってある検出器を全部作り直す**（`settingsVersion` を 1 つ進め、`detectorCache` を空にする）。
+  読み取り中なら、新しいものが用意できるまでは古いものを使い続け、`applyEngine()` で差し替えたときに
+  古いほうの `dispose()`（Worker の `terminate()`）を呼ぶ。`applyEngine()` は待っている間に
+  `settingsVersion` が進んだエンジンは据えずに畳む（続けて変えられたときに古い設定のものが後から据わらないように）。
+  解析の途中で畳まれた検出器の失敗は `analyze()` が見分けて、`fallbackFor()` には回さない。
 
 #### ZXing-C++（wasm）
 
 `vendor/zxing-wasm-reader-3.1.4.min.js` ＋ `vendor/zxing-wasm-reader-3.1.4.wasm`
 （[zxing-wasm](https://github.com/Sec-ant/zxing-wasm) の `reader` サブパスの IIFE 版）。
-Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路で、自動では選ばれない。
+**起動時のエンジンの既定**（`DEFAULT_ENGINE`）。`'auto'` の連鎖には入らない。
 
 - **js と wasm の 2 つで 1 組。** 版を上げるときは `ZXING_CPP_SRC` と
   `ZXING_CPP_WASM` を両方とも直すこと。
@@ -353,7 +386,9 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
   wasm の取得とコンパイルまで初期化のうちに終わらせる。ここを待たずに検出器を返すと、
   最初の数フレームの解析がまとめて待たされる。
 - 解析オプションは `ZXING_CPP_OPTIONS`。**zxing-wasm 3.1.4 の ReaderOptions を、既定値のものも
-  含めて全項目書いてある**（`formats` だけは `configure({ formats })` から barcode-worker.js が入れる）。
+  含めて全項目書いてある**（`formats` だけは有効フォーマットから barcode-worker.js が入れる）。
+  このうち `ZXING_CPP_EDITABLE` の 7 項目は設定画面から変えられ、変えたぶんが上に重なる（`zxingCppOptions()`）。
+  ここに書いてある値は**設定を変えていないときの既定**。
   既定値は同梱の js が持つ既定のオブジェクトで確認したもので、版を上げたら突き合わせ直すこと。
   既定から変えているのは `maxNumberOfSymbols: 1`（枠内に複数は想定しない）、
   `tryInvert: false`（白黒反転を試すと通常のバーコードの実効回数が落ちるため）、
@@ -506,15 +541,14 @@ barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけ
 （このページでは `app.js` の `setupPreprocess()` の中）。
 
 - **無効にするだけなら** `app.js` の「組み立て」にある `setupPreprocess();` の 1 行を消す。
-  前処理は一切走らず、「前処理」ボタンも出ない（`#preprocessBtn` は HTML 側で `hidden`）。
+  前処理は一切走らず、設定画面の前処理の欄も出ない（`#preprocessSection` は HTML 側で `hidden`）。
   保存済みの選択が A/B 比較でも結果ダイアログは普段どおり出る（`isBenchmarking()` が
   `setupPreprocess()` を通ったかを見ている）。
 - **完全に外すなら** 次の 4 か所。barcode.js の `frameFilter` は既定 `null` の口なので残してよい。
   - `js/barcode-preprocess.js`
-  - `index.html` のローダの 1 行と、`#preprocessBtn` / `#preprocessPanel` / `#scanOutput` / `#scanWave` /
-    `#scanWaveInfo` / `#scanLocate`（と `#preprocessPanel` 周りの CSS）
-  - `app.js` の「前処理」の節と `setupPreprocess();` の行、`showBrightnessPanel()` の中の
-    `showPreprocessPanel()` の呼び出し
+  - `index.html` のローダの 1 行と、`#preprocessSection` / `#scanOutput` / `#scanWave` /
+    `#scanWaveInfo` / `#scanLocate`
+  - `app.js` の「前処理」の節と `setupPreprocess();` の行
   - `app.js` の `isBenchmarking()` / `preprocessDebug()` / `preprocessOutput()` / `formatStats()` の呼び出し元
     （バッジ・`onDetect`・検出画像ダイアログ。いずれも「前処理」とコメントしてある）
 - ライブラリの約束ごと（DOM を探さない・`emit()` で例外を握る・`storageKey`）は他と同じ。
@@ -527,7 +561,7 @@ barcode.js 側にあるのは `frameFilter` という差し込み口 1 つだけ
 #### パイプライン（段の選び方）
 
 前処理は**段（stage）を決まった順に並べたパイプライン**で、段ごとに有効・無効を選ぶ
-（このページでは「前処理」ボタン `#preprocessBtn` で開くパネル `#preprocessPanel` のチェックボックス。
+（このページでは設定画面 `#settings` の前処理の欄 `#preprocessSection` のチェックボックス。
 中身は `app.js` の `buildPreprocessPanel()` が `getStages()` / `getMethods()` から作る）。
 **全部の段を無効にしたものが「前処理なし」**で、以前の `'off'` にあたる。**既定は全部無効。**
 
@@ -814,9 +848,9 @@ OpenCV でよくやる「勾配 → 塊 → 回転矩形 → 切り出し」を�
 
 #### 検出率の比較（A/B）
 
-A/B 比較（`compare`。パネルの「A/B 比較」）を入れると、**1 フレームおきに前処理あり（有効な段を全部通したもの）と
+A/B 比較（`compare`。設定画面の前処理の欄の「A/B 比較」）を入れると、**1 フレームおきに前処理あり（有効な段を全部通したもの）と
 素通しを入れ替えて**それぞれの検出率を数える（`getStats()`、`getState().stats`。`app.js` はバッジを描くたびに
-読みに行く）。このページでは `#engine` バッジに `前 42% / 素 0%` と出て、「前処理」ボタンのラベルに `（A/B）` が付く。
+読みに行く）。このページでは `#engine` バッジに `前 42% / 素 0%` と出る。
 別々に試すと持ち方や明るさが変わってしまうので、**必ず交互に回したこのモードで比べること。**
 `app.js` はこのとき結果ダイアログを出さず、`autoPause` も切る（1 枚読めたところで止まると数が溜まらないため）。
 どの段も効かなかったフレームは素通しとして数える。以前の `'ab'` は「コントラスト調整（stretch）+ 縦集約 + A/B」
@@ -847,7 +881,7 @@ A/B 比較（`compare`。パネルの「A/B 比較」）を入れると、**1 �
 - objectURL は `app.js` の `releasePhoto()` で必ず revoke。ダイアログを閉じるときは
   **`img` から src を外してから** revoke する（表示中に revoke すると消える）。
 - 撮影ダイアログを開いている間は解析を止め、閉じたら再開する。結果ダイアログと
-  撮影ダイアログが重なるのを防ぐため。3 つのダイアログをまとめて見ているのは
+  撮影ダイアログが重なるのを防ぐため。ダイアログをまとめて見ているのは
   `app.js` の `anyDialogOpen()` / `syncScanning()` で、**photo.js は barcode.js を知らない**。
 - フラッシュと振動は `onCaptureStart` で呼び出し側が行う。`takePhoto()` は完了までに
   時間がかかることがあるので、先に反応を返すために撮影の実処理より前に呼ぶ。
@@ -872,7 +906,7 @@ DOM も CSS のクラス名も知らない（唯一の例外が camera.js の `m
     箱の大きさが起動の瞬間に変わると、枠の見た目がその場で飛ぶ。
 - ダイアログは `<dialog>` + `showModal()`。未対応ブラウザ向けに
   `setAttribute('open', '')` のフォールバックを `openDialog()` に入れてある。
-- **ダイアログを開いたら解析を止め、閉じたら再開する。** 3 つ（結果 / 撮影 / 検出画像）を
+- **ダイアログを開いたら解析を止め、閉じたら再開する。** 4 つ（結果 / 撮影 / 検出画像 / 設定）を
   まとめて見ているのが `anyDialogOpen()` / `syncScanning()` で、開閉のたびに必ず通す
   （止めるのは camera.js の `pauseScan()` / `resumeScan()`）。
   ライブラリ側はダイアログの存在を知らないので、ここを飛ばすとモーダルが重なる。
@@ -892,12 +926,14 @@ DOM も CSS のクラス名も知らない（唯一の例外が camera.js の `m
   スライダー（`#brightnessPanel`）は `#controls` の中に幅いっぱい（`flex: 0 0 100%`）で
   置いてあり、ボタンが何行に折り返しても常にその上の行に出る。
   `#controls` は `pointer-events: none` なので、触る箱（`#brightnessControl`）だけ戻している。
-- 「前処理」ボタン（`#preprocessBtn`）も同じ扱いで、`renderPreprocess()` が
-  `前処理: 領域+余白` / `前処理: なし` / A/B 比較中は末尾に `（A/B）` を書く。押すとパネル
-  （`#preprocessPanel`）を開閉し、段ごとのチェックボックスと方式の `<select>` は
-  `buildPreprocessPanel()` が作る（HTML には入れ物の `#preprocessStages` しか無い）。
-  明るさのスライダーと同じ場所に出るので、片方を開くともう片方は畳む。
-  触る箱（`#preprocessControl`）だけ `pointer-events` を戻しているのも同じ。
+- 「設定」ボタン（`#settingsBtn`）はダイアログ `#settings` を開く（ラベルは固定）。カメラの状態に依らず押せる。
+  中身は起動時のエンジン（`#settingsEngine`）・前処理（`#preprocessSection`。`setupPreprocess()` を
+  通ったときだけ出す）・有効フォーマット（`#settingsFormats`）・ZXing-C++ のオプション（`#settingsReader`）。
+  HTML には入れ物しか無く、入力欄は `buildSettings()` と `buildPreprocessPanel()` が作る。
+  **選んだ時点で反映・保存される**（「閉じる」は閉じるだけ）。入力欄の状態はライブラリからの通知
+  （`onSettingsChange` → `renderSettings()`、前処理は `onChange` → `renderPreprocess()`）で書き戻すので、
+  受け付けられなかった変更（フォーマットを全部外す・`minLineCount` に 0 など）は元に戻る。
+  以前は「前処理」ボタンで `#controls` の中にパネルを開閉していたが、この設定画面に移した。
 
 ## vendor/
 
@@ -947,7 +983,7 @@ CameraController.configure({
 - `vendor/` は `js/vendor/` に置けば設定は要らない。このリポジトリのように
   別の場所へ置くなら `configure({ vendorPath })` で指す（`app.js` の実例を参照）。
   `.wasm` を `application/wasm` で返すサーバであることも確認すること。
-- **`localStorage` のキー**（`cameraFacingMode` / `barcodeEngine` / `barcodePreprocess`）はホスト側と
+- **`localStorage` のキー**（`cameraFacingMode` / `barcodeSettings` / `barcodePreprocess`）はホスト側と
   ぶつかりうるので、`storageKey` で名前空間を付けるか `null` で保存を切る。
 - **読み取るフォーマットを変えるなら `configure({ formats })`。** 1 件につき
   `{ native, zxing, zxingCpp, quagga }` の 4 つとも書くこと（理由は `FORMATS` の項）。

@@ -7,7 +7,7 @@
   // ここにあるもの:
   //   - 要素の取得と、ボタンのイベント
   //   - ステータス・エンジンバッジ・各ボタンのラベル（日本語の文言は全部ここ）
-  //   - 3 つのダイアログ（結果 / 撮影 / 検出画像）と、その開閉に合わせた解析の停止と再開
+  //   - 4 つのダイアログ（結果 / 撮影 / 検出画像 / 設定）と、その開閉に合わせた解析の停止と再開
   //   - #frame.idle の付け外し
   //
   // ライブラリはそれぞれ独立していて、互いを参照しない。
@@ -33,6 +33,15 @@
   const CAMERA_LABELS = {
     environment: 'リアカメラ',
     user: 'フロントカメラ'
+  };
+
+  // 有効フォーマットの表示。barcode.js は zxing の表記（CODE_128 など）で扱う。
+  // 設定画面にはこの並びで出す（ここに無いものは後ろに表記のまま並べる）
+  const FORMAT_LABELS = {
+    CODE_39: 'CODE39',
+    CODE_128: 'CODE128',
+    EAN_8: 'EAN8',
+    EAN_13: 'EAN13'
   };
 
   const $ = (id) => document.getElementById(id);
@@ -75,6 +84,13 @@
   const previewInfo = $('scanPreviewInfo');
   const previewCloseBtn = $('scanPreviewCloseBtn');
 
+  const settingsBtn = $('settingsBtn');
+  const settingsDialog = $('settings');
+  const settingsEngine = $('settingsEngine');
+  const settingsFormats = $('settingsFormats');
+  const settingsReader = $('settingsReader');
+  const settingsCloseBtn = $('settingsCloseBtn');
+
   // どれかの js の読み込みに失敗しても、残りは動き続けるようにする。
   // 従来からある方針で、意図的なもの（片方が欠けてもカメラ単体・撮影単体は使える）
   const camera = window.CameraController || {
@@ -86,7 +102,10 @@
   const scanner = window.BarcodeScanner || {
     configure() {}, start() {}, stop() {}, detect: () => Promise.resolve(null),
     setEngine() {}, nextEngine() {}, capturePreview: () => Promise.resolve(null),
-    getEngineState: () => ({ status: 'idle' }), getEngineChoices: () => [], isActive: () => false
+    getEngineState: () => ({ status: 'idle' }), getEngineChoices: () => [], isActive: () => false,
+    setStartupEngine() {}, setFormats() {}, setReaderOption() {},
+    getSettings: () => null,
+    getSettingChoices: () => ({ engines: [], formats: [], zxingCpp: [], binarizers: [] })
   };
 
   const photo = window.PhotoCapture || {
@@ -142,10 +161,10 @@
     syncScanning();
   }
 
-  // 結果・撮影・検出画像のどれかを開いている間は解析を止める。
+  // 結果・撮影・検出画像・設定のどれかを開いている間は解析を止める。
   // 解析を続けるとモーダルが重なってしまう（barcode.js 側はこの判断をしない）
   function anyDialogOpen() {
-    return resultDialog.open || photoDialog.open || previewDialog.open;
+    return resultDialog.open || photoDialog.open || previewDialog.open || settingsDialog.open;
   }
 
   function syncScanning() {
@@ -251,8 +270,6 @@
   function showBrightnessPanel(open) {
     brightnessPanel.hidden = !open;
     brightnessBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
-    // 前処理のパネルと同じ場所（ボタンの上の行）に出るので、開くときは向こうを畳む
-    if (open && preprocessEnabled) showPreprocessPanel(false);
   }
 
   function handleBrightnessChange(state) {
@@ -369,16 +386,139 @@
     syncScanning();
   });
 
+  // --- 設定のダイアログ -------------------------------------------------
+  //
+  // 「設定」ボタンで開く。起動時のエンジン・有効フォーマット・ZXing-C++ のオプションは
+  // barcode.js の設定で、前処理の段は barcode-preprocess.js の選択（下の「前処理」の節が
+  // #preprocessSection に作る）。どれも選んだ時点で反映・保存され、「閉じる」は閉じるだけ。
+  // 入力欄の状態は、ライブラリからの通知（onSettingsChange / onChange）で書き戻す
+  // （受け付けられなかった変更、たとえばフォーマットを全部外したときに元へ戻すため）
+
+  // 入力欄。フォーマット -> checkbox、ZXing-C++ のオプション -> input / select
+  const formatInputs = new Map();
+  const readerInputs = new Map();
+
+  function createCheckboxRow(text) {
+    const row = document.createElement('div');
+    row.className = 'settings-row';
+
+    const label = document.createElement('label');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    label.append(checkbox, text);
+    row.append(label);
+
+    return { row, checkbox };
+  }
+
+  function createSelect(values, labelOf) {
+    const select = document.createElement('select');
+    for (const value of values) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = labelOf(value);
+      select.append(option);
+    }
+    return select;
+  }
+
+  // 名前の横に入力欄を 1 つ置く行（binarizer の select、minLineCount の数値）
+  function createFieldRow(text, field) {
+    const row = document.createElement('div');
+    row.className = 'settings-row';
+
+    const label = document.createElement('label');
+    label.textContent = text;
+    field.setAttribute('aria-label', text);
+    row.append(label, field);
+
+    return row;
+  }
+
+  function checkedFormats() {
+    return [...formatInputs].filter(([, checkbox]) => checkbox.checked).map(([name]) => name);
+  }
+
+  // 入力欄は barcode.js が返す選べる値の一覧から作る
+  // （configure() が設定の初期状態を流してくるので、その前に呼ぶ）
+  function buildSettings() {
+    const choices = scanner.getSettingChoices();
+
+    for (const engine of choices.engines) {
+      const option = document.createElement('option');
+      option.value = engine;
+      option.textContent = ENGINE_LABELS[engine] || engine;
+      settingsEngine.append(option);
+    }
+    settingsEngine.addEventListener('change', () => scanner.setStartupEngine(settingsEngine.value));
+
+    const order = Object.keys(FORMAT_LABELS);
+    const rank = (name) => (order.includes(name) ? order.indexOf(name) : order.length);
+    for (const name of choices.formats.slice().sort((a, b) => rank(a) - rank(b))) {
+      const { row, checkbox } = createCheckboxRow(FORMAT_LABELS[name] || name);
+      // 全部外そうとしたときは barcode.js が受け付けず、onSettingsChange でチェックが戻る
+      checkbox.addEventListener('change', () => scanner.setFormats(checkedFormats()));
+      settingsFormats.append(row);
+      formatInputs.set(name, checkbox);
+    }
+
+    // オプション名はそのまま出す（barcode.js の ZXING_CPP_OPTIONS と突き合わせやすいように）
+    for (const name of choices.zxingCpp) {
+      if (name === 'binarizer') {
+        const select = createSelect(choices.binarizers, (value) => value);
+        select.addEventListener('change', () => scanner.setReaderOption(name, select.value));
+        settingsReader.append(createFieldRow(name, select));
+        readerInputs.set(name, select);
+        continue;
+      }
+
+      if (name === 'minLineCount') {
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = '1';
+        input.step = '1';
+        input.inputMode = 'numeric';
+        // 1 未満や小数は barcode.js が受け付けず、onSettingsChange で元の値に戻る
+        input.addEventListener('change', () => scanner.setReaderOption(name, Number(input.value)));
+        settingsReader.append(createFieldRow(name, input));
+        readerInputs.set(name, input);
+        continue;
+      }
+
+      const { row, checkbox } = createCheckboxRow(name);
+      checkbox.addEventListener('change', () => scanner.setReaderOption(name, checkbox.checked));
+      settingsReader.append(row);
+      readerInputs.set(name, checkbox);
+    }
+  }
+
+  function renderSettings(settings) {
+    if (!settings) return;
+
+    settingsEngine.value = settings.engine;
+    for (const [name, checkbox] of formatInputs) checkbox.checked = settings.formats.includes(name);
+
+    for (const [name, input] of readerInputs) {
+      const value = settings.zxingCpp[name];
+      if (input.type === 'checkbox') input.checked = Boolean(value);
+      else input.value = String(value);
+    }
+  }
+
+  // エンジンと同じくカメラの状態に依らず押せる
+  settingsBtn.addEventListener('click', () => openDialog(settingsDialog));
+  settingsCloseBtn.addEventListener('click', () => settingsDialog.close());
+  settingsDialog.addEventListener('close', syncScanning);
+
   // --- 前処理（js/barcode-preprocess.js。検討中）--------------------------
   //
   // 前処理にまつわるページ側の配線はこの節にまとめてある。有効にするのは
   // 「組み立て」の setupPreprocess() の 1 行で、それを消せば前処理は一切動かない
-  // （ボタンも出ない）。完全に外すときは、この節と setupPreprocess() の行、
-  // showBrightnessPanel() の中の showPreprocessPanel() の呼び出し、
-  // index.html の #preprocessBtn / #preprocessPanel / #scanOutput / #scanWave / #scanWaveInfo / #scanLocate と
+  // （設定画面の前処理の欄も出ない）。完全に外すときは、この節と setupPreprocess() の行、
+  // index.html の #preprocessSection / #scanOutput / #scanWave / #scanWaveInfo / #scanLocate と
   // ローダの 1 行、js/barcode-preprocess.js を消す。
   //
-  // 前処理は段を並べたパイプラインで、「前処理」ボタンで開くパネルのチェックボックスで
+  // 前処理は段を並べたパイプラインで、設定画面（#settings）の前処理の欄のチェックボックスで
   // 段ごとに有効・無効を切り替える（全部外すと前処理なし）。
   // A/B 比較は前処理ありと無しを 1 フレームおきに交互に回して検出率を比べる計測用で、
   // このときだけ結果ダイアログを出さない（止まると数が溜まらない）
@@ -388,14 +528,6 @@
     locate: '領域検出',
     contrast: 'コントラスト調整',
     aggregate: '縦集約',
-    pad: '余白'
-  };
-
-  // 段 -> ボタンのラベルに並べる短い名前
-  const PREPROCESS_STAGE_SHORT = {
-    locate: '領域',
-    contrast: 'コントラスト',
-    aggregate: '集約',
     pad: '余白'
   };
 
@@ -415,8 +547,7 @@
     locate: '領域検出の切り出し'
   };
 
-  const preprocessBtn = $('preprocessBtn');
-  const preprocessPanel = $('preprocessPanel');
+  const preprocessSection = $('preprocessSection');
   const preprocessStages = $('preprocessStages');
   const previewOutput = $('scanOutput');
   const previewOutputImage = $('scanOutputImage');
@@ -433,7 +564,7 @@
 
   let preprocessEnabled = false;
 
-  // パネルの入力欄。段 -> { checkbox, select }（select は方式を選べる段だけ）
+  // 設定画面の前処理の欄の入力欄。段 -> { checkbox, select }（select は方式を選べる段だけ）
   const preprocessInputs = new Map();
   let preprocessCompareInput = null;
 
@@ -457,22 +588,7 @@
     // barcode.js への差し込みはここだけ
     scanner.configure({ frameFilter: preprocess.filter });
 
-    preprocessBtn.hidden = false;
-    // 押すたびにパネルを開閉する。エンジンと同じくカメラの状態に依らず押せる
-    preprocessBtn.addEventListener('click', () => showPreprocessPanel(preprocessPanel.hidden));
-  }
-
-  function createCheckboxRow(text) {
-    const row = document.createElement('div');
-    row.className = 'preprocess-row';
-
-    const label = document.createElement('label');
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    label.append(checkbox, text);
-    row.append(label);
-
-    return { row, checkbox };
+    preprocessSection.hidden = false;
   }
 
   // 段ごとのチェックボックス（と方式の選択）を、前処理が返す段の並び（＝掛ける順）で作る
@@ -485,14 +601,8 @@
       let select = null;
       const methods = preprocess.getMethods(stage);
       if (methods.length) {
-        select = document.createElement('select');
+        select = createSelect(methods, (method) => PREPROCESS_METHOD_LABELS[method] || method);
         select.setAttribute('aria-label', `${text}の方式`);
-        for (const method of methods) {
-          const option = document.createElement('option');
-          option.value = method;
-          option.textContent = PREPROCESS_METHOD_LABELS[method] || method;
-          select.append(option);
-        }
         select.addEventListener('change', () => preprocess.setMethod(stage, select.value));
         row.append(select);
       }
@@ -508,25 +618,13 @@
     preprocessCompareInput = checkbox;
   }
 
-  // パネルの入力欄と「前処理」ボタンのラベルを、いまの選択に合わせる。
-  // ボタンのラベルは常にその時の選択を表す（エンジンと同じく setLabel() は通さない）
+  // 設定画面の前処理の欄を、いまの選択に合わせる
   function renderPreprocess(state) {
     for (const [stage, { checkbox, select }] of preprocessInputs) {
       checkbox.checked = state.stages.includes(stage);
       if (select) select.value = state[stage];
     }
     if (preprocessCompareInput) preprocessCompareInput.checked = state.compare;
-
-    const names = state.stages.map((stage) => PREPROCESS_STAGE_SHORT[stage] || stage);
-    preprocessBtn.textContent =
-      `前処理: ${names.length ? names.join('+') : 'なし'}${state.compare ? '（A/B）' : ''}`;
-  }
-
-  // 明るさのスライダーと同じ場所（ボタンの上の行）に出るので、開くときは向こうを畳む
-  function showPreprocessPanel(open) {
-    preprocessPanel.hidden = !open;
-    preprocessBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
-    if (open) showBrightnessPanel(false);
   }
 
   function isBenchmarking() {
@@ -889,6 +987,9 @@
 
   // --- 組み立て ---------------------------------------------------------
 
+  // configure() が設定の初期状態を流してくるので、入力欄はその前に作っておく
+  buildSettings();
+
   scanner.configure({
     scanArea,
     // ライブラリは js/ に、同梱ライブラリは vendor/ に置いてある。
@@ -896,6 +997,7 @@
     // このページの置き方に合わせてここで指す
     vendorPath: new URL('vendor/', document.baseURI).href,
     onEngineChange: handleEngineChange,
+    onSettingsChange: renderSettings,
     onError: ({ code, message }) => {
       // 解析エラーは 1 フレームごとに起きうる（Quagga2 のタイムアウトなど）ので
       // ダイアログにはしない。バッジ側に「解析エラー」と出るのでそちらで気付く

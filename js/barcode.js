@@ -11,7 +11,8 @@
   //   barcode-quagga2.js Quagga2 での検出そのもの（Worker に乗らないので別ファイル）
   // 検出エンジンは BarcodeDetector（Chrome / Android 等）を優先し、非対応のブラウザ
   // （iOS Safari / Firefox / デスクトップ Chrome）では同梱の ZXing を使う。
-  // ZXing-C++ と Quagga2 は自動では選ばれず、setEngine() で明示的に選んだときだけ使う。
+  // ZXing-C++ と Quagga2 は 'auto' の連鎖には入らず、選んだときだけ使う。
+  // 起動時のエンジンの既定は ZXing-C++（DEFAULT_ENGINE。setStartupEngine() で変えられる）。
   //
   // このファイルは DOM を探さない。検出枠の要素と結果の受け口は configure() で受け取り、
   // 映像はフレームごとに detect(frame) の frame.video で受け取る。
@@ -20,17 +21,22 @@
   //     scanArea,              // 必須。この要素の矩形の内側だけを切り出して解析する
   //     basePath,              // barcode-worker.js / barcode-quagga2.js の基準。既定はこの js の場所
   //     vendorPath,            // 同梱ライブラリの置き場所。既定は basePath + 'vendor/'
-  //     formats,               // 読み取る対象（既定は FORMATS ＝ CODE128 と JAN と CODE39）
-  //     engine,                // 'auto' | 'zxing' | 'zxing-cpp' | 'quagga'
-  //     storageKey,            // エンジン選択の保存先。null で保存しない
+  //     formats,               // 読み取れる対象の一覧（既定は FORMATS ＝ CODE128 と JAN と CODE39）。
+  //                            // このうちどれを有効にするかは setFormats() で選ぶ
+  //     engine,                // 'auto' | 'zxing' | 'zxing-cpp' | 'quagga'。起動時のエンジンの設定より優先する（保存しない）
+  //     storageKey,            // 設定（起動時のエンジン・有効フォーマット・ZXing-C++ のオプション）の保存先。
+  //                            // null で保存しない
   //     frameFilter,           // 解析に渡す画像を作り直す差し込み口（既定 null ＝ 素通し）。
   //                            // 約束ごとは「差し込みの前処理」を参照
   //     onEngineChange(state),
+  //     onSettingsChange(settings),
   //     onError({ code, message, error })
   //   });
   //   BarcodeScanner.start() / stop()          // カメラの起動・停止に合わせて呼ぶ
   //   BarcodeScanner.detect(frame)             // → Promise<{ text, format } | null>
   //   BarcodeScanner.setEngine(choice) / nextEngine() / capturePreview()
+  //   BarcodeScanner.setStartupEngine(choice) / setFormats(names) / setReaderOption(name, value)
+  //   BarcodeScanner.getSettings() / getSettingChoices()
   //
   // detect は camera.js の detector にそのまま渡す関数。frame は camera.js の
   // フレーム（{ video, width, height, ... }）で、video は画面に出している <video> であること
@@ -135,6 +141,15 @@
     tryCode39ExtendedMode: true
   };
 
+  // 設定画面から変えられる ZXing-C++ のオプション（setReaderOption()）。値は ZXING_CPP_OPTIONS が
+  // 既定で、変えたぶんだけを設定として保存する。真偽値のものと binarizer・minLineCount がある
+  const ZXING_CPP_EDITABLE = [
+    'tryHarder', 'tryRotate', 'tryInvert', 'tryDownscale', 'tryDenoise', 'binarizer', 'minLineCount'
+  ];
+
+  // binarizer に渡せる値（同梱の js が持つ一覧と同じ並び）
+  const ZXING_CPP_BINARIZERS = ['LocalAverage', 'GlobalHistogram', 'FixedThreshold', 'BoolCast'];
+
   // 解析に回す画像の最大辺。切り出したあとの処理（getImageData →
   // グレースケール変換 → 二値化 → デコード）はすべて画素数に比例するので、
   // ここを絞るのが一番素直に効く。
@@ -177,7 +192,14 @@
   // 常に勝つので、'auto' のままだと ZXing / ZXing-C++ / Quagga2 の実力を実機で見られない。
   // 表示用のラベルは呼び出し側が持つ（このファイルは値だけを扱う）
   const ENGINE_CHOICES = ['auto', 'zxing', 'zxing-cpp', 'quagga'];
-  const DEFAULT_STORAGE_KEY = 'barcodeEngine';
+
+  // 起動時のエンジンの既定。設定（setStartupEngine()）で変えられる。
+  // setEngine() / nextEngine() での切り替えはその場限りで、次に開いたときはこれに戻る
+  const DEFAULT_ENGINE = 'zxing-cpp';
+
+  // 設定の保存先。起動時のエンジン・有効フォーマット・ZXing-C++ のオプションを JSON で 1 つにまとめる。
+  // 以前は 'barcodeEngine' に「最後に選んだエンジン」を入れていたが、意味が変わったので読まない
+  const DEFAULT_STORAGE_KEY = 'barcodeSettings';
 
   // onError の既定の文言。呼び出し側は code だけを見て自前の文言を出してもよい
   const MESSAGES = {
@@ -195,6 +217,7 @@
     storageKey: DEFAULT_STORAGE_KEY,
     frameFilter: null,
     onEngineChange: null,
+    onSettingsChange: null,
     onError: null
   };
 
@@ -232,11 +255,13 @@
   };
   frameBuffer.ctx = frameBuffer.canvas.getContext('2d');
 
-  // いま動いているエンジン。{ base, kind, worker, name, input, decode }
-  //   base    'native' | 'zxing' | 'zxing-cpp' | 'quagga'。切り出し方（回転）を決める
-  //   kind    base に Worker かどうかを足したもの（'zxing-worker' など）。状態の通知用
-  //   input   decode に渡す形。'pixels'（RGBA）/ 'bitmap'（ImageBitmap）/ 'canvas'
-  //   decode  (request) => Promise<{ text, format } | null>
+  // いま動いているエンジン。{ base, kind, worker, name, input, decode, dispose, version }
+  //   base     'native' | 'zxing' | 'zxing-cpp' | 'quagga'。切り出し方（回転）を決める
+  //   kind     base に Worker かどうかを足したもの（'zxing-worker' など）。状態の通知用
+  //   input    decode に渡す形。'pixels'（RGBA）/ 'bitmap'（ImageBitmap）/ 'canvas'
+  //   decode   (request) => Promise<{ text, format } | null>
+  //   dispose  () => void。Worker を畳む（作り直して要らなくなったとき）
+  //   version  作ったときの settingsVersion。設定が変わったあとの古いものを見分ける
   let engine = null;
 
   // 選択値 -> Promise<エンジン>。一度作ったものは取っておき、エンジンを
@@ -252,13 +277,19 @@
   // ことがあるため（それぞれが自分のぶんだけ戻す）
   let pendingDetects = 0;
 
-  let engineChoice = ENGINE_CHOICES[0];
+  let engineChoice = DEFAULT_ENGINE;
   let engineStatus = 'idle';  // 'idle' | 'loading' | 'ready' | 'error'
   let engineName = '';
   let engineBusy = false;
   let scanCount = 0;
   let scanRate = null;
   let rateTimerId = null;
+
+  // 設定（保存するもの）。検出器は init のときの値で動くので、変わったら作り直す
+  let startupEngine = DEFAULT_ENGINE;
+  let enabledFormats = null;   // 有効にするフォーマットの zxing 表記。null なら config.formats の全部
+  let zxingCppSettings = {};   // ZXING_CPP_EDITABLE のうち、既定から変えたもの
+  let settingsVersion = 0;     // フォーマットか ZXing-C++ のオプションが変わるたびに増える
 
   // 呼び出し側のコールバックが投げても、こちらの処理は止めない
   function emit(name, payload) {
@@ -357,33 +388,187 @@
     scanRate = null;
   }
 
-  // --- エンジンの選択 ---------------------------------------------------
-
+  // --- 設定 -------------------------------------------------------------
+  //
+  // 起動時のエンジン・有効フォーマット・ZXing-C++ のオプション。storageKey に JSON で保存する。
   // camera.js の向き設定と同じ理由で、localStorage は読み書きとも握りつぶす
-  function loadEngineChoice() {
-    if (!config.storageKey) return ENGINE_CHOICES[0];
 
-    try {
-      const saved = localStorage.getItem(config.storageKey);
-      if (ENGINE_CHOICES.includes(saved)) return saved;
-    } catch (err) {
-      console.warn('エンジン設定の読み込みに失敗しました', err);
-    }
-    return ENGINE_CHOICES[0];
+  function isValidReaderOption(name, value) {
+    if (name === 'binarizer') return ZXING_CPP_BINARIZERS.includes(value);
+    if (name === 'minLineCount') return Number.isInteger(value) && value >= 1;
+    return ZXING_CPP_EDITABLE.includes(name) && typeof value === 'boolean';
   }
 
-  function saveEngineChoice(value) {
+  // 保存値は壊れていることもあるので、1 項目ずつ確かめてから取り込む
+  function loadSettings() {
+    if (!config.storageKey) return;
+
+    let saved = null;
+    try {
+      saved = JSON.parse(localStorage.getItem(config.storageKey));
+    } catch (err) {
+      console.warn('バーコード読み取りの設定の読み込みに失敗しました', err);
+    }
+    if (!saved || typeof saved !== 'object') return;
+
+    if (ENGINE_CHOICES.includes(saved.engine)) startupEngine = saved.engine;
+
+    if (Array.isArray(saved.formats)) {
+      const known = config.formats.map((format) => format.zxing);
+      const formats = saved.formats.filter((name) => known.includes(name));
+      if (formats.length) enabledFormats = formats;
+    }
+
+    if (saved.zxingCpp && typeof saved.zxingCpp === 'object') {
+      for (const name of ZXING_CPP_EDITABLE) {
+        if (isValidReaderOption(name, saved.zxingCpp[name])) zxingCppSettings[name] = saved.zxingCpp[name];
+      }
+    }
+  }
+
+  function saveSettings() {
     if (!config.storageKey) return;
 
     try {
-      localStorage.setItem(config.storageKey, value);
+      localStorage.setItem(
+        config.storageKey,
+        JSON.stringify({ engine: startupEngine, formats: enabledFormats, zxingCpp: zxingCppSettings })
+      );
     } catch (err) {
-      console.warn('エンジン設定の保存に失敗しました', err);
+      console.warn('バーコード読み取りの設定の保存に失敗しました', err);
     }
   }
 
+  // 検出器に渡すフォーマット。有効なものが 1 つも無ければ全部
+  // （ZXing-C++ は空で全フォーマット、BarcodeDetector は空で使えない、と扱いが割れるため空にはしない）
+  function activeFormats() {
+    const enabled = enabledFormats
+      ? config.formats.filter((format) => enabledFormats.includes(format.zxing))
+      : [];
+    return enabled.length ? enabled : config.formats;
+  }
+
+  function zxingCppOptions() {
+    return { ...ZXING_CPP_OPTIONS, ...zxingCppSettings };
+  }
+
+  // 呼び出し側が設定画面を描くのに要るもの。フォーマットは zxing の表記（CODE_128 など）
+  function getSettings() {
+    const options = zxingCppOptions();
+    const zxingCpp = {};
+    for (const name of ZXING_CPP_EDITABLE) zxingCpp[name] = options[name];
+
+    return {
+      engine: startupEngine,
+      formats: activeFormats().map((format) => format.zxing),
+      zxingCpp
+    };
+  }
+
+  // 選べる値の一覧。表示用のラベルは呼び出し側が持つ
+  function getSettingChoices() {
+    return {
+      engines: ENGINE_CHOICES.slice(),
+      formats: config.formats.map((format) => format.zxing),
+      zxingCpp: ZXING_CPP_EDITABLE.slice(),
+      binarizers: ZXING_CPP_BINARIZERS.slice()
+    };
+  }
+
+  function emitSettings() {
+    emit('onSettingsChange', getSettings());
+  }
+
+  // 起動時のエンジンを決めて保存し、いまのエンジンもそれに切り替える
+  function setStartupEngine(choice) {
+    ensureConfigured();
+    if (!ENGINE_CHOICES.includes(choice)) {
+      emitSettings();
+      return Promise.resolve();
+    }
+
+    if (choice !== startupEngine) {
+      startupEngine = choice;
+      saveSettings();
+      emitSettings();
+    }
+    return setEngine(choice);
+  }
+
+  // 有効にするフォーマットを zxing の表記で選ぶ。1 つも無いのは受け付けない
+  // （呼び出し側がチェックボックスを戻せるよう、そのときも onSettingsChange を出す）
+  function setFormats(names) {
+    ensureConfigured();
+    const known = config.formats.map((format) => format.zxing);
+    const formats = known.filter((name) => Array.isArray(names) && names.includes(name));
+
+    const current = getSettings().formats;
+    if (!formats.length || formats.join() === current.join()) {
+      emitSettings();
+      return Promise.resolve();
+    }
+
+    enabledFormats = formats;
+    saveSettings();
+    emitSettings();
+    return reloadEngines();
+  }
+
+  // ZXing-C++ のオプションを 1 つ変える（ZXING_CPP_EDITABLE のものだけ）。
+  // 他のエンジンには効かないが、検出器の作り直しは全部まとめて行う
+  function setReaderOption(name, value) {
+    ensureConfigured();
+    if (!isValidReaderOption(name, value)) {
+      emitSettings();
+      return Promise.resolve();
+    }
+    if (zxingCppOptions()[name] === value) return Promise.resolve();
+
+    zxingCppSettings[name] = value;
+    saveSettings();
+    emitSettings();
+    return reloadEngines();
+  }
+
+  // フォーマットか ZXing-C++ のオプションが変わったら、作ってある検出器を全部作り直す
+  // （どれも init のときの値で動いているため）。読み取り中なら、新しいものが用意できるまでは
+  // いまのものを使い続け、差し替えたところで古いものを畳む（applyEngine()）。
+  // 用意できなかったときは、古い設定のままのエンジンで読み取りを続ける
+  async function reloadEngines() {
+    settingsVersion += 1;
+    const version = settingsVersion;
+
+    const stale = [...detectorCache.values()];
+    detectorCache.clear();
+    for (const promise of stale) {
+      // いま動いているものは、差し替えのときに applyEngine() が畳む
+      promise.then((old) => { if (old !== engine) old.dispose(); }, () => {});
+    }
+
+    if (!active) return;
+
+    engineBusy = true;
+    setEngineState('loading', '');
+
+    try {
+      await applyEngine(getDetector());
+    } catch (err) {
+      detectorCache.delete(engineChoice);
+      setEngineState(engine ? 'ready' : 'error', engine ? engine.name : '');
+      console.error(err);
+      fail('engine-switch-failed', err);
+    } finally {
+      // 作り直しが重なったときは、最後のものが終わるまで切り替え中のままにする
+      if (version === settingsVersion) engineBusy = false;
+      emitEngine();
+    }
+  }
+
+  // --- エンジンの選択 ---------------------------------------------------
+
   // 動作中ならカメラは止めずに、検出器だけその場で差し替える。
-  // 停止中は選択を覚えるだけで、次の start() がこの選択で初期化する
+  // 停止中は選択を覚えるだけで、次の start() がこの選択で初期化する。
+  // ここでの選択は保存しない（次に開いたときは起動時のエンジンに戻る）
   async function setEngine(choice) {
     ensureConfigured();
     if (!ENGINE_CHOICES.includes(choice) || choice === engineChoice) return;
@@ -393,7 +578,6 @@
     const previousName = engineName;
 
     engineChoice = choice;
-    saveEngineChoice(engineChoice);
 
     if (!active) {
       emitEngine();
@@ -410,7 +594,6 @@
       // 選択だけ戻して読み取りは続ける（camera.js の前後切替と同じ扱い）
       detectorCache.delete(engineChoice);
       engineChoice = previous;
-      saveEngineChoice(previous);
       setEngineState(previousStatus, previousName);
       console.error(err);
       fail('engine-switch-failed', err);
@@ -495,7 +678,8 @@
           engine: 'zxing-cpp',
           src: resolveVendor(ZXING_CPP_SRC),
           wasm: resolveVendor(ZXING_CPP_WASM),
-          options: ZXING_CPP_OPTIONS
+          // ZXING_CPP_OPTIONS に設定（setReaderOption()）で変えたぶんを重ねたもの
+          options: zxingCppOptions()
         }
       };
     }
@@ -515,6 +699,7 @@
 
     const workerSrc = resolveUrl(WORKER_SRC);
     const worker = new Worker(withVersion(workerSrc));
+    const version = settingsVersion;
     let pending = null;
     let nextId = 0;
 
@@ -531,6 +716,16 @@
         const transfer = request.buffer ? [request.buffer] : request.bitmap ? [request.bitmap] : [];
         worker.postMessage({ id, ...request }, transfer);
       });
+    }
+
+    // 設定が変わって作り直したときに畳む。解析の途中なら打ち切る
+    // （放っておくと、その解析を待っている camera.js のループが進まなくなる）
+    function dispose() {
+      worker.terminate();
+      if (pending) {
+        pending.reject(new Error('検出器を作り直したため、解析を打ち切りました。'));
+        pending = null;
+      }
     }
 
     return new Promise((resolve, reject) => {
@@ -568,7 +763,9 @@
             worker: true,
             name: `${spec.name} (Worker)`,
             input: spec.input,
-            decode
+            decode,
+            dispose,
+            version
           });
           return;
         }
@@ -589,42 +786,50 @@
         else current.resolve(message.result);
       };
 
-      worker.postMessage({ type: 'init', formats: config.formats, ...spec.init });
+      worker.postMessage({ type: 'init', formats: activeFormats(), ...spec.init });
     });
   }
 
   // Worker を使えない環境向けの経路。barcode-worker.js をそのまま <script> で読み込み、
   // 同じ検出コードをメインスレッドで動かす（解析のあいだ画面が止まる）
   async function createMainEngine(spec) {
+    const version = settingsVersion;
     if (!window.BarcodeWorkerCore) await loadScript(withVersion(resolveUrl(WORKER_SRC)));
 
     const core = window.BarcodeWorkerCore;
     if (!core) throw new Error('barcode-worker.js を読み込めませんでした。');
 
     const decode = await withTimeout(
-      core.createDecoder({ formats: config.formats, ...spec.init }, loadScript),
+      core.createDecoder({ formats: activeFormats(), ...spec.init }, loadScript),
       spec.timeout,
       `${spec.name} の初期化がタイムアウトしました。`
     );
 
-    return { base: spec.base, kind: spec.base, worker: false, name: spec.name, input: spec.input, decode };
+    return {
+      base: spec.base, kind: spec.base, worker: false, name: spec.name, input: spec.input, decode,
+      dispose() {}, version
+    };
   }
 
   // Quagga2 の経路。自動では選ばれず、setEngine('quagga') で選んだときだけ使う。
   // Worker に乗らないので barcode-quagga2.js をメインスレッドに読み込む
   async function createQuaggaEngine() {
+    const version = settingsVersion;
     if (!window.BarcodeQuagga2) await loadScript(withVersion(resolveUrl(QUAGGA_MODULE_SRC)));
 
     const quagga = window.BarcodeQuagga2;
     if (!quagga) throw new Error('barcode-quagga2.js を読み込めませんでした。');
 
     const decode = await quagga.createDecoder(
-      { formats: config.formats, src: resolveVendor(QUAGGA_SRC) },
+      { formats: activeFormats(), src: resolveVendor(QUAGGA_SRC) },
       loadScript
     );
 
     // 画素ではなく canvas のまま渡す（decodeSingle は data URL でしか受け取れないため）
-    return { base: 'quagga', kind: 'quagga', worker: false, name: 'Quagga2', input: 'canvas', decode };
+    return {
+      base: 'quagga', kind: 'quagga', worker: false, name: 'Quagga2', input: 'canvas', decode,
+      dispose() {}, version
+    };
   }
 
   // Worker で動かし、駄目ならメインスレッドに落ちる
@@ -674,7 +879,20 @@
   async function applyEngine(promise) {
     const next = await promise;
 
+    // 待っている間に設定が変わっていたら、古い設定で作られたものなので据えない
+    // （設定を変えた側の reloadEngines() が新しいものを据える）
+    if (next.version !== settingsVersion) {
+      next.dispose();
+      return;
+    }
+
+    const previous = engine;
     engine = next;
+
+    // 古い設定で作られたものは detectorCache にも残っていないので、差し替えたら畳む。
+    // 設定が同じもの（エンジンの切り替えで行き来するもの）は取っておく
+    if (previous && previous !== next && previous.version !== settingsVersion) previous.dispose();
+
     setEngineState('ready', next.name);
   }
 
@@ -875,6 +1093,9 @@
       try {
         return await current.decode(request);
       } catch (err) {
+        // 解析の途中で検出器が作り直された（古いほうを畳んだ）。落ちたわけではないので何もしない
+        if (current !== engine) return null;
+
         const fallback = fallbackFor(current, err);
         if (!fallback) throw err;
 
@@ -975,16 +1196,18 @@
 
     if (!config.scanArea) throw new Error('BarcodeScanner.configure: scanArea が必要です。');
 
-    // 選択の復元は初回だけ。configure() は設定を足すために何度でも呼べるので
+    // 設定の復元は初回だけ。configure() は設定を足すために何度でも呼べるので
     // （app.js は frameFilter の差し込みに使っている）、毎回ここを通すと
     // storageKey が null のときに選択が既定へ戻ってしまう
+    if (!configured) loadSettings();
     if (options.engine) engineChoice = options.engine;
-    else if (!configured) engineChoice = loadEngineChoice();
+    else if (!configured) engineChoice = startupEngine;
 
     configured = true;
 
-    // 停止中の状態を一度流しておく。呼び出し側はこれでボタンの初期表示を決められる
+    // 停止中の状態を一度流しておく。呼び出し側はこれでボタンと設定画面の初期表示を決められる
     emitEngine();
+    emitSettings();
   }
 
   function ensureConfigured() {
@@ -1035,6 +1258,11 @@
     capturePreview,
     getEngineState,
     getEngineChoices: () => ENGINE_CHOICES.slice(),
+    setStartupEngine,
+    setFormats,
+    setReaderOption,
+    getSettings,
+    getSettingChoices,
     isActive: () => active
   };
 })();
