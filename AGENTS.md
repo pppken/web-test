@@ -938,8 +938,12 @@ DOM も CSS のクラス名も知らない（唯一の例外が camera.js の `m
   **ページの見た目の話なので、持つのも保存するのも `app.js`**（`localStorage['scanAreaSize']`、
   JSON `{ width, height }`。「既定に戻す」でキーごと消す）。ライブラリには何も知らせない。
   barcode.js はフレームごとに枠を `getBoundingClientRect()` で測り直すので、CSS を変えれば次のフレームから効く。
-  - 既定（保存なし）は index.html の `#scanArea` の CSS のまま（幅 96%・最大 624px、高さ 20%・75〜160px）。
-    選んだときは `#scanArea.custom` と CSS 変数（`--scan-area-width` / `--scan-area-height`）で当て、
+  - **当てる大きさは 保存値 → 初期値（`app.js` の `SCAN_AREA_INITIAL`）→ CSS の既定 の順に、先にあるもの。**
+    `SCAN_AREA_INITIAL` は `{ width, height }`（%）で、カメラの起動前（「組み立て」）に当たる。
+    いまは `null`（初期値なし）で、index.html の `#scanArea` の CSS のまま（幅 96%・最大 624px、高さ 20%・75〜160px）。
+    範囲外・整数でない値はコンソールに警告を出して無視する（CSS のまま）。
+    「既定に戻す」は保存値を消すだけなので、初期値があればそこへ戻る（次に開いたときと同じ大きさ）。
+  - 保存値か初期値があるときは `#scanArea.custom` と CSS 変数（`--scan-area-width` / `--scan-area-height`）で当て、
     **px の上限・下限は外す**（残すと大きい画面で広げられない）。
     `app.js` の `SCAN_AREA_SIZE` の `default` は、この CSS と揃えておくこと。
   - 既定のままスライダーを初めて動かしたとき、もう片方は**いまの実寸を % に直した値**から始める

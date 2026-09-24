@@ -52,6 +52,12 @@
     height: { label: '高さ', min: 5, max: 100, default: 20 }
   };
 
+  // 検出枠の大きさの初期値（{ width, height }。単位は SCAN_AREA_SIZE と同じ %、範囲内の整数）。
+  // カメラの起動前（組み立て）に当てる。設定画面で選んで保存したもの（SCAN_AREA_STORAGE_KEY）が
+  // あればそちらが勝ち、「既定に戻す」はここに戻る。null なら index.html の #scanArea の CSS のまま。
+  // 範囲外・整数でない値は使わずに CSS のままにする（コンソールに警告を出す）
+  const SCAN_AREA_INITIAL = null;
+
   // 検出枠の大きさの保存先。ページの見た目の話なのでライブラリではなくこちらが持つ
   const SCAN_AREA_STORAGE_KEY = 'scanAreaSize';
 
@@ -104,6 +110,7 @@
   const scanAreaSizeFields = $('scanAreaSize');
   const scanAreaInfo = $('scanAreaInfo');
   const scanAreaResetBtn = $('scanAreaResetBtn');
+  const scanAreaDefault = $('scanAreaDefault');
 
   // どれかの js の読み込みに失敗しても、残りは動き続けるようにする。
   // 従来からある方針で、意図的なもの（片方が欠けてもカメラ単体・撮影単体は使える）
@@ -533,11 +540,14 @@
   //
   // 大きさは #scanArea の CSS だけで決まる。barcode.js はフレームごとに枠を測り直すので、
   // ここで変えれば次のフレームからその範囲を解析する（ライブラリには何も知らせない）。
-  // null は既定で、index.html の #scanArea の CSS（px の上限・下限つき）に任せる。
-  // 選んだものは #scanArea.custom と CSS 変数で、px の上限・下限を外した % として当てる
+  //
+  // 当てる大きさは、保存値 → 初期値（SCAN_AREA_INITIAL）→ index.html の #scanArea の CSS
+  // （px の上限・下限つき）の順に、先にあるもの。保存値も初期値も無いときが null で、CSS に任せる。
+  // 保存値か初期値があれば #scanArea.custom と CSS 変数で、px の上限・下限を外した % として当てる
 
-  let scanAreaSize = loadScanAreaSize();   // { width, height }（%）| null
-  const scanAreaInputs = new Map();        // 'width' / 'height' -> { input, output }
+  const scanAreaInitial = initialScanAreaSize();   // { width, height }（%）| null
+  let scanAreaSaved = loadScanAreaSize();          // 設定画面で選んで保存したもの | null
+  const scanAreaInputs = new Map();                // 'width' / 'height' -> { input, output }
 
   function validScanAreaSize(value) {
     if (!value || typeof value !== 'object') return null;
@@ -551,6 +561,19 @@
     return size;
   }
 
+  function initialScanAreaSize() {
+    if (SCAN_AREA_INITIAL === null) return null;
+
+    const size = validScanAreaSize(SCAN_AREA_INITIAL);
+    if (!size) console.warn('SCAN_AREA_INITIAL が範囲外なので、検出枠は既定の CSS のままにします', SCAN_AREA_INITIAL);
+    return size;
+  }
+
+  // いま当てる大きさ。null なら CSS の既定のまま
+  function currentScanAreaSize() {
+    return scanAreaSaved || scanAreaInitial;
+  }
+
   function loadScanAreaSize() {
     try {
       return validScanAreaSize(JSON.parse(localStorage.getItem(SCAN_AREA_STORAGE_KEY)));
@@ -562,14 +585,14 @@
 
   function saveScanAreaSize() {
     try {
-      if (scanAreaSize) localStorage.setItem(SCAN_AREA_STORAGE_KEY, JSON.stringify(scanAreaSize));
+      if (scanAreaSaved) localStorage.setItem(SCAN_AREA_STORAGE_KEY, JSON.stringify(scanAreaSaved));
       else localStorage.removeItem(SCAN_AREA_STORAGE_KEY);
     } catch (e) {
       // 保存できなくても、開いている間はその大きさで動く
     }
   }
 
-  // 既定のままのときの大きさ（%）。カメラの起動中は CSS の上限・下限込みの実寸から測る。
+  // CSS の既定のままのときの大きさ（%）。カメラの起動中は CSS の上限・下限込みの実寸から測る。
   // スライダーを初めて動かしたとき、もう片方がここから始まるので、見た目が飛ばない
   function scanAreaDefaults() {
     const area = scanArea.getBoundingClientRect();
@@ -587,11 +610,12 @@
   }
 
   function applyScanAreaSize() {
-    scanArea.classList.toggle('custom', Boolean(scanAreaSize));
+    const size = currentScanAreaSize();
+    scanArea.classList.toggle('custom', Boolean(size));
 
-    if (scanAreaSize) {
-      scanArea.style.setProperty('--scan-area-width', `${scanAreaSize.width}%`);
-      scanArea.style.setProperty('--scan-area-height', `${scanAreaSize.height}%`);
+    if (size) {
+      scanArea.style.setProperty('--scan-area-width', `${size.width}%`);
+      scanArea.style.setProperty('--scan-area-height', `${size.height}%`);
     } else {
       scanArea.style.removeProperty('--scan-area-width');
       scanArea.style.removeProperty('--scan-area-height');
@@ -599,7 +623,7 @@
   }
 
   function renderScanAreaSettings() {
-    const size = scanAreaSize || scanAreaDefaults();
+    const size = currentScanAreaSize() || scanAreaDefaults();
     for (const [key, { input, output }] of scanAreaInputs) {
       input.value = String(size[key]);
       output.value = `${size[key]}%`;
@@ -609,8 +633,9 @@
     const actual = rect.width
       ? `画面上 ${Math.round(rect.width)} x ${Math.round(rect.height)} px`
       : '実寸はカメラの起動中に出ます';
-    scanAreaInfo.textContent = scanAreaSize ? actual : `既定 · ${actual}`;
-    scanAreaResetBtn.disabled = !scanAreaSize;
+    // 「既定」は保存値が無い状態（初期値があればそれ、無ければ CSS）
+    scanAreaInfo.textContent = scanAreaSaved ? actual : `既定 · ${actual}`;
+    scanAreaResetBtn.disabled = !scanAreaSaved;
   }
 
   function buildScanAreaSettings() {
@@ -632,7 +657,7 @@
 
       // 動かしている間も枠に当てる（ダイアログの背後に枠が透けて見える）。保存は指を離したとき
       input.addEventListener('input', () => {
-        scanAreaSize = { ...(scanAreaSize || scanAreaDefaults()), [key]: Number(input.value) };
+        scanAreaSaved = { ...(currentScanAreaSize() || scanAreaDefaults()), [key]: Number(input.value) };
         applyScanAreaSize();
         renderScanAreaSettings();
       });
@@ -643,8 +668,15 @@
       scanAreaInputs.set(key, { input, output });
     }
 
+    // HTML の注記は CSS の既定の説明なので、初期値があるときはそちらに書き換える
+    if (scanAreaInitial) {
+      scanAreaDefault.textContent =
+        `既定は幅 ${scanAreaInitial.width}%・高さ ${scanAreaInitial.height}% です。`;
+    }
+
+    // 保存値を消す。初期値があればそれに、無ければ CSS の既定に戻る（次に開いたときと同じ大きさ）
     scanAreaResetBtn.addEventListener('click', () => {
-      scanAreaSize = null;
+      scanAreaSaved = null;
       applyScanAreaSize();
       saveScanAreaSize();
       renderScanAreaSettings();
@@ -1131,7 +1163,7 @@
   // configure() が設定の初期状態を流してくるので、入力欄はその前に作っておく
   buildSettings();
 
-  // 保存してある検出枠の大きさは、カメラが起動する（枠が出る）前に当てておく
+  // 検出枠の大きさ（保存値、無ければ SCAN_AREA_INITIAL）は、カメラが起動する（枠が出る）前に当てておく
   buildScanAreaSettings();
   applyScanAreaSize();
 

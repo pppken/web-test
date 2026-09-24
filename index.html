@@ -786,7 +786,8 @@
           <span id="scanAreaInfo"></span>
           <button id="scanAreaResetBtn" type="button">既定に戻す</button>
         </div>
-        <p class="settings-note">既定は幅 96%（最大 624px）・高さ 20%（75〜160px）です。動かすと px の上限・下限は外れます。枠を大きくすると、解析の前に長辺 640px まで縮めるぶん細いバーが潰れやすくなります。</p>
+        <!-- #scanAreaDefault は app.js の SCAN_AREA_INITIAL があるときだけ、その値の説明に書き換わる -->
+        <p class="settings-note"><span id="scanAreaDefault">既定は幅 96%（最大 624px）・高さ 20%（75〜160px）です。動かすと px の上限・下限は外れます。</span>枠を大きくすると、解析の前に長辺 640px まで縮めるぶん細いバーが潰れやすくなります。</p>
       </fieldset>
 
       <!-- 前処理（検討中）。app.js の setupPreprocess() が通ったときだけ出す -->
