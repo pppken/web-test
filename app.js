@@ -406,8 +406,6 @@
     preprocessEnabled = true;
 
     preprocess.configure({
-      // 集約・伸び縮みのあとに二値化する（検証中）。false で従来どおり灰色のまま渡す
-      binarize: true,
       onChange: (state) => {
         // 「前処理」ボタンも常に選択を表す。エンジンと同じくカメラの状態に依らず押せる
         preprocessBtn.textContent = `前処理: ${PREPROCESS_LABELS[state.choice] || state.choice}`;
@@ -458,7 +456,7 @@
     const age = ((performance.now() - output.time) / 1000).toFixed(1);
     const what = output.preview ? '前回の表示用に作った画像' : '解析へ渡した画像';
     previewOutputInfo.textContent =
-      `前処理の出力（${describeAggregate(output)}・${age} 秒前に${what}）` +
+      `前処理の出力（${PREPROCESS_LABELS[output.mode] || output.mode}・${age} 秒前に${what}）` +
       `　${output.width} × ${output.height}` +
       (output.pad ? `（うち左右 ${output.pad}px は白の余白）` : '（余白なし）') +
       '　等倍表示。はみ出すときは横にスクロールできます';
@@ -532,17 +530,12 @@
     previewWaveInfo.textContent = describeWave(debug);
   }
 
-  // 集約の仕方と、そのあとに二値化したかどうか
-  function describeAggregate(info) {
-    const label = PREPROCESS_LABELS[info.mode] || info.mode;
-    return info.binarize ? `${label} → 二値化` : label;
-  }
 
   // 最細バー／最細スペースは、実際の module width が何 px あるかの答えそのもの。
   // 集約画像の尺と、元映像の尺（srcScale で割り戻したもの）と、解析に渡す出力画像の尺
   // （scale を掛けたもの。出力を縮めているときはここが一番細い）を出す
   function describeWave(debug) {
-    const parts = [`集約: ${describeAggregate(debug)}（${debug.width} × ${debug.height} 段）`];
+    const parts = [`集約: ${PREPROCESS_LABELS[debug.mode] || debug.mode}（${debug.width} × ${debug.height} 段）`];
 
     if (debug.runs) {
       const other = (px) =>
