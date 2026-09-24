@@ -527,8 +527,8 @@
         <button id="scanPreviewBtn" disabled>検出画像</button>
         <!-- ラベルは app.js が現在の選択で上書きする -->
         <button id="engineBtn">エンジン: 自動</button>
-        <!-- ラベルは app.js が現在の選択で上書きする -->
-        <button id="preprocessBtn">前処理: なし</button>
+        <!-- 前処理（検討中）。app.js の setupPreprocess() が表示し、ラベルも現在の選択で上書きする -->
+        <button id="preprocessBtn" hidden>前処理: なし</button>
         <!-- ラベルは app.js が現在の倍率で上書きする -->
         <button id="zoomBtn" disabled>ズーム</button>
         <!-- ラベルは app.js が現在の明るさで上書きする -->
@@ -584,9 +584,16 @@
     (() => {
       const version = Date.now();
       // async = false で、記述した順に実行される。
-      // js/ のライブラリ 3 つは互いを参照しないので順不同だが、app.js だけは
-      // 3 つの window.* を使うので必ず最後に置くこと
-      for (const src of ['js/camera.js', 'js/barcode.js', 'js/photo.js', 'app.js']) {
+      // js/ のライブラリは互いを参照しないので順不同だが、app.js だけは
+      // それらの window.* を使うので必ず最後に置くこと。
+      // barcode-preprocess.js は検討中の前処理で、この 1 行を消しても他は動く
+      for (const src of [
+        'js/camera.js',
+        'js/barcode.js',
+        'js/barcode-preprocess.js',
+        'js/photo.js',
+        'app.js'
+      ]) {
         const script = document.createElement('script');
         script.src = `${src}?v=${version}`;
         script.async = false;

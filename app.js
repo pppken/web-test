@@ -2,7 +2,7 @@
   'use strict';
 
   // このページ固有の配線。DOM を探すのはこのファイルだけで、
-  // camera.js / barcode.js / photo.js は要素もコールバックも configure() で受け取る。
+  // js/ のライブラリは要素もコールバックも configure() で受け取る。
   //
   // ここにあるもの:
   //   - 要素の取得と、ボタンのイベント
@@ -10,8 +10,9 @@
   //   - 3 つのダイアログ（結果 / 撮影 / 検出画像）と、その開閉に合わせた解析の停止と再開
   //   - #frame.idle の付け外し
   //
-  // 3 つのライブラリはそれぞれ独立していて、互いを参照しない。
-  // 組み合わせるのはこのファイルの役目（カメラが起動したら読み取りと撮影を始める、など）。
+  // ライブラリはそれぞれ独立していて、互いを参照しない。
+  // 組み合わせるのはこのファイルの役目（カメラのフレームを barcode.js の detect に渡す、
+  // カメラが起動したら読み取りと撮影の準備をする、など）。
 
   const LABEL_RESET_MS = 1500;
 
@@ -21,17 +22,6 @@
     zxing: 'ZXing',
     'zxing-cpp': 'ZXing-C++',
     quagga: 'Quagga2'
-  };
-
-  // 前処理（縦方向の集約）の選択値 -> ボタンに出す表示。
-  // 'ab' は前処理ありと無しを 1 フレームおきに交互に回して検出率を比べる計測用で、
-  // このときだけ結果ダイアログを出さない（止まると数が溜まらない）
-  const PREPROCESS_LABELS = {
-    off: 'なし',
-    mean: '平均',
-    median: '中央値',
-    trimmed: 'トリム平均',
-    ab: 'A/B 比較'
   };
 
   // 撮影がどちらの経路を通ったか（photo.js の method）
@@ -65,7 +55,6 @@
   const brightnessRange = $('brightnessRange');
   const brightnessValueLabel = $('brightnessValue');
   const previewBtn = $('scanPreviewBtn');
-  const preprocessBtn = $('preprocessBtn');
 
   const resultDialog = $('result');
   const resultTitle = $('resultTitle');
@@ -84,25 +73,20 @@
   const previewDialog = $('scanPreview');
   const previewImage = $('scanPreviewImage');
   const previewInfo = $('scanPreviewInfo');
-  const previewWave = $('scanWave');
-  const previewWaveInfo = $('scanWaveInfo');
   const previewCloseBtn = $('scanPreviewCloseBtn');
 
   // どれかの js の読み込みに失敗しても、残りは動き続けるようにする。
   // 従来からある方針で、意図的なもの（片方が欠けてもカメラ単体・撮影単体は使える）
   const camera = window.CameraController || {
     configure() {}, start() {}, stop() {}, switchCamera() {}, watchPermission() {},
-    zoomNext() {}, setBrightness() {},
-    isRunning: () => false, getFacingMode: () => 'environment', getTrack: () => null
+    zoomNext() {}, setBrightness() {}, pauseScan() {}, resumeScan() {},
+    isScanPaused: () => false, isRunning: () => false, getFacingMode: () => 'environment', getTrack: () => null
   };
 
   const scanner = window.BarcodeScanner || {
-    configure() {}, start() {}, stop() {}, pause() {}, resume() {},
-    setEngine() {}, nextEngine() {}, capturePreview: () => null,
-    setPreprocess() {}, nextPreprocess() {}, resetStats() {},
-    getPreprocessState: () => ({ choice: 'off' }), getPreprocessChoices: () => [],
-    getStats: () => ({ plain: {}, pre: {} }),
-    getEngineChoices: () => [], isActive: () => false, isPaused: () => false
+    configure() {}, start() {}, stop() {}, detect: () => Promise.resolve(null),
+    setEngine() {}, nextEngine() {}, capturePreview: () => Promise.resolve(null),
+    getEngineState: () => ({ status: 'idle' }), getEngineChoices: () => [], isActive: () => false
   };
 
   const photo = window.PhotoCapture || {
@@ -165,8 +149,8 @@
   }
 
   function syncScanning() {
-    if (anyDialogOpen()) scanner.pause();
-    else scanner.resume();
+    if (anyDialogOpen()) camera.pauseScan();
+    else camera.resumeScan();
   }
 
   function setRunning(running) {
@@ -218,15 +202,8 @@
     }
 
     const rate = state.rate === null ? state.name : `${state.name} · ${state.rate}/s`;
-    engineLabel.textContent = state.preprocess === 'ab' ? `${rate} · ${formatStats(state.stats)}` : rate;
-  }
-
-  // A/B 比較の途中経過。前処理あり／なしそれぞれの「解析した回数のうち読めた割合」
-  function formatStats(stats) {
-    if (!stats) return '';
-    const pct = (bucket) =>
-      bucket && bucket.tries ? `${Math.round((bucket.hits / bucket.tries) * 100)}%` : '–';
-    return `前 ${pct(stats.pre)} / 素 ${pct(stats.plain)}`;
+    // 前処理の A/B 比較中だけ、検出率の途中経過を足す
+    engineLabel.textContent = isBenchmarking() ? `${rate} · ${formatStats()}` : rate;
   }
 
   // 「エンジン」ボタンのラベルは常にその時の選択を表すので、setLabel() は通さない。
@@ -236,29 +213,11 @@
     engineBtn.disabled = state.busy;
   }
 
-  // 「前処理」ボタンも常に選択を表す。エンジンと同じくカメラの状態に依らず押せる
-  function renderPreprocessButton(state) {
-    const choice = state.preprocess || 'off';
-    preprocessBtn.textContent = `前処理: ${PREPROCESS_LABELS[choice] || choice}`;
-  }
-
   function handleEngineChange(state) {
     renderEngineBadge(state);
     renderEngineButton(state);
-    renderPreprocessButton(state);
     previewBtn.disabled = !state.active;
   }
-
-  // A/B 比較の間は結果ダイアログを出さない。1 枚読めたところで止まってしまうと
-  // 検出率が溜まらないため、autoPause ごと切る
-  function isBenchmarking() {
-    return scanner.getPreprocessState().choice === 'ab';
-  }
-
-  preprocessBtn.addEventListener('click', () => {
-    scanner.nextPreprocess();
-    scanner.configure({ autoPause: !isBenchmarking() });
-  });
 
   // --- ズーム -----------------------------------------------------------
 
@@ -372,29 +331,112 @@
 
   // 解析に渡しているのと同じ画像を、そのままダイアログに出す。
   // 枠のズレや余白の付き方、縮小後にバーが潰れていないかをその場で確認する
-  function showPreview() {
-    const preview = scanner.capturePreview();
+  async function showPreview() {
+    const preview = await scanner.capturePreview();
     if (!preview) {
       setLabel(previewBtn, '取得できません');
       return;
     }
 
-    previewInfo.textContent = preview.pad
-      ? `${preview.width} × ${preview.height}（うち左右 ${preview.pad}px は白の余白）`
+    // 前処理が作った画像なら、余白の幅は前処理側の検証用データに入っている
+    const debug = preprocessDebug();
+    const pad = preview.pad !== null ? preview.pad : debug && debug.pad;
+
+    previewInfo.textContent = pad
+      ? `${preview.width} × ${preview.height}（うち左右 ${pad}px は白の余白）`
       : `${preview.width} × ${preview.height}`;
     // 解析に渡すのと同じ画素をそのまま見たいので、非可逆な形式にはしない
     previewImage.src = preview.canvas.toDataURL('image/png');
 
-    renderWave(preview.preprocess);
+    renderWave(debug);
 
     openDialog(previewDialog);
   }
 
-  // --- 集約した 1 次元波形の表示（前処理の検証用）------------------------
+  previewBtn.addEventListener('click', showPreview);
+  previewCloseBtn.addEventListener('click', () => previewDialog.close());
+
+  previewDialog.addEventListener('close', () => {
+    // data URL を抱えたままにしない
+    previewImage.removeAttribute('src');
+    syncScanning();
+  });
+
+  // --- 前処理（js/barcode-preprocess.js。検討中）--------------------------
   //
+  // 前処理にまつわるページ側の配線はこの節にまとめてある。有効にするのは
+  // 「組み立て」の setupPreprocess() の 1 行で、それを消せば前処理は一切動かない
+  // （ボタンも出ない）。完全に外すときは、この節と setupPreprocess() の行、
+  // index.html の #preprocessBtn / #scanWave / #scanWaveInfo とローダの 1 行、
+  // js/barcode-preprocess.js を消す。
+  //
+  // 'ab' は前処理ありと無しを 1 フレームおきに交互に回して検出率を比べる計測用で、
+  // このときだけ結果ダイアログを出さない（止まると数が溜まらない）
+
+  // 選択値 -> ボタンに出す表示
+  const PREPROCESS_LABELS = {
+    off: 'なし',
+    mean: '平均',
+    median: '中央値',
+    trimmed: 'トリム平均',
+    ab: 'A/B 比較'
+  };
+
+  const preprocessBtn = $('preprocessBtn');
+  const previewWave = $('scanWave');
+  const previewWaveInfo = $('scanWaveInfo');
+
+  const preprocess = window.BarcodePreprocess || {
+    configure() {}, filter: null, nextMode() {},
+    getState: () => ({ choice: 'off', debug: null, stats: null })
+  };
+
+  let preprocessEnabled = false;
+
+  function setupPreprocess() {
+    if (!window.BarcodePreprocess) return;
+    preprocessEnabled = true;
+
+    preprocess.configure({
+      onChange: (state) => {
+        // 「前処理」ボタンも常に選択を表す。エンジンと同じくカメラの状態に依らず押せる
+        preprocessBtn.textContent = `前処理: ${PREPROCESS_LABELS[state.choice] || state.choice}`;
+        // A/B 比較の間は結果ダイアログを出さない。1 枚読めたところで止まってしまうと
+        // 検出率が溜まらないため、autoPause ごと切る
+        camera.configure({ autoPause: state.choice !== 'ab' });
+        renderEngineBadge(scanner.getEngineState());
+      }
+    });
+
+    // barcode.js への差し込みはここだけ
+    scanner.configure({ frameFilter: preprocess.filter });
+
+    preprocessBtn.hidden = false;
+    preprocessBtn.addEventListener('click', () => preprocess.nextMode());
+  }
+
+  function isBenchmarking() {
+    return preprocessEnabled && preprocess.getState().choice === 'ab';
+  }
+
+  function preprocessDebug() {
+    if (!preprocessEnabled) return null;
+    const state = preprocess.getState();
+    return state.choice === 'off' ? null : state.debug;
+  }
+
+  // A/B 比較の途中経過。前処理あり／なしそれぞれの「解析した回数のうち読めた割合」
+  function formatStats() {
+    const stats = preprocess.getState().stats;
+    if (!stats) return '';
+    const pct = (bucket) =>
+      bucket && bucket.tries ? `${Math.round((bucket.hits / bucket.tries) * 100)}%` : '–';
+    return `前 ${pct(stats.pre)} / 素 ${pct(stats.plain)}`;
+  }
+
+  // 集約した 1 次元波形の表示（前処理の検証用）。
   // X 座標・輝度・しきい値・黒白の判定を 1 枚に重ねて出す。
   // 前処理が実際にどう効いているかは、この波形を見るのが一番早い
-
   function renderWave(debug) {
     if (!debug || !debug.profile) {
       previewWave.hidden = true;
@@ -475,15 +517,6 @@
 
     return parts.join('　');
   }
-
-  previewBtn.addEventListener('click', showPreview);
-  previewCloseBtn.addEventListener('click', () => previewDialog.close());
-
-  previewDialog.addEventListener('close', () => {
-    // data URL を抱えたままにしない
-    previewImage.removeAttribute('src');
-    syncScanning();
-  });
 
   // --- 撮影のダイアログ -------------------------------------------------
 
@@ -592,19 +625,11 @@
   // --- 組み立て ---------------------------------------------------------
 
   scanner.configure({
-    video,
     scanArea,
     // ライブラリは js/ に、同梱ライブラリは vendor/ に置いてある。
     // barcode.js の既定は自分と同じ場所の vendor/（= js/vendor/）なので、
     // このページの置き方に合わせてここで指す
     vendorPath: new URL('vendor/', document.baseURI).href,
-    onDetect: (result) => {
-      // A/B 比較の間は数えるだけ（バッジに途中経過が出る）
-      if (isBenchmarking()) return;
-
-      if (navigator.vibrate) navigator.vibrate(60);
-      showResult(result);
-    },
     onEngineChange: handleEngineChange,
     onError: ({ code, message }) => {
       // 解析エラーは 1 フレームごとに起きうる（Quagga2 のタイムアウトなど）ので
@@ -614,9 +639,6 @@
       showError(message);
     }
   });
-
-  // 前処理の選択は localStorage から復元されるので、autoPause をそれに合わせる
-  scanner.configure({ autoPause: !isBenchmarking() });
 
   photo.configure({
     video,
@@ -633,13 +655,24 @@
   camera.configure({
     video,
 
+    // フレームを受け取って検出するのは barcode.js。結果は onDetect で返ってくる
+    detector: scanner.detect,
+
+    onDetect: (result) => {
+      // 前処理の A/B 比較の間は数えるだけ（バッジに途中経過が出る）
+      if (isBenchmarking()) return;
+
+      if (navigator.vibrate) navigator.vibrate(60);
+      showResult(result);
+    },
+
     onStarting: ({ facingMode: mode }) => {
       facingMode = mode;
       resolution = null;
       setStatus('カメラを起動中...');
     },
 
-    // カメラが起動したら読み取りと撮影を始める。この 3 つを結び付けるのはここだけ
+    // カメラが起動したら検出と撮影の準備をする。フレームは camera.js が detector に渡してくる
     onStart: ({ facingMode: mode, track }) => {
       facingMode = mode;
       setRunning(true);
@@ -668,6 +701,10 @@
     onBrightness: handleBrightnessChange,
     onError: ({ message }) => setStatus(message)
   });
+
+  // 前処理（検討中）。外すときはこの 1 行を消す。
+  // autoPause を camera.js に入れ直すので、camera.configure() より後に置くこと
+  setupPreprocess();
 
   setRunning(false);
   renderShutter();

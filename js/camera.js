@@ -2,6 +2,8 @@
   'use strict';
 
   // getUserMedia でのカメラ制御。ズームと明るさ（端末が対応している範囲だけ）も持つ。
+  // カメラが動いている間はフレームを取り続け、detector（呼び出し側が渡す検出の関数。
+  // このページでは BarcodeScanner.detect）に 1 枚ずつ渡して、見つかった結果を onDetect で知らせる。
   //
   // このファイルは DOM を探さない。<video> もコールバックも configure() で受け取り、
   // ボタン・ステータス表示・CSS クラスの付け外しは呼び出し側の責任にしてある
@@ -14,14 +16,27 @@
   //     storageKey,                  // 向きの保存先。null で保存しない
   //     mirrorClass,                 // フロント時に video へ付ける class。null で付けない
   //     zoomFactors,                 // ズームで巡回する倍率（等倍の何倍か）
+  //     detector,                    // (frame) => Promise<result | null>。無ければフレームは取らない
+  //     scanInterval,                // 1 枚の解析が終わってから次のフレームを取るまでの間隔（ms）
+  //     autoPause,                   // 検出したら自動で pauseScan() する（既定 true）
   //     onStarting({ facingMode }),
   //     onStart({ facingMode, track, mirrored }),
   //     onStop({ silent }),
   //     onResolution({ width, height }),
   //     onZoom(state), onBrightness(state),   // state の中身は getZoomState() / getBrightnessState()
+  //     onDetect(result),            // detector が返した結果（null 以外）
   //     onError({ code, message, error })
   //   });
   //   CameraController.start() / stop() / switchCamera() / watchPermission()
+  //   CameraController.pauseScan() / resumeScan()   // カメラは動かしたまま、フレームの受け渡しだけ止める
+  //
+  // detector に渡す frame は { video, width, height, time, serial, facingMode }。
+  // 画素のコピーではなく <video> そのものを渡す。受け取った側（barcode.js）が要る範囲
+  // （検出枠のぶん）だけを読めばよく、映像を丸ごと複製しないで済むため。
+  // detector の結果が返るまで次のフレームは渡さない（解析が重なることはない）。
+  //
+  // onDetect が呼ばれた時点で（autoPause が既定のままなら）フレームの受け渡しは止まっている。
+  // 結果を見せ終わったら resumeScan() を呼ぶこと。呼ばない限り読み直さない。
   //
   // onError の code は 'insecure-context' / 'unsupported' / 'denied' / 'blocked' /
   // 'not-found' / 'in-use' / 'unknown' / 'zoom-failed' / 'brightness-failed'。
@@ -56,6 +71,10 @@
   // step を返さない端末で、刻みを作るための段数
   const BRIGHTNESS_STEPS = 100;
 
+  // 1 枚の解析が終わってから次のフレームを取るまでの間隔。1 秒あたり約 8 回解析する。
+  // setInterval にしないのは、解析が遅れたときにフレームが溜まらないようにするため
+  const SCAN_INTERVAL_MS = 120;
+
   // onError の既定の文言。呼び出し側は code だけを見て自前の文言を出してもよい
   const MESSAGES = {
     'insecure-context': 'https:// か http://localhost で開いてください。',
@@ -77,12 +96,16 @@
     storageKey: DEFAULT_STORAGE_KEY,
     mirrorClass: DEFAULT_MIRROR_CLASS,
     zoomFactors: ZOOM_FACTORS,
+    detector: null,
+    scanInterval: SCAN_INTERVAL_MS,
+    autoPause: true,
     onStarting: null,
     onStart: null,
     onStop: null,
     onResolution: null,
     onZoom: null,
     onBrightness: null,
+    onDetect: null,
     onError: null
   };
 
@@ -100,6 +123,15 @@
   let brightnessValue = 0;       // 最後に適用できた値
   let brightnessPending = null;  // 適用中に動かされたぶん（最新の 1 つだけ持つ）
   let brightnessApplying = false;
+
+  let scanPaused = false;   // 結果の表示中など、フレームの受け渡しを止めているか
+  let scanTimer = null;
+  let scanToken = 0;        // ループを畳むたびに進める。古いループの続きを見分ける
+  let frameSerial = 0;      // 新しいフレームが届くたびに進む（requestVideoFrameCallback）
+  let scannedSerial = -1;   // 最後に detector へ渡したフレームの serial
+  let frameTime = 0;        // 最後に届いたフレームの mediaTime（秒）
+  let frameHandle = null;
+  let frameWaiter = null;   // 新しいフレームを待っているループの続き
 
   // 呼び出し側のコールバックが投げても、こちらの処理は止めない
   function emit(name, payload) {
@@ -141,12 +173,17 @@
     }
   }
 
+  // 設定を足すために何度でも呼べる（app.js は autoPause の切り替えに使っている）。
+  // 向きの復元と初期状態の通知は初回だけ
   function configure(options = {}) {
     Object.assign(config, options);
 
     if (!config.video) throw new Error('CameraController.configure: video が必要です。');
 
-    facingMode = options.facingMode || loadFacingMode();
+    if (options.facingMode) facingMode = options.facingMode;
+    else if (!configured) facingMode = loadFacingMode();
+
+    if (configured) return;
     configured = true;
 
     // 停止中の状態（いずれも「非対応」）を一度流しておく。
@@ -473,6 +510,139 @@
     }
   }
 
+  // --- フレームの受け渡し -----------------------------------------------
+  //
+  // カメラが動いている間、フレームを 1 枚ずつ detector に渡し、結果を onDetect で知らせる。
+  // 1 枚の解析が終わってから scanInterval 待ち、さらに**前回渡したものより新しいフレームが
+  // 届いていれば**次を渡す（同じフレームを 2 回解析しない）。新しいフレームが届いたかは
+  // requestVideoFrameCallback で数える。未対応のブラウザでは待たずに渡す。
+  //
+  // ループを外から止める／回し直すのは cancelScan() / restartScan() の 2 つだけ。
+  // 解析（await）の途中で止められてもその続きを畳めるよう、scanToken で世代を数えている。
+  // これが無いと、解析待ちのあいだに停止 -> 再開したときにループが二重に回る
+
+  function canScan() {
+    return Boolean(stream) && !scanPaused && typeof config.detector === 'function';
+  }
+
+  function onVideoFrame(now, metadata) {
+    frameHandle = null;
+    frameSerial += 1;
+    frameTime = metadata && typeof metadata.mediaTime === 'number' ? metadata.mediaTime : now / 1000;
+
+    if (frameWaiter) {
+      const resume = frameWaiter;
+      frameWaiter = null;
+      resume();
+    }
+
+    if (stream) frameHandle = config.video.requestVideoFrameCallback(onVideoFrame);
+  }
+
+  function watchFrames() {
+    const video = config.video;
+    if (typeof video.requestVideoFrameCallback !== 'function' || frameHandle !== null) return;
+
+    frameHandle = video.requestVideoFrameCallback(onVideoFrame);
+  }
+
+  function unwatchFrames() {
+    const video = config.video;
+    if (frameHandle !== null && typeof video.cancelVideoFrameCallback === 'function') {
+      video.cancelVideoFrameCallback(frameHandle);
+    }
+    frameHandle = null;
+  }
+
+  // 前回渡したものより新しいフレームが届くまで待つ。数えられないブラウザでは待たない
+  function waitForNewFrame() {
+    if (frameHandle === null || frameSerial !== scannedSerial) return Promise.resolve();
+
+    return new Promise((resolve) => {
+      frameWaiter = resolve;
+    });
+  }
+
+  // detector に渡すフレーム。画素は複製しない（先頭のコメントを参照）
+  function grabFrame() {
+    const video = config.video;
+
+    return {
+      video,
+      width: video.videoWidth,
+      height: video.videoHeight,
+      time: frameTime,
+      serial: frameSerial,
+      facingMode
+    };
+  }
+
+  function handleResult(result) {
+    // 止めないと、結果を見せている間も 8 回/秒で同じコードを拾い続けることになる。
+    // 読み直したくなったら呼び出し側が resumeScan() を呼ぶ
+    if (config.autoPause) pauseScan();
+    emit('onDetect', result);
+  }
+
+  async function scanOnce(token) {
+    scanTimer = null;
+    if (token !== scanToken || !canScan()) return;
+
+    await waitForNewFrame();
+    if (token !== scanToken || !canScan()) return;
+
+    scannedSerial = frameSerial;
+
+    let result = null;
+    try {
+      result = await config.detector(grabFrame());
+    } catch (err) {
+      // detector 側の失敗でループを止めない（知らせるのは detector 側の役目）
+      console.error('フレームの解析に失敗しました', err);
+    }
+
+    // 解析を待っている間にループが畳まれて回し直されていたら、この呼び出しは
+    // 古い世代なのでここで終わる
+    if (token !== scanToken) return;
+    if (result && canScan()) handleResult(result);
+
+    // 解析が遅れてもフレームが溜まらないよう、完了してから次を予約する
+    if (canScan()) scanTimer = setTimeout(() => scanOnce(token), config.scanInterval);
+  }
+
+  // 予約済みの次回ぶんを取り消し、世代を進める。
+  // 解析の途中（await 中）の続きは、完了時に世代のずれを見て自分で畳む
+  function cancelScan() {
+    scanToken += 1;
+    clearTimeout(scanTimer);
+    scanTimer = null;
+
+    // 新しいフレームを待っている続きは起こして、世代のずれで畳ませる
+    if (frameWaiter) {
+      const resume = frameWaiter;
+      frameWaiter = null;
+      resume();
+    }
+  }
+
+  function restartScan() {
+    cancelScan();
+    if (canScan()) scanOnce(scanToken);
+  }
+
+  // 結果の表示中など、カメラは動かしたままフレームの受け渡しだけ止める
+  function pauseScan() {
+    if (scanPaused) return;
+    scanPaused = true;
+    cancelScan();
+  }
+
+  function resumeScan() {
+    if (!scanPaused) return;
+    scanPaused = false;
+    restartScan();
+  }
+
   // --- 起動と停止 -------------------------------------------------------
 
   async function startCamera() {
@@ -514,6 +684,12 @@
 
       emit('onStart', { facingMode, track: videoTrack, mirrored: facingMode === 'user' });
       emitResolution();
+
+      // 呼び出し側が onStart で検出の準備（BarcodeScanner.start()）を始めてから回す。
+      // 準備が終わるまでの detector は null を返すだけなので、待たなくてよい
+      scanPaused = false;
+      watchFrames();
+      restartScan();
     } catch (err) {
       handleError(err);
     }
@@ -521,6 +697,9 @@
 
   function stopCamera(options = {}) {
     if (!stream) return;
+
+    cancelScan();
+    unwatchFrames();
 
     stream.getTracks().forEach((track) => track.stop());
     stream = null;
@@ -650,6 +829,9 @@
     watchPermission,
     zoomNext,
     setBrightness,
+    pauseScan,
+    resumeScan,
+    isScanPaused: () => scanPaused,
     getZoomState,
     getBrightnessState,
     isRunning: () => Boolean(stream),
