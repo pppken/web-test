@@ -406,6 +406,9 @@
     preprocessEnabled = true;
 
     preprocess.configure({
+      // 灰色にした直後のコントラスト正規化（検証中）。
+      // 'off' | 'stretch'（上下 1% を捨てて 0〜255 に伸ばす）| 'clahe'（区画ごとに平坦化）
+      contrastNormalize: 'stretch',
       onChange: (state) => {
         // 「前処理」ボタンも常に選択を表す。エンジンと同じくカメラの状態に依らず押せる
         preprocessBtn.textContent = `前処理: ${PREPROCESS_LABELS[state.choice] || state.choice}`;
@@ -531,6 +534,17 @@
   }
 
 
+  // 灰色にした直後のコントラスト正規化で、何をしたか
+  function describeContrastNormalize(info) {
+    if (!info || info.mode === 'off') return 'なし';
+    if (info.mode === 'stretch') {
+      return info.applied
+        ? `stretch（${info.lo}〜${info.hi} → 0〜255）`
+        : `stretch（${info.lo}〜${info.hi}。幅が足りず見送り）`;
+    }
+    return `CLAHE（${info.tilesX} × ${info.tilesY} 区画・クリップ ${info.clip}）`;
+  }
+
   // 最細バー／最細スペースは、実際の module width が何 px あるかの答えそのもの。
   // 集約画像の尺と、元映像の尺（srcScale で割り戻したもの）と、解析に渡す出力画像の尺
   // （scale を掛けたもの。出力を縮めているときはここが一番細い）を出す
@@ -546,6 +560,7 @@
       parts.push(`本数: ${debug.runs.bars}`);
     }
 
+    parts.push(`コントラスト正規化: ${describeContrastNormalize(debug.contrastNormalize)}`);
     parts.push(`傾き補正: ${debug.shear}px`);
     parts.push(`振幅: ${Math.round(debug.contrast.range)}/255`);
     // 'none' のときは二値化せずに渡しているので、波形の黒白は実測用の目安でしかない

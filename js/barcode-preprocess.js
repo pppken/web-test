@@ -8,6 +8,7 @@
   //
   //   BarcodePreprocess.configure({
   //     mode,          // 'off' | 'mean' | 'median' | 'trimmed' | 'ab'（既定は保存値。無ければ 'median'）
+  //     contrastNormalize, // 灰色にした直後のコントラスト正規化。'off'（既定）| 'stretch' | 'clahe'
   //     threshold,     // 集約後の二値化。'none'（既定）| 'otsu' | 'adaptive'
   //     smooth,        // 集約後に 3 タップの平滑化を掛ける（既定 false）
   //     shear,         // 傾き（シアー）の補正を入れる（既定 true）
@@ -72,6 +73,15 @@
   const PRE_MIN_CONTRAST = 16;    // 集約した波形の振幅がこれ未満なら前処理を諦めて
                                   // 素通しの経路に落ちる（枠内にバーコードが無い・
                                   // バーが横向きで縦集約に耐えない、のいずれか）
+  const PRE_STRETCH_CLIP = 0.01;  // コントラスト正規化 'stretch' で、暗い側・明るい側それぞれ
+                                  // 捨てる割合。反射や枠の端の影 1 点に伸ばし幅を引っ張られないため
+  const PRE_CLAHE_TILES_X = 8;    // CLAHE の横の区画数。区画の幅（1280px 幅なら 160px）に
+                                  // バーとスペースが両方入る程度に粗くしておく
+  const PRE_CLAHE_TILES_Y = 1;    // CLAHE の縦の区画数。取り込みが 32 段しかなく、1 段が既に
+                                  // 元の十数ラインの平均なので縦には分けない
+  const PRE_CLAHE_CLIP = 2.0;     // CLAHE のクリップ上限（1 階調あたりの平均画素数の何倍まで
+                                  // 許すか）。上げるほど区画ごとの伸ばし方が強くなり、
+                                  // 無地の場所のノイズも持ち上がる
 
   // 集約の仕方。'off' は前処理なし、'ab' は 1 フレームおきに off と
   // AB_MODE を入れ替えて検出率を比べる計測用。
@@ -108,8 +118,24 @@
   // 黒に倒れる）。読み比べ用に残してあるだけで、既定にはしないこと
   const THRESHOLD_MODES = ['none', 'otsu', 'adaptive'];
 
+  // 灰色にした直後（傾きの測定・集約より前）に掛けるコントラスト正規化。
+  //   'off'      何もしない（集約後の normalize() だけ）
+  //   'stretch'  ROI の輝度の上下 PRE_STRETCH_CLIP を捨て、残りを 0〜255 に線形に伸ばす
+  //   'clahe'    ROI を横に PRE_CLAHE_TILES_X 区画に分け、区画ごとにクリップ付きの
+  //              ヒストグラム平坦化を掛けて、区画の間は線形補間でつなぐ
+  //
+  // 'stretch' は全体に同じ直線を掛けるだけなので、明るさの順番は変わらない。
+  // 中央値の集約とは入れ替えても結果が同じで、集約後の normalize()（最小〜最大を
+  // 0〜255 に伸ばす）との違いは「上下の外れ値に引っ張られない」ことだけになる。
+  //
+  // 'clahe' は場所ごとに伸ばし方を変えるので、影や照明のむらで ROI の左右の明るさが
+  // 違うときに効く。その代わり階調の写し方が直線でなくなるので、ぼけた縁の
+  // 「中間の濃さ」の位置がずれ、バーの太さが偏りうる（読み比べて決めること）
+  const CONTRAST_MODES = ['off', 'stretch', 'clahe'];
+
   const config = {
     mode: null,
+    contrastNormalize: 'off',
     threshold: 'none',
     smooth: false,
     shear: true,
@@ -227,6 +253,7 @@
     return {
       choice: current,
       mode: current === 'ab' ? AB_MODE : current,
+      contrastNormalize: contrastMode(),
       threshold: config.threshold,
       smooth: !!config.smooth,
       shear: !!config.shear,
@@ -337,6 +364,120 @@
     }
 
     return gray;
+  }
+
+  function contrastMode() {
+    return CONTRAST_MODES.includes(config.contrastNormalize) ? config.contrastNormalize : 'off';
+  }
+
+  // ヒストグラムで、暗い方から数えて rank 個目の画素がある階調
+  function histogramRank(hist, rank) {
+    let sum = 0;
+    for (let v = 0; v < 256; v++) {
+      sum += hist[v];
+      if (sum > rank) return v;
+    }
+    return 255;
+  }
+
+  // 'stretch'。ROI の輝度の上下 PRE_STRETCH_CLIP を捨て、残りを 0〜255 に線形に伸ばす。
+  // 例えば黒バー 50〜100・白 170〜220 なら、50 付近を 0、220 付近を 255 に写す。
+  // gray をその場で書き換える
+  function stretchGray(gray) {
+    const hist = new Int32Array(256);
+    for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
+
+    const lo = histogramRank(hist, gray.length * PRE_STRETCH_CLIP);
+    const hi = histogramRank(hist, gray.length * (1 - PRE_STRETCH_CLIP));
+    // 伸ばす幅が無い（枠内が無地）ときは触らない。集約後の normalize() が前処理を見送る
+    if (hi - lo < PRE_MIN_CONTRAST) return { mode: 'stretch', lo, hi, applied: false };
+
+    const lut = new Uint8Array(256);
+    const gain = 255 / (hi - lo);
+    for (let v = 0; v < 256; v++) {
+      const c = Math.round((v - lo) * gain);
+      lut[v] = c < 0 ? 0 : c > 255 ? 255 : c;
+    }
+    for (let i = 0; i < gray.length; i++) gray[i] = lut[gray[i]];
+
+    return { mode: 'stretch', lo, hi, applied: true };
+  }
+
+  // 'clahe'（Contrast Limited Adaptive Histogram Equalization）。
+  // ROI を tilesX x tilesY の区画に分けて、区画ごとに
+  //   1. ヒストグラムを取り、PRE_CLAHE_CLIP を超えた分を切り取って全階調に配り直す
+  //      （これが無いと、無地の区画のわずかなノイズが 0〜255 いっぱいに伸びる）
+  //   2. 累積分布を階調の対応表にする（ヒストグラム平坦化）
+  // を作り、各画素は周りの区画の中心からの距離で対応表を線形補間する
+  // （区画の境目で明るさが段になるのを防ぐ）。gray をその場で書き換える
+  function claheGray(gray, width, height) {
+    // 区画が細すぎる・低すぎると 1 区画にバーとスペースが両方入らないので、減らす
+    const tilesX = Math.max(1, Math.min(PRE_CLAHE_TILES_X, Math.floor(width / 32)));
+    const tilesY = Math.max(1, Math.min(PRE_CLAHE_TILES_Y, Math.floor(height / 8)));
+    const tileW = width / tilesX;
+    const tileH = height / tilesY;
+
+    const luts = [];
+    const hist = new Float32Array(256);
+    for (let ty = 0; ty < tilesY; ty++) {
+      const y0 = Math.round(ty * tileH);
+      const y1 = Math.round((ty + 1) * tileH);
+      for (let tx = 0; tx < tilesX; tx++) {
+        const x0 = Math.round(tx * tileW);
+        const x1 = Math.round((tx + 1) * tileW);
+        const count = (x1 - x0) * (y1 - y0);
+
+        hist.fill(0);
+        for (let y = y0; y < y1; y++) {
+          const row = y * width;
+          for (let x = x0; x < x1; x++) hist[gray[row + x]]++;
+        }
+
+        // 切り取った分は全階調に均等に配り直す（総数は変わらない）
+        const limit = Math.max(1, (PRE_CLAHE_CLIP * count) / 256);
+        let excess = 0;
+        for (let v = 0; v < 256; v++) {
+          if (hist[v] > limit) {
+            excess += hist[v] - limit;
+            hist[v] = limit;
+          }
+        }
+        const share = excess / 256;
+
+        const lut = new Uint8Array(256);
+        let cdf = 0;
+        for (let v = 0; v < 256; v++) {
+          cdf += hist[v] + share;
+          const c = Math.round((cdf * 255) / count);
+          lut[v] = c > 255 ? 255 : c;
+        }
+        luts.push(lut);
+      }
+    }
+
+    // 区画の中心の間を線形補間する。端の半区画ぶんは一番近い区画の表をそのまま使う
+    const at = (pos, tile, tiles) => {
+      const f = pos / tile - 0.5;
+      const i0 = Math.floor(f);
+      const w = f - i0;
+      const a = i0 < 0 ? 0 : i0 >= tiles ? tiles - 1 : i0;
+      const b = i0 + 1 < 0 ? 0 : i0 + 1 >= tiles ? tiles - 1 : i0 + 1;
+      return { a, b, w };
+    };
+
+    for (let y = 0; y < height; y++) {
+      const vy = at(y + 0.5, tileH, tilesY);
+      const row = y * width;
+      for (let x = 0; x < width; x++) {
+        const vx = at(x + 0.5, tileW, tilesX);
+        const v = gray[row + x];
+        const top = luts[vy.a * tilesX + vx.a][v] * (1 - vx.w) + luts[vy.a * tilesX + vx.b][v] * vx.w;
+        const bottom = luts[vy.b * tilesX + vx.a][v] * (1 - vx.w) + luts[vy.b * tilesX + vx.b][v] * vx.w;
+        gray[row + x] = Math.round(top * (1 - vy.w) + bottom * vy.w);
+      }
+    }
+
+    return { mode: 'clahe', tilesX, tilesY, clip: PRE_CLAHE_CLIP, applied: true };
   }
 
   // 上側の帯と下側の帯の平均波形を突き合わせて、上下で何 px ずれているかを測る。
@@ -664,6 +805,13 @@
     const rgba = frameBuffer.ctx.getImageData(0, 0, width, height).data;
     const gray = toGray(rgba, width * height);
 
+    // コントラスト正規化は傾きの測定より先。影やむらを均したほうが上下の帯を突き合わせやすい
+    const contrastModeNow = contrastMode();
+    const contrastNormalize =
+      contrastModeNow === 'stretch' ? stretchGray(gray)
+        : contrastModeNow === 'clahe' ? claheGray(gray, width, height)
+          : { mode: 'off', applied: false };
+
     const shear = config.shear ? estimateShear(gray, width, height) : 0;
     let profile = aggregate(gray, width, height, mode, shear);
 
@@ -671,7 +819,7 @@
     if (!contrast.ok) {
       // 枠内にバーコードが無いか、バーが横向きで縦の集約に耐えない
       if (config.debug) {
-        debugInfo = { mode, width, height, shear, contrast, skipped: true };
+        debugInfo = { mode, contrastNormalize, width, height, shear, contrast, skipped: true };
       }
       return null;
     }
@@ -697,6 +845,7 @@
         height: canvas.height,
         pad: PRE_PAD_X,
         mode,
+        contrastNormalize: contrastModeNow,
         time: performance.now()
       };
 
@@ -708,6 +857,7 @@
 
       debugInfo = {
         mode,
+        contrastNormalize,
         thresholdMode,
         width,
         height,
