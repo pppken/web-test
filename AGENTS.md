@@ -262,13 +262,13 @@ Quagga2 以外はさらに **Worker → メインスレッド** の 2 段にな�
 **ZXing-C++ と Quagga2 はこの自動の連鎖には入らない**（下の「エンジンの選択」を参照）。
 いま何で動いているかは `onEngineChange` の `name` に出る（このページでは `#engine` のバッジ）。
 
-- **読み取る種類は `FORMATS` に集約してある。既定は CODE128 と JAN**
-  （＝ EAN-13 / EAN-8。13 桁と 8 桁は別フォーマット扱いなので 3 件ある。
+- **読み取る種類は `FORMATS` に集約してある。既定は CODE128 と JAN と CODE39**
+  （JAN ＝ EAN-13 / EAN-8。13 桁と 8 桁は別フォーマット扱いなので全部で 4 件ある。
   `configure({ formats })` で差し替えられる）。
-  `BarcodeDetector` には `code_128` / `ean_13` / `ean_8`、ZXing には `POSSIBLE_FORMATS`
-  として `CODE_128` / `EAN_13` / `EAN_8`、ZXing-C++ には `formats` として
-  `Code128` / `EAN13` / `EAN8`、Quagga2 には `decoder.readers` として
-  `code_128_reader` / `ean_reader` / `ean_8_reader` を渡す。
+  `BarcodeDetector` には `code_128` / `ean_13` / `ean_8` / `code_39`、ZXing には `POSSIBLE_FORMATS`
+  として `CODE_128` / `EAN_13` / `EAN_8` / `CODE_39`、ZXing-C++ には `formats` として
+  `Code128` / `EAN13` / `EAN8` / `Code39`、Quagga2 には `decoder.readers` として
+  `code_128_reader` / `ean_reader` / `ean_8_reader` / `code_39_reader` を渡す。
   4 者とも表記が違うので 1 件につき 4 つ書く（`pdf417` / `PDF_417` や
   EAN-13 の Quagga2 名が `ean_reader` であるように、
   大文字化だけでは揃わないものがあるため、機械変換にしていない）。
@@ -280,6 +280,8 @@ Quagga2 以外はさらに **Worker → メインスレッド** の 2 段にな�
   （`zxingCppFormat()`。barcode-worker.js にある。Worker でもメインスレッドでも同じコードを通る）。
   **引く順は `format` → `symbology`。** `symbology` は EAN13 / EAN8 のどちらでも
   `EANUPC` になり、13 桁と 8 桁を区別できない（3.1.4 で確認）。
+  逆に CODE39 は `format` が `Code39Std` / `Code39Ext` になり `FORMATS` の `Code39` と
+  一致しないので、`symbology`（`Code39`）のほうで拾われる。
 - `BarcodeDetector` は API があっても `getSupportedFormats()` が空配列を返す環境がある
   （`FORMATS` のどれも含まれない場合も同じ扱い。いずれも ZXing へ）。
   実行中に例外を投げた場合も `analyze()` が捕まえて、`fallbackFor()` の落ち先
@@ -350,11 +352,14 @@ Quagga2 と同じく**選択したときだけ**使う読み比べ用の経路�
   同梱したもの（絶対 URL）を指すように差し替えている。`fireImmediately: true` にして、
   wasm の取得とコンパイルまで初期化のうちに終わらせる。ここを待たずに検出器を返すと、
   最初の数フレームの解析がまとめて待たされる。
-- 解析オプションは `ZXING_CPP_OPTIONS`。`maxNumberOfSymbols: 1`（枠内に複数は想定しない）、
-  `tryInvert: false`（白黒反転を試すと通常のバーコードの実効回数が落ちるため）、`tryHarder: true`、`tryDownscale: true` の 4 つを指定する。
-  `tryHarder` / `tryDownscale` は既定でも true だが、ZXing 経路と揃えて明示している
-  （重いときに最初に外す場所なので既定任せにしない）。`tryDownscale` はライブラリ側が
-  `downscaleThreshold`（500）を超える辺だけを `downscaleFactor`（3）で縮めるので、
+- 解析オプションは `ZXING_CPP_OPTIONS`。**zxing-wasm 3.1.4 の ReaderOptions を、既定値のものも
+  含めて全項目書いてある**（`formats` だけは `configure({ formats })` から barcode-worker.js が入れる）。
+  既定値は同梱の js が持つ既定のオブジェクトで確認したもので、版を上げたら突き合わせ直すこと。
+  既定から変えているのは `maxNumberOfSymbols: 1`（枠内に複数は想定しない）、
+  `tryInvert: false`（白黒反転を試すと通常のバーコードの実効回数が落ちるため）、
+  `tryDownscale: false` の 3 つ。`tryHarder: true` は既定と同じだが、重いときに最初に外す
+  場所として意識しておく。`tryDownscale` を true にすると、ライブラリ側が
+  `downscaleThreshold`（500）を超える辺だけを `downscaleFactor`（3）で縮めた層も読むので、
   `MAX_SCAN_SIDE` = 640 のこの経路では実際に走る。`tryRotate` は既定（true）のまま。
 - **`tryRotate` が効くので 90 度回転は渡さない**（`needsRotation()` が false）。
   左右の白い帯（`SCAN_PAD_X`）は ZXing / Quagga2 と同じく足す。
@@ -414,8 +419,8 @@ barcode.js が持つのはこの口だけ。** 既定の `null` なら従来ど�
    （740x568、実機相当のサイズ）で **ZXing 0.9ms → 12.9ms、ZXing-C++ 1.0ms → 3.5ms**
    で収まった（検出フレームは 1 行目で当たるのでどちらも変わらない）。
    `SCAN_INTERVAL_MS = 120` に対しては十分小さい。**ただしこれはデスクトップでの数字で、
-   しかも CODE39 1 本だった頃のもの。** いまは CODE128 と JAN の
-   `Code128Reader` + `MultiFormatUPCEANReader` の 2 本を回すぶん重く、
+   しかも CODE39 1 本だった頃のもの。** いまは CODE128 と JAN と CODE39 の
+   `Code128Reader` + `MultiFormatUPCEANReader` + `Code39Reader` の 3 本を回すぶん重く、
    実写フレームはさらに当たりが多い。実機では必ず `#engine` の N/s を見ること。
    なお縦向きバーコードは `TRY_HARDER` の回転リトライ任せにはできない。
    いまの `RGBLuminanceSource` は `isRotateSupported()` が false で走らず、
@@ -467,7 +472,8 @@ barcode.js が持つのはこの口だけ。** 既定の `null` なら従来ど�
     GPU からの読み戻しになって逆に重くなる。
   - `stop()` で `releasePreviewFrame()` を呼び、停止後に古いフレームを解析／表示しない
     ようにする。
-- 同梱ライブラリの経路（ZXing / ZXing-C++ / Quagga2）では、切り出した画像の**左右に幅 `SCAN_PAD_X` = 50px の白い帯**を
+- **（いまは一時的に `SCAN_PAD_X` = 0 で無効。戻すときは 50 にする）**
+  同梱ライブラリの経路（ZXing / ZXing-C++ / Quagga2）では、切り出した画像の**左右に幅 `SCAN_PAD_X` = 50px の白い帯**を
   足してから渡す。枠いっぱいにバーコードが写っているとクワイエットゾーンが足りず
   読めないため。回転経路でもバーが並ぶのは canvas の横方向なので、足す位置は正立時と同じ。
   `BarcodeDetector` には足さない（端末側の実装に任せる）。

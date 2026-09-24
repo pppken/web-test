@@ -85,13 +85,13 @@
     // POSSIBLE_FORMATS を渡さないと、MultiFormatReader は 1D 系・QR・DataMatrix・
     // Aztec・PDF417 のリーダーをすべて用意し、しかも未検出のフレームでは
     // 毎回その全部を走らせる（未検出が大半なので、これが 1 回の解析の主な中身になる）。
-    // CODE128 と JAN に絞ると Code128Reader と MultiFormatUPCEANReader
-    // （EAN13Reader / EAN8Reader を束ねたもの）の 2 本で済む。
+    // CODE128 と JAN と CODE39 に絞ると Code128Reader と MultiFormatUPCEANReader
+    // （EAN13Reader / EAN8Reader を束ねたもの）と Code39Reader の 3 本で済む。
     //
     // TRY_HARDER を付けると、doDecode が高さ方向に見る行が 15 行から画像の高さぶん
     // 全部に増える（行ステップも h>>5 から h>>8 になる）。
     // 全フォーマット有効だった頃は 1 回の解析が 10 倍（約 31ms -> 311ms）になり
-    // 実効 3 回/秒まで落ちたが、POSSIBLE_FORMATS を絞った今はこの 2 本ぶんの
+    // 実効 3 回/秒まで落ちたが、POSSIBLE_FORMATS を絞った今はこの 3 本ぶんの
     // 増加で済む。**重くなったらまずここを外す。**
     // 判断は onEngineChange の rate を実機で見て行うこと
     // （CODE39 1 本だった頃より重いので、フォーマットを増やしたら測り直すこと）。

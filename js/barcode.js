@@ -20,7 +20,7 @@
   //     scanArea,              // 必須。この要素の矩形の内側だけを切り出して解析する
   //     basePath,              // barcode-worker.js / barcode-quagga2.js の基準。既定はこの js の場所
   //     vendorPath,            // 同梱ライブラリの置き場所。既定は basePath + 'vendor/'
-  //     formats,               // 読み取る対象（既定は FORMATS ＝ CODE128 と JAN）
+  //     formats,               // 読み取る対象（既定は FORMATS ＝ CODE128 と JAN と CODE39）
   //     engine,                // 'auto' | 'zxing' | 'zxing-cpp' | 'quagga'
   //     storageKey,            // エンジン選択の保存先。null で保存しない
   //     frameFilter,           // 解析に渡す画像を作り直す差し込み口（既定 null ＝ 素通し）。
@@ -71,40 +71,68 @@
   // （LIB_TIMEOUT_MS = 10 秒）と同じ尺では回線の細い実機で足りない
   const WASM_INIT_TIMEOUT_MS = 30000;
 
-  // ZXing-C++ の解析オプション。formats は configure() の formats から入れるのでここには書かない。
-  // 検出は barcode-worker.js が行うが、重さの調整はここ（定数の置き場）で行う。
-  //   maxNumberOfSymbols  1 件見つかった時点で打ち切る（枠内に複数は想定していない）
-  //   tryInvert           白黒反転した画像は試さない。通常のバーコードの実効回数が落ちる
-  //   tryHarder           既定でも true だが、ZXing 経路と揃えて明示しておく。
-  //                       重いときに最初に外す場所なので、既定任せにしない
-  //   tryDownscale        縮小した画像でも読みに行く（既定は true）。
-  //                       ライブラリ側は downscaleThreshold（500）を超える辺だけを
-  //                       downscaleFactor（3）で縮めるため、MAX_SCAN_SIDE = 640 の
-  //                       この経路では実際に走る（重いときは tryHarder の次に外す）
-  // tryRotate は既定（true）のまま。これが効くので、この経路ではこちら側で
-  // 90 度回転させない（needsRotation() が false）。
-  // 速度が足りないときは onEngineChange の rate を見ながら外す。
+  // ZXing-C++ の解析オプション。検出は barcode-worker.js が行うが、重さの調整はここ
+  // （定数の置き場）で行う。速度が足りないときは onEngineChange の rate を見ながら外す。
   //
-  // ここに書いていない既定値のうち、1D で意味があるのは次の 2 つ（3.1.4 で確認）。
-  //   minLineCount = 2   1D は 1 行ずつ読み、**同じ結果が 2 行で出ないと最後に捨てる**
-  //                      （ODReader.cpp の DoDecode 末尾の erase_if）。印字が荒くて
-  //                      「まぐれで 1 行だけ読めた」ぶんはここで落ちている。
-  //                      1 にすれば拾えるが誤読の目が増えるので、**まず前処理を試すこと。**
-  //                      前処理（barcode-preprocess.js）の画像は全行が同じ内容なので、
-  //                      この条件は自動的に満たされる
-  //   tryDenoise = false 3.1.4 では ZXING_EXPERIMENTAL_API の中にあり、しかも
-  //                      Aztec / DataMatrix / QRCode にしか適用されない
-  //                      （ReadBarcode.cpp の formatsBenefittingFromClosing）。1D には効かない
+  // **zxing-wasm 3.1.4 の ReaderOptions を全項目書いてある。** 何が効いているかを
+  // ここだけで読めるようにするためで、既定値のものも省略しない。既定値は同梱の
+  // vendor/zxing-wasm-reader-3.1.4.min.js が持つ既定のオブジェクトで確認した
+  // （版を上げたら項目の増減と既定値を突き合わせ直すこと）。
+  // 各行の末尾に「既定」とあるものは既定値のまま、「変更」は既定から変えてあるもの。
   //
-  // binarizer も既定（'LocalAverage'）のままでよい。**1D では 'GlobalHistogram' と
-  // 完全に同じ経路**を通る（HybridBinarizer::getPatternRow が
-  // GlobalHistogramBinarizer::getPatternRow をそのまま呼ぶ）。局所しきい値が効くのは
-  // 2D コードだけなので、この 2 つを読み比べても差は出ない
+  // formats だけはここに書かない。configure() の formats（既定は FORMATS）から
+  // barcode-worker.js が入れる（既定は [] ＝ 全フォーマット）。
   const ZXING_CPP_OPTIONS = {
-    maxNumberOfSymbols: 1,
-    tryInvert: false,
+    // 既定 true。ZXing 経路（TRY_HARDER）と揃えて明示しておく。
+    // 重いときに最初に外す場所
     tryHarder: true,
-    tryDownscale: false
+    // 既定 true。これが効くので、この経路ではこちら側で 90 度回転させない
+    // （needsRotation() が false）
+    tryRotate: true,
+    // 変更（既定 true）。白黒反転した画像は試さない。通常のバーコードの実効回数が落ちる
+    tryInvert: false,
+    // 変更（既定 true）。縮小した画像でも読みに行く。ライブラリ側は downscaleThreshold を
+    // 超える辺だけを downscaleFactor で縮めるので、MAX_SCAN_SIDE = 640 のこの経路では
+    // 実際に走る（重いときは tryHarder の次に外す候補）
+    tryDownscale: false,
+    // 既定 false。3.1.4 では ZXING_EXPERIMENTAL_API の中にあり、しかも
+    // Aztec / DataMatrix / QRCode にしか適用されない
+    // （ReadBarcode.cpp の formatsBenefittingFromClosing）。1D には効かない
+    tryDenoise: false,
+    // 既定 'LocalAverage'。**1D では 'GlobalHistogram' と完全に同じ経路**を通る
+    // （HybridBinarizer::getPatternRow が GlobalHistogramBinarizer::getPatternRow を
+    // そのまま呼ぶ）。局所しきい値が効くのは 2D コードだけなので、読み比べても差は出ない
+    binarizer: 'LocalAverage',
+    // 既定 false。true にすると「画像全体が余白なしの 1 つのコード」とみなして探索を省く。
+    // カメラ映像には使えない
+    isPure: false,
+    // 既定 3 / 500。tryDownscale のときに、辺が downscaleThreshold を超える画像を
+    // 1/downscaleFactor に縮めた層を作る
+    downscaleFactor: 3,
+    downscaleThreshold: 500,
+    // 既定 2。1D は 1 行ずつ読み、**同じ結果が 2 行で出ないと最後に捨てる**
+    // （ODReader.cpp の DoDecode 末尾の erase_if）。印字が荒くて
+    // 「まぐれで 1 行だけ読めた」ぶんはここで落ちている。
+    // 1 にすれば拾えるが誤読の目が増えるので、**まず前処理を試すこと。**
+    // 前処理（barcode-preprocess.js）の画像は全行が同じ内容なので、この条件は自動的に満たされる
+    minLineCount: 2,
+    // 変更（既定 255）。1 件見つかった時点で打ち切る（枠内に複数は想定していない）
+    maxNumberOfSymbols: 1,
+    // 既定 false。任意のチェックサム（Code39 / ITF など）も検証する。CODE128 / JAN の
+    // チェックディジットは必須なので、この値に関わらず常に検証される
+    validateOptionalChecksum: false,
+    // 既定 false。true にすると読めなかった候補もエラー付きで返す。
+    // barcode-worker.js は results[0] をそのまま結果にするので、true にしないこと
+    returnErrors: false,
+    // 既定 'Ignore'。JAN のアドオン（2 桁 / 5 桁の添え字）は読まない
+    eanAddOnSymbol: 'Ignore',
+    // 既定 'HRI'。text を人が読む形（Human Readable Interpretation）で返す
+    textMode: 'HRI',
+    // 既定 'Unknown'。文字コードは自動判定に任せる（1D の数字・英数字には関係しない）
+    characterSet: 'Unknown',
+    // 既定 true。Code39 の拡張モード（Full ASCII。'+A' を 'a' と読むなど）も試す。
+    // 拡張として読めたものは format が Code39Ext になる（結果の表記はどちらも CODE_39）
+    tryCode39ExtendedMode: true
   };
 
   // 解析に回す画像の最大辺。切り出したあとの処理（getImageData →
@@ -123,9 +151,12 @@
   // 静止領域（クワイエットゾーン）まで切り落とされて読めないことがあるので、
   // 切り出した画像の左右を白で埋めて補う。
   // 回転経路でもバーが並ぶ向きは canvas の横方向なので、足す位置は同じ
-  const SCAN_PAD_X = 50;
+  //
+  // **一時的に 0（余白なし）にしてある。** 元に戻すときは 50 にする。
+  // 0 のときは captureScanArea() が白い帯を塗らず、切り出した画像をそのまま渡す
+  const SCAN_PAD_X = 0;
 
-  // 読み取る対象のフォーマット。既定は CODE128 と JAN（＝ EAN-13 / EAN-8）。
+  // 読み取る対象のフォーマット。既定は CODE128 と JAN（＝ EAN-13 / EAN-8）と CODE39。
   // JAN は 13 桁と 8 桁で別のフォーマット扱いなので 2 件書く。
   // BarcodeDetector / ZXing / ZXing-C++ / Quagga2 で表記が違うので 4 つとも持つ。大半は
   // 大文字小文字と区切りの差でしかないが、PDF417 だけ 'pdf417' / 'PDF_417' と規則が
@@ -135,12 +166,16 @@
   // ZXing-C++ の表記は同梱の js が持つ `ZXingWASM.barcodeFormats` が一覧（区切りは入らない。
   // 'EAN-13' のような綴りも受け付けるが、結果に入るのは 'EAN13' のほうなので一覧に合わせる。
   // **綴りが違っても例外にはならず、黙って全フォーマットを見に行く**ので注意）。
-  // 結果の format は全経路で zxing の表記（CODE_128 / EAN_13 / EAN_8）に揃えてから返す
+  // ZXing-C++ の 'Code39' は Code39Std / Code39Ext をまとめた括りで、結果の format には
+  // 'Code39Std' などが入る。symbology のほうが 'Code39' になるので、barcode-worker.js の
+  // zxingCppFormat() がそちらで拾って CODE_39 に直す。
+  // 結果の format は全経路で zxing の表記（CODE_128 / EAN_13 / EAN_8 / CODE_39）に揃えてから返す
   // （揃えるのは barcode-worker.js / barcode-quagga2.js 側）
   const FORMATS = [
     { native: 'code_128', zxing: 'CODE_128', zxingCpp: 'Code128', quagga: 'code_128_reader' },
     { native: 'ean_13', zxing: 'EAN_13', zxingCpp: 'EAN13', quagga: 'ean_reader' },
-    { native: 'ean_8', zxing: 'EAN_8', zxingCpp: 'EAN8', quagga: 'ean_8_reader' }
+    { native: 'ean_8', zxing: 'EAN_8', zxingCpp: 'EAN8', quagga: 'ean_8_reader' },
+    { native: 'code_39', zxing: 'CODE_39', zxingCpp: 'Code39', quagga: 'code_39_reader' }
   ];
 
   // 同じバーコードを同じ端末で読み比べられるように、使うエンジンを選べるようにしてある。
