@@ -44,12 +44,13 @@
                                   // （1280x32 = 4 万画素 < 640x267 = 17 万画素）
   const PRE_ROWS = 32;            // 集約の材料にする段数。<video> から縦だけ縮めて作るので、
                                   // 1 段が既に元の十数ライン分の平均になっている
-  const PRE_OUT_WIDTH = 600;      // 出力画像の横幅（左右の余白 PRE_PAD_X があればそれ込み）。波形はこの幅に
-                                  // 合わせて伸び縮みする（resample()）。以前は常に 2 倍へ
-                                  // 引き伸ばしていた（1280px 幅の枠なら 2640px）が、幅を抑えるため固定幅にした。
-                                  // **ROI が広いと縮めることになり、そのぶん最細バーが細る**
-                                  // （860px 幅の ROI なら約 0.7 倍）。検出画像ダイアログの
-                                  // 「最細バー」の出力側の値が 2px を切るようなら、ここを広げる
+  const PRE_OUT_WIDTH = null;     // 出力画像の横幅（左右の余白 PRE_PAD_X があればそれ込み）。
+                                  // **null なら実寸**（＝検出枠を元映像の px で取り込んだ幅。
+                                  // PRE_MAX_WIDTH を超える枠だけはそこまで縮まっている）で、伸び縮みしない。
+                                  // 数値を入れると、波形をその幅に合わせて伸び縮みさせる（resample()）。
+                                  // 経緯: 最初は常に 2 倍（1280px 幅の枠なら 2640px）→ 600px 固定 →
+                                  // 実寸。600px 固定では実機の枠（約 860px 幅）を約 0.7 倍に縮めることになり、
+                                  // そのぶん最細バーが細っていた
   const PRE_OUT_ROWS = 100;       // 出力画像の行数（全行が同じ内容）。
                                   // 以前は ZXing-C++ に合わせた最小の 2 行にしていたが、
                                   // 実機の ZXing-C++ で検出しなかったため、高さ不足を疑って 100 に上げて検証中。
@@ -416,7 +417,7 @@
   //
   // 曲線は集約した波形（伸び縮みの前）の尺で作り、波形と一緒に resample() で出力の幅へ
   // 合わせてから割る（buildImage()）。伸び縮みのあとに割るので、エッジの位置は
-  // 出力の 1px 単位に丸められる（600px に縮めている今は、入力の 1px より粗いことがある）
+  // 出力の 1px 単位に丸められる（実寸のいまは入力の 1px 単位。PRE_OUT_WIDTH で縮めればそれより粗くなる）
   function binarizeCurve(profile) {
     const width = profile.length;
     const lo = new Float32Array(width);
@@ -756,10 +757,11 @@
 
     // 伸び縮みは二値化より後ではなく先。二値化を先にすると、集約で得た
     // サブピクセルのエッジ位置をそこで捨ててしまう
-    const outWidth = PRE_OUT_WIDTH - PRE_PAD_X * 2;
-    const scaled = resample(profile, outWidth);
-    const scaledThreshold =
-      threshold.curve ? resample(threshold.curve, outWidth) : threshold.value;
+    // PRE_OUT_WIDTH が null（実寸）なら伸び縮みさせずにそのまま使う
+    const outWidth = PRE_OUT_WIDTH ? PRE_OUT_WIDTH - PRE_PAD_X * 2 : width;
+    const fit = (values) => (outWidth === width ? values : resample(values, outWidth));
+    const scaled = fit(profile);
+    const scaledThreshold = threshold.curve ? fit(threshold.curve) : threshold.value;
 
     const canvas = buildImage(scaled, thresholdMode === 'none' ? null : scaledThreshold);
 
