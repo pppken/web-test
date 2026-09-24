@@ -460,8 +460,9 @@
     const what = output.preview ? '前回の表示用に作った画像' : '解析へ渡した画像';
     previewOutputInfo.textContent =
       `前処理の出力（${describeAggregate(output)}・${age} 秒前に${what}）` +
-      `　${output.width} × ${output.height}（うち左右 ${output.pad}px は白の余白）` +
-      '　等倍表示。横にスクロールできます';
+      `　${output.width} × ${output.height}` +
+      (output.pad ? `（うち左右 ${output.pad}px は白の余白）` : '（余白なし）') +
+      '　等倍表示。はみ出すときは横にスクロールできます';
   }
 
   // A/B 比較の途中経過。前処理あり／なしそれぞれの「解析した回数のうち読めた割合」
@@ -541,14 +542,17 @@
   }
 
   // 最細バー／最細スペースは、実際の module width が何 px あるかの答えそのもの。
-  // 集約画像の尺と、元映像の尺（srcScale で割り戻したもの）の両方を出す
+  // 集約画像の尺と、元映像の尺（srcScale で割り戻したもの）と、解析に渡す出力画像の尺
+  // （scale を掛けたもの。出力を縮めているときはここが一番細い）を出す
   function describeWave(debug) {
     const parts = [`集約: ${describeAggregate(debug)}（${debug.width} × ${debug.height} 段）`];
 
     if (debug.runs) {
-      const src = (px) => (debug.srcScale ? ` / 元映像 ${(px / debug.srcScale).toFixed(1)}px` : '');
-      parts.push(`最細バー: ${debug.runs.minBar}px${src(debug.runs.minBar)}`);
-      parts.push(`最細スペース: ${debug.runs.minSpace}px${src(debug.runs.minSpace)}`);
+      const other = (px) =>
+        (debug.srcScale ? ` / 元映像 ${(px / debug.srcScale).toFixed(1)}px` : '') +
+        ` / 出力 ${(px * debug.scale).toFixed(1)}px`;
+      parts.push(`最細バー: ${debug.runs.minBar}px${other(debug.runs.minBar)}`);
+      parts.push(`最細スペース: ${debug.runs.minSpace}px${other(debug.runs.minSpace)}`);
       parts.push(`本数: ${debug.runs.bars}`);
     }
 
@@ -560,7 +564,7 @@
         ? `しきい値: ${debug.thresholdMode}（波形の黒白は実測用の目安）`
         : `しきい値: ${debug.thresholdMode}`
     );
-    parts.push(`引き伸ばし: ${debug.scale}x → ${debug.out.width} × ${debug.out.height}`);
+    parts.push(`横の倍率: ${debug.scale.toFixed(2)}x → ${debug.out.width} × ${debug.out.height}`);
 
     return parts.join('　');
   }

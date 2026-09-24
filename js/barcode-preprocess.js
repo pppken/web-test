@@ -36,16 +36,20 @@
   // バーコードは高さ方向には同じ模様が続くので、複数ラインを集約すれば
   // この誤差はラインの本数ぶん小さくなる。集約すると縁は「なめらかな傾斜」になり、
   // エッジの位置がサブピクセルで分かるようになるが、**そのまま出しても
-  // run length は整数に丸められて元の木阿弥**なので、横に引き伸ばしてから渡す。
-  // 集約 → 引き伸ばしの 2 つで 1 組で、片方だけでは効かない。
+  // run length は整数に丸められて元の木阿弥**なので、線形補間（縮めるときは面積の平均）で
+  // 出力の幅に合わせ、エッジの位置を画素の濃さとして残してから渡す（resample()）。
   const PRE_MAX_WIDTH = 1280;     // 前処理経路で横に残す最大幅。barcode.js の MAX_SCAN_SIDE より広く取る。
                                   // 細バーの太さは横の解像度でしか決まらないのでここは削らない。
                                   // 縦は PRE_ROWS 段まで潰すので画素数はむしろ減る
                                   // （1280x32 = 4 万画素 < 640x267 = 17 万画素）
   const PRE_ROWS = 32;            // 集約の材料にする段数。<video> から縦だけ縮めて作るので、
                                   // 1 段が既に元の十数ライン分の平均になっている
-  const PRE_SCALE = 2;            // 集約した波形を横に引き伸ばす倍率。
-                                  // エッジ位置の分解能が元画像の 1/PRE_SCALE px になる
+  const PRE_OUT_WIDTH = 600;      // 出力画像の横幅（左右の余白 PRE_PAD_X があればそれ込み）。波形はこの幅に
+                                  // 合わせて伸び縮みする（resample()）。以前は常に 2 倍へ
+                                  // 引き伸ばしていた（1280px 幅の枠なら 2640px）が、幅を抑えるため固定幅にした。
+                                  // **ROI が広いと縮めることになり、そのぶん最細バーが細る**
+                                  // （860px 幅の ROI なら約 0.7 倍）。検出画像ダイアログの
+                                  // 「最細バー」の出力側の値が 2px を切るようなら、ここを広げる
   const PRE_OUT_ROWS = 100;       // 出力画像の行数（全行が同じ内容）。
                                   // 以前は ZXing-C++ に合わせた最小の 2 行にしていたが、
                                   // 実機の ZXing-C++ で検出しなかったため、高さ不足を疑って 100 に上げて検証中。
@@ -57,11 +61,14 @@
                                   //     （いまの ZXING_CPP_OPTIONS は false なので効かない）
                                   //   - 2 行なら tryRotate の走査も width<3 で即座に打ち切られる。
                                   //     100 行だと回転側でも走査するぶん、1 回の解析が重くなる
-  const PRE_PAD_X = 40;           // 出力画像の左右に足す白の幅（出力側の px）
+  const PRE_PAD_X = 0;            // 出力画像の左右に足す白の幅（出力側の px）。以前は 40。
+                                  // いまは足さない（検証中）。クワイエットゾーンは ROI に写っている
+                                  // ラベルの余白だけが頼りになるので、枠いっぱいにバーコードを
+                                  // 写すと読めない
   const PRE_MAX_SHEAR = 24;       // 傾き補正で許す上下のずれ（入力側の px）。
                                   // ROI の高さが 500px なら約 2.7 度ぶん
   const PRE_TRIM = 0.25;          // trimmed mean で上下から捨てる割合
-  const PRE_ADAPTIVE_WINDOW = 48; // adaptive しきい値の窓幅（集約後・引き伸ばし前の px）
+  const PRE_ADAPTIVE_WINDOW = 48; // adaptive しきい値の窓幅（集約後・伸び縮み前の px）
   const PRE_BIN_WINDOW = 48;      // 集約前の二値化（binarize）で、しきい値を決める窓の幅（入力側の px）。
                                   // 太いバー（4 モジュール）が収まり、かつラベルの縁の灰色が
                                   // バーの暗さに引きずられない程度の幅
@@ -94,7 +101,7 @@
   const AB_MODE = 'median';
   const DEFAULT_STORAGE_KEY = 'barcodePreprocess';
 
-  // 引き伸ばしたあとの二値化。**既定は 'none'（＝ 生の輝度をそのまま渡す）。**
+  // 伸び縮みさせたあとの二値化。**既定は 'none'（＝ 生の輝度をそのまま渡す）。**
   // ZXing-C++ 側は 1 行ごとにヒストグラムでしきい値を決め、さらに
   // (-p[-1] + 4*p[0] - p[1]) / 2 という鋭化を掛けてから run length を取る
   // （GlobalHistogramBinarizer.cpp の ThresholdSharpened）。この鋭化は
@@ -409,7 +416,7 @@
   // 割ったあとの集約は**平均でなければならない**（capture() が mode に依らず平均にする）。
   // 0/255 の中央値は多数決になって、エッジの位置が 1px 単位に丸められる。
   // 平均なら「その x で何割の段が黒か」になり、縁のがたつきがそのまま
-  // サブピクセルのエッジ位置として残る（引き伸ばしで効くのはこの情報）
+  // サブピクセルのエッジ位置として残る（resample() で残せるのはこの情報）
   function binarizeRows(gray, width, height) {
     const out = new Uint8Array(width * height);
     const lo = new Uint8Array(width);
@@ -611,23 +618,43 @@
     return { value: null, curve: null };
   }
 
-  // 横に PRE_SCALE 倍へ引き伸ばす。**線形補間でなければ意味が無い。**
-  // 集約で得られるのは「エッジが x と x+1 の間のどこにあるか」という情報で、
-  // 最近傍で伸ばすとそれを捨てて整数に丸め直すことになる
-  function upsample(profile, scale) {
+  // 波形を outWidth px に伸び縮みさせる。
+  //
+  // 伸ばすときは**線形補間でなければ意味が無い。** 集約で得られるのは「エッジが x と x+1 の
+  // 間のどこにあるか」という情報で、最近傍で伸ばすとそれを捨てて整数に丸め直すことになる。
+  //
+  // 縮めるときは、出力の 1px が覆う入力の区間を面積で平均する（間引かない）。
+  // 間引くと細バーを丸ごと飛ばすことがあるが、面積で平均すればエッジを跨ぐ画素が
+  // 中間の灰色になり、エッジの位置はその濃さとして残る
+  function resample(profile, outWidth) {
     const width = profile.length;
-    const out = new Float32Array(width * scale);
+    const out = new Float32Array(outWidth);
+    const step = width / outWidth;   // 出力の 1px が入力の何 px にあたるか
 
-    for (let i = 0; i < out.length; i++) {
-      const u = (i + 0.5) / scale - 0.5;
-      const i0 = Math.floor(u);
-      const frac = u - i0;
-      const a = profile[i0 < 0 ? 0 : i0 >= width ? width - 1 : i0];
-      const i1 = i0 + 1;
-      const b = profile[i1 < 0 ? 0 : i1 >= width ? width - 1 : i1];
-      out[i] = a + (b - a) * frac;
+    if (step <= 1) {
+      for (let i = 0; i < outWidth; i++) {
+        const u = (i + 0.5) * step - 0.5;
+        const i0 = Math.floor(u);
+        const frac = u - i0;
+        const a = profile[i0 < 0 ? 0 : i0 >= width ? width - 1 : i0];
+        const i1 = i0 + 1;
+        const b = profile[i1 < 0 ? 0 : i1 >= width ? width - 1 : i1];
+        out[i] = a + (b - a) * frac;
+      }
+      return out;
     }
 
+    for (let i = 0; i < outWidth; i++) {
+      const from = i * step;
+      const to = from + step;
+      let sum = 0;
+      for (let x = Math.floor(from); x < to && x < width; x++) {
+        const a = x > from ? x : from;
+        const b = x + 1 < to ? x + 1 : to;
+        sum += profile[x] * (b - a);
+      }
+      out[i] = sum / step;
+    }
     return out;
   }
 
@@ -738,11 +765,12 @@
     const thresholdMode = THRESHOLD_MODES.includes(config.threshold) ? config.threshold : 'none';
     const threshold = thresholdCurve(profile, thresholdMode);
 
-    // 引き伸ばしは二値化より後ではなく先。二値化を先にすると、集約で得た
+    // 伸び縮みは二値化より後ではなく先。二値化を先にすると、集約で得た
     // サブピクセルのエッジ位置をそこで捨ててしまう
-    const scaled = upsample(profile, PRE_SCALE);
+    const outWidth = PRE_OUT_WIDTH - PRE_PAD_X * 2;
+    const scaled = resample(profile, outWidth);
     const scaledThreshold =
-      threshold.curve ? upsample(threshold.curve, PRE_SCALE) : threshold.value;
+      threshold.curve ? resample(threshold.curve, outWidth) : threshold.value;
 
     const canvas = buildImage(scaled, thresholdMode === 'none' ? null : scaledThreshold);
 
@@ -778,7 +806,8 @@
         // 最細バーを測るためだけに引いたものか（thresholdMode が 'none' のとき）
         thresholdIsMeasureOnly: !hasThreshold,
         runs,
-        scale: PRE_SCALE,
+        // 集約画像 → 出力画像の横の倍率（1 未満なら縮めている）
+        scale: outWidth / width,
         // 集約画像の 1px が元映像の何 px にあたるか。実機の module width はこれを掛ける
         srcScale: frameBuffer.scaleX,
         crop: frameBuffer.crop,
