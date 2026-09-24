@@ -345,7 +345,8 @@
     const pad = preview.pad !== null ? preview.pad : debug && debug.pad;
 
     previewInfo.textContent = pad
-      ? `${preview.width} × ${preview.height}（うち左右 ${pad}px は白の余白）`
+      // 素通しの画像の余白は白とは限らない（barcode.js の SCAN_PAD_FILL が 'edge' なら端の色）
+      ? `${preview.width} × ${preview.height}（うち左右 ${pad}px は余白）`
       : `${preview.width} × ${preview.height}`;
     // 解析に渡すのと同じ画素をそのまま見たいので、非可逆な形式にはしない
     previewImage.src = preview.canvas.toDataURL('image/png');
